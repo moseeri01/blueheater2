@@ -1,9 +1,8 @@
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
-
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
-    LoadingTitle = "Loading...",
-    LoadingSubtitle = "Auto Farm System",
+    LoadingTitle = "Moseeri Hub Loading...",
+    LoadingSubtitle = "Star Stream Style",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = nil,
@@ -13,7 +12,7 @@ local Window = Rayfield:CreateWindow({
     KeySettings = {
         Title = "Moseeri Key",
         Subtitle = "Get your key from Discord",
-        Note = "https://discord.gg/uGX2X3xWvY",
+        Note = "https://discord.gg/uGX2X3WvY",
         FileName = "MoseeriKey",
         SaveKey = true,
         GrabKeyFromSite = true,
@@ -21,69 +20,106 @@ local Window = Rayfield:CreateWindow({
     }
 })
 
--- 📌 MAIN TAB (Star Stream Style)
-local MainTab = Window:CreateTab("🛡 Main Features")
+-- MAIN FEATURES Tab
+local TabMain = Window:CreateTab("Main Features", nil)
+local SectionFarm = TabMain:CreateSection("Auto Farming")
 
--- 🧲 TOGGLES
-local MainSection = MainTab:CreateSection("Toggles")
-
-getgenv().autoFarm = false
-getgenv().killAura = false
-getgenv().dodge = false
-getgenv().chestFarm = false
-getgenv().bossOnly = false
-getgenv().killWithStaff = false
-getgenv().killSpeed = 0.1
-
-MainSection:CreateToggle({
+SectionFarm:CreateToggle({
     Name = "Enable Auto Farm",
     CurrentValue = false,
-    Callback = function(Value)
-        getgenv().autoFarm = Value
-        if Value then
-            AutoFarm()
+    Callback = function(v)
+        getgenv().autoFarm = v
+        if v then
+            print("Auto Farm On")
+            -- Auto farm function here
         end
-    end,
+    end
 })
-
-MainSection:CreateToggle({
+SectionFarm:CreateToggle({
     Name = "Enable Chest Farm",
     CurrentValue = false,
-    Callback = function(Value)
-        getgenv().chestFarm = Value
-    end,
+    Callback = function(v)
+        getgenv().chestFarm = v
+        -- Chest farm function here
+    end
 })
-
-MainSection:CreateToggle({
+SectionFarm:CreateToggle({
     Name = "Enable Dodge Mechanism",
     CurrentValue = false,
-    Callback = function(Value)
-        getgenv().dodge = Value
-    end,
+    Callback = function(v)
+        getgenv().dodgeMechanism = v
+        -- Dodge code here
+    end
 })
-
-MainSection:CreateToggle({
+SectionFarm:CreateToggle({
     Name = "Boss Prioritization",
     CurrentValue = false,
-    Callback = function(Value)
-        getgenv().bossOnly = Value
-    end,
+    Callback = function(v)
+        getgenv().bossPriority = v
+        -- Prioritize boss code here
+    end
 })
-
-MainSection:CreateToggle({
+SectionFarm:CreateToggle({
     Name = "Enable Kill Aura",
     CurrentValue = false,
-    Callback = function(Value)
-        getgenv().killAura = Value
-    end,
+    Callback = function(v)
+        getgenv().killAura = v
+        -- Kill aura code here
+    end
 })
-
-MainSection:CreateToggle({
+SectionFarm:CreateToggle({
     Name = "Kill Aura (With Staff)",
     CurrentValue = false,
+    Callback = function(v)
+        getgenv().killAuraStaff = v
+        -- Kill aura staff code here
+    end
+})
+SectionFarm:CreateParagraph({
+    Title = "About Kill Aura With Staff",
+    Content = "Even though it appears to work from a distance, you need to be close for it to deal damage."
+})
+SectionFarm:CreateSlider({
+    Name = "Kill Aura Speed",
+    Range = {0.05, 1},
+    Increment = 0.05,
+    Suffix = "s",
+    CurrentValue = 0.1,
     Callback = function(Value)
-        getgenv().killWithStaff = Value
+        getgenv().killAuraSpeed = Value
     end,
 })
 
-MainSection:CreateParagraph
+-- DUNGEON & TOWER Tab
+local TabDungeon = Window:CreateTab("Dungeon & Tower", nil)
+local SectionDungeon = TabDungeon:CreateSection("Dungeon Scripts")
+SectionDungeon:CreateButton({
+    Name = "Auto Dungeon",
+    Callback = function()
+        print("Auto Dungeon!")
+    end,
+})
+
+-- PLAYER Tab
+local TabPlayer = Window:CreateTab("Player", nil)
+local SectionPlayer = TabPlayer:CreateSection("Player Options")
+SectionPlayer:CreateToggle({
+    Name = "Infinite Jump",
+    CurrentValue = false,
+    Callback = function(v)
+        getgenv().infJump = v
+        -- Infinite Jump code
+    end
+})
+SectionPlayer:CreateSlider({
+    Name = "Walkspeed",
+    Range = {10, 100},
+    Increment = 1,
+    Suffix = "Speed",
+    CurrentValue = 16,
+    Callback = function(Value)
+        game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = Value
+    end,
+})
+
+-- สามารถเพิ่ม Tab อื่นๆ ได้เช่น "Place", "Misc", "Settings" ตามตัวอย่างในคลิป
