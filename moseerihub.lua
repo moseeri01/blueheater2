@@ -2,17 +2,17 @@ local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
-    LoadingTitle = "Star Stream Style UI",
-    LoadingSubtitle = "Auto Farm | Kill Aura | Dodge",
+    LoadingTitle = "Loading...",
+    LoadingSubtitle = "Auto Farm System",
     ConfigurationSaving = {
         Enabled = true,
-        FolderName = "MoseeriHub",
-        FileName = "MainUI"
+        FolderName = nil,
+        FileName = "MoseeriHub"
     },
     KeySystem = true,
     KeySettings = {
-        Title = "Moseeri Hub Key",
-        Subtitle = "Get your key on Discord",
+        Title = "Moseeri Key",
+        Subtitle = "Get your key from Discord",
         Note = "https://discord.gg/uGX2X3xWvY",
         FileName = "MoseeriKey",
         SaveKey = true,
