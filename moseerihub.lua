@@ -9,16 +9,17 @@ local Window = Rayfield:CreateWindow({
       FolderName = "Moseeri",
       FileName = "HubData"
    },
-   KeySystem = true,
-   KeySettings = {
-      Title = "Moseeri Key System",
-      Subtitle = "Enter Your Key",
-      Note = "Get your key from Discord",
-      FileName = "MoseeriKey",
-      SaveKey = true,
-      GrabKeyFromSite = true,
-      Key = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/key/key.txt"
-   }
+KeySystem = true,
+KeySettings = {
+   Title = "Moseeri Key",
+   Subtitle = "Get your key from Discord",
+   Note = "https://discord.gg/uGX2X3xWv",
+   FileName = "MoseeriKey",
+   SaveKey = true,
+   GrabKeyFromSite = true,
+   Key = {"https://raw.githubusercontent.com/moseeri01/blueheater2/main/key/key.txt"}
+}
+
 })
 
 Rayfield:Notify({
