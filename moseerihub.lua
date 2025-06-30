@@ -21,25 +21,24 @@ local Window = Rayfield:CreateWindow({
     }
 })
 
--- สร้างแท็บและ Section
-local MainTab = Window:CreateTab("⚔️ Auto Farm")
-local FarmSection = MainTab:CreateSection("ตั้งค่าฟาร์ม")
+-- สร้างแท็บเดียว ชื่อ "Auto Farm"
+local FarmTab = Window:CreateTab("⚔️ Auto Farm")
 
--- ตัวแปรพื้นฐาน
+-- ตัวแปรหลัก
 getgenv().autofarm = false
 getgenv().selectedMob = nil
 getgenv().delayTime = 0.1
 
--- ดึงชื่อ Mob จาก Workspace
+-- หามอนสเตอร์ใน Workspace
 local mobs = {}
-for _, v in pairs(game:GetService("Workspace").Monster.Mon:GetChildren()) do
+for _, v in pairs(game:GetService("Workspace"):WaitForChild("Monster"):WaitForChild("Mon"):GetChildren()) do
     if not table.find(mobs, v.Name) then
         table.insert(mobs, v.Name)
     end
 end
 
--- Dropdown เลือกมอน
-FarmSection:CreateDropdown({
+-- Dropdown เลือกมอนสเตอร์
+FarmTab:CreateDropdown({
     Name = "เลือกมอนสเตอร์",
     Options = mobs,
     CurrentOption = mobs[1] or "None",
@@ -48,9 +47,9 @@ FarmSection:CreateDropdown({
     end
 })
 
--- Slider ตั้งดีเลย์ตี
-FarmSection:CreateSlider({
-    Name = "ตั้งค่าดีเลย์",
+-- Slider ปรับดีเลย์
+FarmTab:CreateSlider({
+    Name = "ดีเลย์โจมตี (วินาที)",
     Range = {0.05, 2},
     Increment = 0.05,
     Suffix = "s",
@@ -60,9 +59,9 @@ FarmSection:CreateSlider({
     end
 })
 
--- ปุ่ม Auto Farm
-FarmSection:CreateToggle({
-    Name = "เริ่มฟาร์ม",
+-- ปุ่ม Toggle เริ่ม Auto Farm
+FarmTab:CreateToggle({
+    Name = "เริ่ม Auto Farm",
     CurrentValue = false,
     Callback = function(value)
         getgenv().autofarm = value
@@ -77,9 +76,9 @@ function AutoFarm()
     task.spawn(function()
         while getgenv().autofarm do
             local mob = game:GetService("Workspace").Monster.Mon:FindFirstChild(getgenv().selectedMob)
-            local player = game.Players.LocalPlayer
-            if mob and mob:FindFirstChild("HumanoidRootPart") and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-                player.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
+            local plr = game.Players.LocalPlayer
+            if mob and mob:FindFirstChild("HumanoidRootPart") and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+                plr.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
             end
             task.wait(getgenv().delayTime)
         end
