@@ -1,4 +1,5 @@
 local Rayfield = loadstring(game:HttpGet("https://raw.githubusercontent.com/shlexware/Rayfield/main/source.lua"))()
+
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
     LoadingTitle = "Loading...",
@@ -16,6 +17,6 @@ local Window = Rayfield:CreateWindow({
         FileName = "MoseeriKey",
         SaveKey = true,
         GrabKeyFromSite = true,
-        Key = {"https://raw.githubusercontent.com/moseeri01/key/main/key.txt"}
+        Key = "https://raw.githubusercontent.com/moseeri01/key/main/key.txt"
     }
 })
