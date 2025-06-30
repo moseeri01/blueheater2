@@ -6,7 +6,7 @@ local Window = Rayfield:CreateWindow({
     LoadingSubtitle = "By Amira",
     ConfigurationSaving = {
         Enabled = true,
-        FolderName = nil,
+        FolderName = nil, -- หรือใส่ชื่อโฟลเดอร์ เช่น "MoseeriFolder"
         FileName = "MoseeriHub"
     },
     KeySystem = true,
@@ -17,6 +17,17 @@ local Window = Rayfield:CreateWindow({
         FileName = "MoseeriKey",
         SaveKey = true,
         GrabKeyFromSite = true,
-        Key = {"https://raw.githubusercontent.com/moseeri01/key/main/key.txt"}
+        Key = {"moseeri123"}, -- สำรองไว้หากเว็บโหลดไม่ได้
+        KeyLink = "https://raw.githubusercontent.com/moseeri01/key/main/key.txt"
     }
+})
+
+local MainTab = Window:CreateTab("Main")
+local MainSection = MainTab:CreateSection("Moseeri Feature")
+
+MainSection:CreateButton({
+    Name = "Click Me!",
+    Callback = function()
+        print("Hello from Moseeri Hub!")
+    end
 })
