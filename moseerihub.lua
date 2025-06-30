@@ -1,14 +1,16 @@
--- moseerihub.lua
-
--- 1️⃣ เรียกไลบรารี Rayfield จาก Sirius
+-- เรียก Rayfield (Sirius)
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
--- 2️⃣ สร้างหน้าต่างหลัก พร้อมระบบ KeySystem ดึงจาก key.txt ใน repo
+-- สร้างหน้าต่างหลัก
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
-    LoadingTitle = "Loading...",
-    LoadingSubtitle = "Auto Farm System",
-    ConfigurationSaving = { Enabled = true, FolderName = nil, FileName = "MoseeriHub" },
+    LoadingTitle = "Moseeri Hub",
+    LoadingSubtitle = "by Moseeri",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = nil,
+        FileName = "MoseeriHub"
+    },
     KeySystem = true,
     KeySettings = {
         Title = "Moseeri Key",
@@ -17,118 +19,285 @@ local Window = Rayfield:CreateWindow({
         FileName = "MoseeriKey",
         SaveKey = true,
         GrabKeyFromSite = true,
-        Key = {"https://raw.githubusercontent.com/moseeri01/key/main/key.txt"}
+        Key = { "https://raw.githubusercontent.com/moseeri01/key/main/key.txt" }
     }
 })
--- 2) แจ้งเตือนเมื่อโหลดเสร็จ
+
+-- แจ้งเตือนเมื่อโหลดเสร็จ
 Rayfield:Notify({
     Title = "Welcome!",
     Content = "Moseeri Hub Loaded",
     Duration = 4,
     Image = 13047715178,
     Actions = {
-        Okay = { Name = "Close", Callback = function() print("User accepted") end }
+        Close = { Name = "Close", Callback = function() print("Hub Closed") end }
     }
 })
 
--- 3) แท็บ Home
+----------------------------------------
+-- Tab: 🏠 Home
+----------------------------------------
 local HomeTab     = Window:CreateTab("🏠 Home", nil)
 local HomeSection = HomeTab:CreateSection("Main")
 
-HomeSection:CreateLabel("Welcome to Moseeri Hub!")
+HomeSection:CreateLabel("👋 Welcome to Moseeri Hub!")
+
 HomeSection:CreateButton({
     Name = "Rejoin Server",
     Callback = function()
-        game:GetService("TeleportService"):Teleport(game.PlaceId)
+        game:GetService("Players").LocalPlayer:Kick("Rejoining…")
     end
 })
 
--- 4) แท็บ Teleports
-local TP    = Window:CreateTab("🏝 Teleports", nil)
-local TPsec = TP:CreateSection("Maps")
-
-TPsec:CreateButton({ Name = "Starter Island",    Callback = function() /* โค้ดวาร์ป */ end })
-TPsec:CreateButton({ Name = "Pirate Island",     Callback = function() /* โค้ดวาร์ป */ end })
-TPsec:CreateButton({ Name = "Pineapple Paradise", Callback = function() /* โค้ดวาร์ป */ end })
-
--- 5) แท็บ Auto Farm
-local AF    = Window:CreateTab("🏹 Auto Farm", nil)
-local AFsec = AF:CreateSection("Farming Control")
-
--- 🔸 ตัวแปรควบคุม
-getgenv().autoFarm    = false
-getgenv().selectedMob = nil
-getgenv().delayWarp   = 0.1
-
--- 🔸 โฟลเดอร์ม็อบ
-local monFolder = workspace:WaitForChild("Monster",5):WaitForChild("Mon",5)
-if not monFolder then
-    warn("❌ ไม่พบ Monster.Mon ใน workspace")
-    return
-end
-
--- 🔸 เตรียมรายชื่อม็อบเบื้องต้น
-local mobList = {}
-for _, m in ipairs(monFolder:GetChildren()) do
-    table.insert(mobList, m.Name)
-end
-
--- 🔸 สร้าง Dropdown ให้เลือกม็อบ
-local dropdown = AFsec:CreateDropdown({
-    Name          = "Select Mob",
-    Options       = mobList,
-    CurrentOption = mobList[1],
-    Callback      = function(option)
-        getgenv().selectedMob = option
+HomeSection:CreateButton({
+    Name = "Destroy GUI",
+    Callback = function()
+        Rayfield:Destroy()
     end
 })
 
--- 🔸 ฟังก์ชันอัปเดตรายชื่อม็อบอัตโนมัติ
-local function updateMobs()
-    local newList = {}
-    for _, m in ipairs(monFolder:GetChildren()) do
-        table.insert(newList, m.Name)
-    end
-    dropdown:Refresh(newList)
-end
+----------------------------------------
+-- Tab: Main Features
+----------------------------------------
+local MFTab     = Window:CreateTab("Main Features", nil)
+local MFSec     = MFTab:CreateSection("Features")
 
--- เรียกครั้งแรก + ผูกอีเวนต์
-updateMobs()
-monFolder.ChildAdded:Connect(updateMobs)
-monFolder.ChildRemoved:Connect(updateMobs)
-
--- 🔸 Slider ปรับ Delay ระหว่างวาร์ป
-AFsec:CreateSlider({
-    Name         = "Warp Delay",
-    Range        = {0.05, 1},
-    Increment    = 0.05,
-    Suffix       = "s",
-    CurrentValue = getgenv().delayWarp,
-    Callback     = function(v)
-        getgenv().delayWarp = v
+-- Auto Farm
+getgenv().autoFarm        = false
+MFSec:CreateToggle({
+    Name = "Auto Farm",
+    CurrentValue = false,
+    Flag = "Main_AutoFarm",
+    Tooltip = "เปิด/ปิดการฟาร์มอัตโนมัติ",
+    Callback = function(v)
+        getgenv().autoFarm = v
+        print("Auto Farm:", v)
     end,
 })
 
--- 🔸 Toggle เปิด/ปิด Auto Farm
-AFsec:CreateToggle({
-    Name         = "Enable Auto Farm",
+-- Chest Farm
+getgenv().chestFarm      = false
+MFSec:CreateToggle({
+    Name = "Chest Farm",
     CurrentValue = false,
-    Callback     = function(val)
-        getgenv().autoFarm = val
-        if val then
-            spawn(function()
-                while getgenv().autoFarm do
-                    local mob = monFolder:FindFirstChild(getgenv().selectedMob)
-                    if mob and mob:FindFirstChild("HumanoidRootPart") then
-                        local plr = game.Players.LocalPlayer
-                        if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
-                            plr.Character.HumanoidRootPart.CFrame =
-                                mob.HumanoidRootPart.CFrame * CFrame.new(0,0,2)
-                        end
-                    end
-                    task.wait(getgenv().delayWarp)
-                end
-            end)
+    Flag = "Main_ChestFarm",
+    Tooltip = "เปิด/ปิดการเก็บ Chest อัตโนมัติ",
+    Callback = function(v)
+        getgenv().chestFarm = v
+        print("Chest Farm:", v)
+    end,
+})
+
+-- Dodge Mechanism
+getgenv().autoDodge      = false
+MFSec:CreateToggle({
+    Name = "Dodge Mechanism",
+    CurrentValue = false,
+    Flag = "Main_Dodge",
+    Tooltip = "เปิด/ปิดระบบหลบสกิล",
+    Callback = function(v)
+        getgenv().autoDodge = v
+        print("Dodge Mechanism:", v)
+    end,
+})
+
+-- Boss Prioritization
+getgenv().bossPriority   = false
+MFSec:CreateToggle({
+    Name = "Boss Prioritization",
+    CurrentValue = false,
+    Flag = "Main_BossPriority",
+    Tooltip = "โฟกัสบอสก่อน",
+    Callback = function(v)
+        getgenv().bossPriority = v
+        print("Boss Prioritization:", v)
+    end,
+})
+
+-- Kill Aura
+getgenv().killAura       = false
+MFSec:CreateToggle({
+    Name = "Kill Aura",
+    CurrentValue = false,
+    Flag = "Main_KillAura",
+    Tooltip = "เปิด/ปิดระบบ Kill Aura",
+    Callback = function(v)
+        getgenv().killAura = v
+        print("Kill Aura:", v)
+    end,
+})
+
+-- Kill Aura Speed
+getgenv().killAuraSpeed  = 50
+MFSec:CreateSlider({
+    Name = "Kill Aura Speed",
+    Range = {1, 100},
+    Increment = 1,
+    Suffix = "%",
+    CurrentValue = 50,
+    Flag = "Main_KillAuraSpeed",
+    Tooltip = "ปรับความถี่การโจมตีของ Kill Aura",
+    Callback = function(val)
+        getgenv().killAuraSpeed = val
+        print("Kill Aura Speed:", val)
+    end,
+})
+
+----------------------------------------
+-- Tab: Dungeon & Tower
+----------------------------------------
+local DTTab     = Window:CreateTab("Dungeon & Tower", nil)
+local DTSec     = DTTab:CreateSection("Automation")
+
+-- ตัวอย่าง Auto Dungeon
+getgenv().autoDungeon    = false
+DTSec:CreateToggle({
+    Name = "Auto Dungeon",
+    CurrentValue = false,
+    Flag = "DT_AutoDungeon",
+    Tooltip = "เข้า-ออกดันเจี้ยนอัตโนมัติ",
+    Callback = function(v)
+        getgenv().autoDungeon = v
+        print("Auto Dungeon:", v)
+    end,
+})
+
+-- ตัวอย่าง Auto Tower
+getgenv().autoTower      = false
+DTSec:CreateToggle({
+    Name = "Auto Tower",
+    CurrentValue = false,
+    Flag = "DT_AutoTower",
+    Tooltip = "ปีนหอคอยอัตโนมัติ",
+    Callback = function(v)
+        getgenv().autoTower = v
+        print("Auto Tower:", v)
+    end,
+})
+
+-- Interval ระหว่าง Auto Tower
+getgenv().towerInterval  = 5
+DTSec:CreateSlider({
+    Name = "Tower Interval",
+    Range = {1, 60},
+    Increment = 1,
+    Suffix = "s",
+    CurrentValue = 5,
+    Flag = "DT_TowerInterval",
+    Tooltip = "ดีเลย์ระหว่างแต่ละขั้นหอคอย",
+    Callback = function(v)
+        getgenv().towerInterval = v
+        print("Tower Interval:", v)
+    end,
+})
+
+-- ปุ่ม Teleport ตัวอย่าง
+DTSec:CreateButton({
+    Name = "Teleport to Dungeon",
+    Callback = function()
+        local spawn = workspace:FindFirstChild("DungeonSpawn")
+        if spawn then
+            game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawn.CFrame
         end
     end,
 })
+
+DTSec:CreateButton({
+    Name = "Teleport to Tower",
+    Callback = function()
+        local spawn = workspace:FindFirstChild("TowerSpawn")
+        if spawn then
+            game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawn.CFrame
+        end
+    end,
+})
+
+----------------------------------------
+-- Tab: Player
+----------------------------------------
+local PTab      = Window:CreateTab("Player", nil)
+local PMov      = PTab:CreateSection("Movement")
+local PMisc     = PTab:CreateSection("Miscellaneous")
+
+-- Infinite Jump
+getgenv().infJump       = false
+PMov:CreateToggle({
+    Name = "Infinite Jump",
+    CurrentValue = false,
+    Flag = "P_InfJump",
+    Tooltip = "กระโดดไม่จำกัด",
+    Callback = function(v)
+        getgenv().infJump = v
+        print("Infinite Jump:", v)
+    end,
+})
+-- เชื่อม KeyDown ใน background
+if not getgenv().infJumpInit then
+    getgenv().infJumpInit = true
+    local plr = game:GetService("Players").LocalPlayer
+    plr:GetMouse().KeyDown:Connect(function(key)
+        if getgenv().infJump and key:byte() == 32 then
+            local h = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+            if h then
+                h:ChangeState("Jumping")
+            end
+        end
+    end)
+end
+
+-- WalkSpeed Slider
+getgenv().walkSpeed     = 16
+PMov:CreateSlider({
+    Name = "WalkSpeed",
+    Range = {1, 350},
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = 16,
+    Flag = "P_WalkSpeed",
+    Tooltip = "ปรับความเร็วเดิน",
+    Callback = function(v)
+        getgenv().walkSpeed = v
+        local hrp = game.Players.LocalPlayer.Character
+        if hrp then hrp.Humanoid.WalkSpeed = v end
+    end,
+})
+
+-- JumpPower Slider
+getgenv().jumpPower     = 50
+PMov:CreateSlider({
+    Name = "JumpPower",
+    Range = {1, 350},
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = 50,
+    Flag = "P_JumpPower",
+    Tooltip = "ปรับพลังกระโดด",
+    Callback = function(v)
+        getgenv().jumpPower = v
+        local hrp = game.Players.LocalPlayer.Character
+        if hrp then hrp.Humanoid.JumpPower = v end
+    end,
+})
+
+-- Spam Chat
+getgenv().chatSpam      = false
+getgenv().spamText      = "Hello"
+PMisc:CreateToggle({
+    Name = "Spam Chat",
+    CurrentValue = false,
+    Flag = "P_ChatSpam",
+    Tooltip = "ส่งข้อความซ้ำๆ",
+    Callback = function(v)
+        getgenv().chatSpam = v
+        spawn(function()
+            while getgenv().chatSpam do
+                game:GetService("ReplicatedStorage").DefaultChatSystemChatEvents.SayMessageRequest:FireServer(getgenv().spamText, "All")
+                task.wait(1)
+            end
+        end)
+    end,
+})
+PMisc:CreateInput({
+    Name = "Spam Text",
+    PlaceholderText = "พิมพ์ข้อความ...",
+    RemoveTextAfterFocusLost = true,
