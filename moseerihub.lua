@@ -17,7 +17,7 @@ KeySettings = {
    FileName = "MoseeriKey",
    SaveKey = true,
    GrabKeyFromSite = true,
-   Key = {"https://raw.githubusercontent.com/moseeri01/blueheater2/main/key/key.txt"}
+   Key = {"https://raw.githubusercontent.com/moseeri01/blueheater2/main/key.txt"}
 }
 
 })
