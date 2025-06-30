@@ -1,3 +1,4 @@
+local Rayfield = loadstring(game:HttpGet("https://raw.githubusercontent.com/shlexware/Rayfield/main/source.lua"))()
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
     LoadingTitle = "Loading...",
