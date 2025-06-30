@@ -1,192 +1,149 @@
--- เรียก Rayfield (Sirius)
+-- moseerihub.lua
+-- 1️⃣ เรียกไลบรารี Rayfield
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
--- สร้างหน้าต่างหลัก
+-- 2️⃣ สร้างหน้าต่างหลัก
 local Window = Rayfield:CreateWindow({
-    Name = "Moseeri Hub",
-    LoadingTitle = "Moseeri Hub",
-    LoadingSubtitle = "by Moseeri",
-    ConfigurationSaving = {
-        Enabled = true,
-        FolderName = nil,
-        FileName = "MoseeriHub"
-    },
-    KeySystem = true,
-    KeySettings = {
-        Title = "Moseeri Key",
-        Subtitle = "Get your key from Discord",
-        Note = "https://discord.gg/uGX2X3xWvY",
-        FileName = "MoseeriKey",
-        SaveKey = true,
-        GrabKeyFromSite = true,
-        Key = { "https://raw.githubusercontent.com/moseeri01/key/main/key.txt" }
-    }
+   Name = "🔥 Moseeri Hub",
+   LoadingTitle = "Loading Moseeri Hub...",
+   LoadingSubtitle = "Auto Farm System",
+   ConfigurationSaving = {
+      Enabled = true,
+      FolderName = nil,
+      FileName = "MoseeriHubConfig"
+   },
+   Discord = {
+      Enabled = false,
+   },
+   KeySystem = true,
+   KeySettings = {
+      Title = "Moseeri Key",
+      Subtitle = "Get your key from Discord",
+      Note = "https://discord.gg/uGX2X3xWvY",
+      FileName = "MoseeriKey",
+      SaveKey = true,
+      GrabKeyFromSite = true,
+      Key = {
+         "https://raw.githubusercontent.com/moseeri01/key/main/key.txt"
+      }
+   }
 })
 
--- แจ้งเตือนเมื่อโหลดเสร็จ
+-- 3️⃣ แจ้งเตือนเมื่อโหลดเสร็จ
 Rayfield:Notify({
-    Title = "You executed the script",
-    Content = "Very cool GUI",
-    Duration = 5,
-    Image = 13047715178,
-    Actions = {
-        Ignore = {
-            Name = "Okay!",
-            Callback = function()
-                print("The user tapped Okay!")
+   Title = "Welcome!",
+   Content = "Moseeri Hub Loaded",
+   Duration = 4,
+   Image = 13047715178,
+   Actions = {
+      Okay = {
+         Name = "Close",
+         Callback = function() print("User accepted") end
+      }
+   }
+})
+
+-- 4️⃣ สร้างแท็บ Home
+local HomeTab = Window:CreateTab("🏠 Home", nil)
+local HomeSection = HomeTab:CreateSection("Main")
+
+HomeSection:CreateLabel("Welcome to Moseeri Hub!")
+HomeSection:CreateButton({
+   Name = "Rejoin Server",
+   Callback = function()
+      game:GetService("TeleportService"):Teleport(game.PlaceId)
+   end,
+})
+
+-- 5️⃣ สร้างแท็บ Teleports
+local TP = Window:CreateTab("🏝 Teleports", nil)
+local TPsec = TP:CreateSection("Maps")
+
+TPsec:CreateButton({ Name = "Starter Island", Callback = function()
+   -- ใส่ CFrame หรือ CFrame.new() ของ Starter Island
+   local plr = game.Players.LocalPlayer
+   plr.Character:SetPrimaryPartCFrame(CFrame.new(0,10,0))
+end })
+TPsec:CreateButton({ Name = "Pirate Island", Callback = function()
+   local plr = game.Players.LocalPlayer
+   plr.Character:SetPrimaryPartCFrame(CFrame.new(100,10,0))
+end })
+TPsec:CreateButton({ Name = "Pineapple Paradise", Callback = function()
+   local plr = game.Players.LocalPlayer
+   plr.Character:SetPrimaryPartCFrame(CFrame.new(200,10,0))
+end })
+
+-- 6️⃣ สร้างแท็บ Auto Farm
+local AF = Window:CreateTab("🏹 Auto Farm", nil)
+local AFsec = AF:CreateSection("Farming Control")
+
+-- ตัวแปร global
+getgenv().autoFarm    = false
+getgenv().selectedMob = nil
+getgenv().delayWarp   = 0.1
+
+-- หาโฟลเดอร์ม็อบใน Workspace (ตรวจสอบชื่อจริงในเกม)
+local monContainer = workspace:WaitForChild("Monster", 5)
+if not monContainer then warn("❌ ไม่พบโฟลเดอร์ Monster") return end
+local monFolder = monContainer:WaitForChild("Mon", 5)
+if not monFolder then warn("❌ ไม่พบโฟลเดอร์ Mon") return end
+
+-- เตรียมชื่อม็อบ
+local mobList = {}
+local function updateMobs()
+   table.clear(mobList)
+   for _, m in ipairs(monFolder:GetChildren()) do
+      if not table.find(mobList, m.Name) then
+         table.insert(mobList, m.Name)
+      end
+   end
+   dropdown:Refresh(mobList)
+end
+updateMobs()
+monFolder.ChildAdded:Connect(updateMobs)
+monFolder.ChildRemoved:Connect(updateMobs)
+
+-- Dropdown เลือกม็อบ
+local dropdown = AFsec:CreateDropdown({
+   Name = "Select Mob",
+   Options = mobList,
+   CurrentOption = mobList[1],
+   Callback = function(opt)
+      getgenv().selectedMob = opt
+   end,
+})
+
+-- Slider ปรับดีเลย์
+AFsec:CreateSlider({
+   Name = "Warp Delay",
+   Range = {0.05, 1},
+   Increment = 0.05,
+   Suffix = "s",
+   CurrentValue = getgenv().delayWarp,
+   Callback = function(v)
+      getgenv().delayWarp = v
+   end,
+})
+
+-- Toggle เริ่ม/หยุด
+AFsec:CreateToggle({
+   Name = "Enable Auto Farm",
+   CurrentValue = false,
+   Callback = function(val)
+      getgenv().autoFarm = val
+      if val then
+         spawn(function()
+            while getgenv().autoFarm do
+               local mob = monFolder:FindFirstChild(getgenv().selectedMob)
+               if mob and mob:FindFirstChild("HumanoidRootPart") then
+                  local plr = game.Players.LocalPlayer
+                  plr.Character:SetPrimaryPartCFrame(
+                     mob.HumanoidRootPart.CFrame * CFrame.new(0,0,2)
+                  )
+               end
+               task.wait(getgenv().delayWarp)
             end
-        }
-    }
+         end)
+      end
+   end,
 })
-
-
-----------------------------------------
--- Tab: 🏠 Home
-----------------------------------------
-local HomeTab     = Window:CreateTab("🏠 Home", nil)
-local MainSection = HomeTab:CreateSection("Main")
-
--- ปุ่ม Infinite Jump Toggle
-MainSection:CreateButton({
-    Name = "Infinite Jump Toggle",
-    Callback = function()
-        _G.infinjump = not _G.infinjump
-
-        if not _G.infinJumpStarted then
-            _G.infinJumpStarted = true
-            game.StarterGui:SetCore("SendNotification", {
-                Title = "Youtube Hub",
-                Text = "Infinite Jump Activated!",
-                Duration = 5
-            })
-            local plr = game:GetService("Players").LocalPlayer
-            plr:GetMouse().KeyDown:Connect(function(k)
-                if _G.infinjump and k:byte() == 32 then
-                    local h = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
-                    if h then
-                        h:ChangeState("Jumping")
-                        task.wait()
-                        h:ChangeState("Seated")
-                    end
-                end
-            end)
-        end
-    end,
-})
-
--- Slider: WalkSpeed
-MainSection:CreateSlider({
-    Name = "WalkSpeed Slider",
-    Range = {1, 350},
-    Increment = 1,
-    Suffix = "Speed",
-    CurrentValue = 16,
-    Flag = "sliderws",
-    Callback = function(Value)
-        local char = game.Players.LocalPlayer.Character
-        if char then char.Humanoid.WalkSpeed = Value end
-    end,
-})
-
--- Slider: JumpPower
-MainSection:CreateSlider({
-    Name = "JumpPower Slider",
-    Range = {1, 350},
-    Increment = 1,
-    Suffix = "Power",
-    CurrentValue = 50,
-    Flag = "sliderjp",
-    Callback = function(Value)
-        local char = game.Players.LocalPlayer.Character
-        if char then char.Humanoid.JumpPower = Value end
-    end,
-})
-
--- Dropdown: Select Area
-MainSection:CreateDropdown({
-    Name = "Select Area",
-    Options = {"Starter World", "Pirate Island", "Pineapple Paradise"},
-    CurrentOption = "Starter World",
-    MultipleOptions = false,
-    Flag = "dropdownarea",
-    Callback = function(Option)
-        print("Selected Area:", Option)
-        -- ตัวอย่าง: Teleport ไปยังโซนที่เลือก
-        -- local spawn = workspace:FindFirstChild(Option.."Spawn")
-        -- if spawn then
-        --     game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawn.CFrame
-        -- end
-    end,
-})
-
--- Input: Walkspeed
-MainSection:CreateInput({
-    Name = "Walkspeed",
-    PlaceholderText = "1-500",
-    RemoveTextAfterFocusLost = true,
-    Callback = function(Text)
-        local v = tonumber(Text)
-        if v then
-            local char = game.Players.LocalPlayer.Character
-            if char then char.Humanoid.WalkSpeed = v end
-        end
-    end,
-})
-
--- Section: Other
-local OtherSection = MainSection -- หรือ HomeTab:CreateSection("Other")
-OtherSection:CreateToggle({
-    Name = "Auto Farm",
-    CurrentValue = false,
-    Flag = "Toggle1",
-    Callback = function(Value)
-        print("Farming:", Value)
-        -- เรียกฟังก์ชัน Auto Farm ของคุณตรงนี้
-    end,
-})
-
-
-----------------------------------------
--- Tab: 🏝 Teleports
-----------------------------------------
-local TPTab = Window:CreateTab("🏝 Teleports", nil)
-
-TPTab:CreateButton({
-    Name = "Starter Island",
-    Callback = function()
-        -- Teleport1
-        local spawn = workspace:FindFirstChild("StarterIslandSpawn")
-        if spawn then
-            game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawn.CFrame
-        end
-    end,
-})
-
-TPTab:CreateButton({
-    Name = "Pirate Island",
-    Callback = function()
-        -- Teleport2
-        local spawn = workspace:FindFirstChild("PirateIslandSpawn")
-        if spawn then
-            game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawn.CFrame
-        end
-    end,
-})
-
-TPTab:CreateButton({
-    Name = "Pineapple Paradise",
-    Callback = function()
-        -- Teleport3
-        local spawn = workspace:FindFirstChild("PineappleParadiseSpawn")
-        if spawn then
-            game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawn.CFrame
-        end
-    end,
-})
-
-
-----------------------------------------
--- Tab: 🎲 Misc
-----------------------------------------
-local MiscTab = Window:CreateTab("🎲 Misc", nil)
--- เพิ่มปุ่มหรือคอนโทรลอื่น ๆ ในนี้ตามต้องการ
