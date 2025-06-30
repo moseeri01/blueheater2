@@ -1,85 +1,85 @@
-local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
     LoadingTitle = "Loading...",
-    LoadingSubtitle = "Auto Farm Hub",
+    LoadingSubtitle = "Auto Farm System",
     ConfigurationSaving = {
         Enabled = true,
-        FolderName = "MoseeriHub",
-        FileName = "config"
+        FolderName = nil,
+        FileName = "MoseeriHub"
     },
     KeySystem = true,
     KeySettings = {
         Title = "Moseeri Key",
-        Subtitle = "มาจาก Discord",
-        Note = "https://discord.gg/yourinvite",
-        FileName = "moseerikey",
+        Subtitle = "Get your key from Discord",
+        Note = "https://discord.gg/uGX2X3xWvY",
+        FileName = "MoseeriKey",
         SaveKey = true,
         GrabKeyFromSite = true,
-        Key = {"https://raw.githubusercontent.com/YourUser/YourRepo/main/key.txt"}
+        Key = {"https://raw.githubusercontent.com/moseeri01/key/main/key.txt"}
     }
 })
 
--- หน้า Main
-local Main = Window:CreateTab("🎯 Main", nil)
-local FarmSec = Main:CreateSection("🛡️ Auto Farm Settings")
+-- สร้างแท็บและ Section
+local MainTab = Window:CreateTab("⚔️ Auto Farm")
+local FarmSection = MainTab:CreateSection("ตั้งค่าฟาร์ม")
 
--- ตัวแปร Global
+-- ตัวแปรพื้นฐาน
 getgenv().autofarm = false
 getgenv().selectedMob = nil
 getgenv().delayTime = 0.1
 
 -- ดึงชื่อ Mob จาก Workspace
-local mobList = {}
-for _, mob in pairs(game:GetService("Workspace").Monster.Mon:GetChildren()) do
-    if not table.find(mobList, mob.Name) then
-        table.insert(mobList, mob.Name)
+local mobs = {}
+for _, v in pairs(game:GetService("Workspace").Monster.Mon:GetChildren()) do
+    if not table.find(mobs, v.Name) then
+        table.insert(mobs, v.Name)
     end
 end
 
--- เมนูเลือก Mob
-FarmSec:CreateDropdown({
-    Name = "Select Mob",
-    Options = mobList,
-    CurrentOption = mobList[1] or "None",
+-- Dropdown เลือกมอน
+FarmSection:CreateDropdown({
+    Name = "เลือกมอนสเตอร์",
+    Options = mobs,
+    CurrentOption = mobs[1] or "None",
     Callback = function(value)
         getgenv().selectedMob = value
     end
 })
 
--- Slider ตั้งดีเลย์
-FarmSec:CreateSlider({
-    Name = "Delay (seconds)",
+-- Slider ตั้งดีเลย์ตี
+FarmSection:CreateSlider({
+    Name = "ตั้งค่าดีเลย์",
     Range = {0.05, 2},
     Increment = 0.05,
     Suffix = "s",
     CurrentValue = 0.1,
-    Callback = function(v)
-        getgenv().delayTime = v
+    Callback = function(value)
+        getgenv().delayTime = value
     end
 })
 
--- ปุ่ม Auto Farm พร้อมไอคอน
-FarmSec:CreateToggle({
-    Name = "⚔️ Auto Farm",
+-- ปุ่ม Auto Farm
+FarmSection:CreateToggle({
+    Name = "เริ่มฟาร์ม",
     CurrentValue = false,
-    Callback = function(enabled)
-        getgenv().autofarm = enabled
-        if enabled then
-            startAutoFarm()
+    Callback = function(value)
+        getgenv().autofarm = value
+        if value then
+            AutoFarm()
         end
     end
 })
 
 -- ฟังก์ชัน Auto Farm
-function startAutoFarm()
+function AutoFarm()
     task.spawn(function()
         while getgenv().autofarm do
-            local root = game.Players.LocalPlayer.Character and game.Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-            local mob = game:GetService("Workspace").Monster.Mon:FindFirstChild(getgenv().selectedMob or "")
-            if root and mob and mob:FindFirstChild("HumanoidRootPart") then
-                root.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0,0,2)
+            local mob = game:GetService("Workspace").Monster.Mon:FindFirstChild(getgenv().selectedMob)
+            local player = game.Players.LocalPlayer
+            if mob and mob:FindFirstChild("HumanoidRootPart") and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                player.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
             end
             task.wait(getgenv().delayTime)
         end
