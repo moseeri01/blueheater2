@@ -1,9 +1,9 @@
 -- moseerihub.lua
 
--- เรียก Rayfield (Sirius)
+-- 1️⃣ เรียกไลบรารี Rayfield จาก Sirius
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
--- สร้างหน้าต่างหลัก
+-- 2️⃣ สร้างหน้าต่างหลัก พร้อมระบบ KeySystem ดึงจาก key.txt ใน repo
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
     LoadingTitle = "Loading...",
@@ -21,7 +21,7 @@ local Window = Rayfield:CreateWindow({
     }
 })
 
--- ข้อความแจ้งตอนโหลดเสร็จ
+-- 3️⃣ แจ้งเตือนตอนโหลดเสร็จ
 Rayfield:Notify({
    Title = "Welcome!",
    Content = "Moseeri Hub Loaded",
@@ -32,63 +32,83 @@ Rayfield:Notify({
    }
 })
 
--- // Tab: Auto Farm
+-- 4️⃣ สร้าง Tab + Section สำหรับ Auto Farm
 local Tab = Window:CreateTab("🏹 Auto Farm")
 local Section = Tab:CreateSection("Farming Control")
 
--- Global vars
-getgenv().autoFarm = false
-getgenv().selectedMob = ""
-getgenv().delay = 0.1
+-- 5️⃣ เก็บตัวแปร global
+getgenv().autoFarm     = false
+getgenv().selectedMob  = nil
+getgenv().warpDelay    = 0.1
 
--- เก็บรายชื่อม็อบจาก Workspace
-local mobs = {}
-for _, v in pairs(game:GetService("Workspace").Monster.Mon:GetChildren()) do
-    if not table.find(mobs, v.Name) then
-        table.insert(mobs, v.Name)
-    end
+-- 6️⃣ หาโฟลเดอร์ม็อบใน Workspace (ปรับชื่อโฟลเดอร์ตามเกมจริงของคุณ)
+local workspace = game:GetService("Workspace")
+local monRoot = workspace:WaitForChild("Monster", 10)        -- รอ Monster folder
+if not monRoot then
+    warn("❌ ไม่พบโฟลเดอร์ Monster ใน Workspace")
+    return
+end
+local monFolder = monRoot:WaitForChild("Mon", 10)            -- รอ Mon subfolder
+if not monFolder then
+    warn("❌ ไม่พบโฟลเดอร์ Mon ภายใน Monster")
+    return
 end
 
--- Dropdown: เลือกม็อบ
-Section:CreateDropdown({
+-- 7️⃣ เตรียมอาร์เรย์ชื่อม็อบ
+local mobs = {}
+local function refreshMobs()
+    table.clear(mobs)
+    for _, m in ipairs(monFolder:GetChildren()) do
+        if not table.find(mobs, m.Name) then
+            table.insert(mobs, m.Name)
+        end
+    end
+    dropdown:Refresh(mobs)
+end
+refreshMobs()
+monFolder.ChildAdded:Connect(refreshMobs)
+monFolder.ChildRemoved:Connect(refreshMobs)
+
+-- 8️⃣ สร้าง Dropdown ให้เลือกม็อบ
+local dropdown = Section:CreateDropdown({
    Name = "Select Mob",
    Options = mobs,
    CurrentOption = mobs[1],
-   Callback = function(option)
-      getgenv().selectedMob = option
+   Callback = function(opt)
+      getgenv().selectedMob = opt
    end,
 })
 
--- Slider: กำหนด Delay
+-- 9️⃣ สร้าง Slider ให้ปรับ Delay
 Section:CreateSlider({
-   Name = "Delay Between Warps",
+   Name = "Warp Delay",
    Range = {0.05, 1},
    Increment = 0.05,
-   Suffix = "Sec",
-   CurrentValue = 0.1,
-   Callback = function(value)
-      getgenv().delay = value
+   Suffix = "s",
+   CurrentValue = getgenv().warpDelay,
+   Callback = function(v)
+      getgenv().warpDelay = v
    end,
 })
 
--- Toggle: เปิด/ปิด AutoFarm
+-- 🔟 สร้าง Toggle เริ่ม/หยุด Auto Farm
 Section:CreateToggle({
    Name = "Enable Auto Farm",
    CurrentValue = false,
-   Callback = function(state)
-      getgenv().autoFarm = state
-      if state then
-         -- เริ่มฟังก์ชัน AutoFarm
-         spawn(function()
-            while getgenv().autoFarm do
-               local mob = workspace.Monster.Mon:FindFirstChild(getgenv().selectedMob)
-               if mob and mob:FindFirstChild("HumanoidRootPart") then
-                  local plr = game.Players.LocalPlayer
-                  plr.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
-               end
-               task.wait(getgenv().delay)
-            end
-         end)
+   Callback = function(val)
+      getgenv().autoFarm = val
+      if val then
+          spawn(function()
+              while getgenv().autoFarm do
+                  local mob = monFolder:FindFirstChild(getgenv().selectedMob)
+                  if mob and mob:FindFirstChild("HumanoidRootPart") then
+                      local plr = game.Players.LocalPlayer
+                      plr.Character.HumanoidRootPart.CFrame = 
+                        mob.HumanoidRootPart.CFrame * CFrame.new(0,0,2)
+                  end
+                  task.wait(getgenv().warpDelay)
+              end
+          end)
       end
    end,
 })
