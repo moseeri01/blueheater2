@@ -1,8 +1,11 @@
+-- โหลด Rayfield (Sirius.menu)
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- สร้างหน้าต่างหลัก พร้อมระบบ KeySystem
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
-    LoadingTitle = "Moseeri Hub Loading...",
-    LoadingSubtitle = "Star Stream Style",
+    LoadingTitle = "Loading Moseeri Hub...",
+    LoadingSubtitle = "Auto Farm System",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = nil,
@@ -20,106 +23,140 @@ local Window = Rayfield:CreateWindow({
     }
 })
 
--- MAIN FEATURES Tab
-local TabMain = Window:CreateTab("Main Features", nil)
-local SectionFarm = TabMain:CreateSection("Auto Farming")
+-- แจ้งว่าโหลดเสร็จ
+Rayfield:Notify({
+    Title = "✅ Moseeri Hub Loaded",
+    Content = "Welcome to the hub!",
+    Duration = 4,
+    Image = 13047715178,
+    Actions = {
+        Okay = {
+            Name = "Close",
+            Callback = function() end
+        }
+    }
+})
 
-SectionFarm:CreateToggle({
-    Name = "Enable Auto Farm",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().autoFarm = v
-        if v then
-            print("Auto Farm On")
-            -- Auto farm function here
-        end
+-- ════════════════════════════
+-- 1) MAIN FEATURES TAB
+-- ════════════════════════════
+local TabMain = Window:CreateTab("Main Features", 4483345998)  
+-- 4483345998 = ตัวอย่าง Asset ID ของไอคอน (เปลี่ยนเป็น ID ที่คุณชอบได้)
+
+local SectionFarm = TabMain:CreateSection("Auto Farming")
+-- เก็บชื่อมอนสเตอร์
+local mobs = {}
+for _, v in pairs(game.Workspace.Monster.Mon:GetChildren()) do
+    if not table.find(mobs, v.Name) then
+        table.insert(mobs, v.Name)
+    end
+end
+
+getgenv().autoFarm      = false
+getgenv().selectedMob   = mobs[1] or ""
+getgenv().farmDelay     = 0.1
+
+SectionFarm:CreateDropdown({
+    Name = "Select Mob",
+    Options = mobs,
+    CurrentOption = getgenv().selectedMob,
+    Callback = function(opt)
+        getgenv().selectedMob = opt
     end
 })
-SectionFarm:CreateToggle({
-    Name = "Enable Chest Farm",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().chestFarm = v
-        -- Chest farm function here
-    end
-})
-SectionFarm:CreateToggle({
-    Name = "Enable Dodge Mechanism",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().dodgeMechanism = v
-        -- Dodge code here
-    end
-})
-SectionFarm:CreateToggle({
-    Name = "Boss Prioritization",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().bossPriority = v
-        -- Prioritize boss code here
-    end
-})
-SectionFarm:CreateToggle({
-    Name = "Enable Kill Aura",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().killAura = v
-        -- Kill aura code here
-    end
-})
-SectionFarm:CreateToggle({
-    Name = "Kill Aura (With Staff)",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().killAuraStaff = v
-        -- Kill aura staff code here
-    end
-})
-SectionFarm:CreateParagraph({
-    Title = "About Kill Aura With Staff",
-    Content = "Even though it appears to work from a distance, you need to be close for it to deal damage."
-})
+
 SectionFarm:CreateSlider({
-    Name = "Kill Aura Speed",
+    Name = "Delay Between Warps",
     Range = {0.05, 1},
     Increment = 0.05,
     Suffix = "s",
-    CurrentValue = 0.1,
-    Callback = function(Value)
-        getgenv().killAuraSpeed = Value
-    end,
+    CurrentValue = getgenv().farmDelay,
+    Flag = "FarmDelay",
+    Callback = function(val)
+        getgenv().farmDelay = val
+    end
 })
 
--- DUNGEON & TOWER Tab
-local TabDungeon = Window:CreateTab("Dungeon & Tower", nil)
+SectionFarm:CreateToggle({
+    Name = "Enable Auto Farm",
+    CurrentValue = getgenv().autoFarm,
+    Flag = "ToggleAutoFarm",
+    Callback = function(val)
+        getgenv().autoFarm = val
+        if val then
+            spawn(function()
+                while getgenv().autoFarm do
+                    local mob = workspace.Monster.Mon:FindFirstChild(getgenv().selectedMob)
+                    if mob and mob:FindFirstChild("HumanoidRootPart") then
+                        local plr = game.Players.LocalPlayer
+                        plr.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0,0,2)
+                    end
+                    task.wait(getgenv().farmDelay)
+                end
+            end)
+        end
+    end
+})
+
+-- ════════════════════════════
+-- 2) DUNGEON & TOWER TAB
+-- ════════════════════════════
+local TabDungeon = Window:CreateTab("Dungeon & Tower", 6023426942)
 local SectionDungeon = TabDungeon:CreateSection("Dungeon Scripts")
 SectionDungeon:CreateButton({
     Name = "Auto Dungeon",
     Callback = function()
-        print("Auto Dungeon!")
-    end,
-})
-
--- PLAYER Tab
-local TabPlayer = Window:CreateTab("Player", nil)
-local SectionPlayer = TabPlayer:CreateSection("Player Options")
-SectionPlayer:CreateToggle({
-    Name = "Infinite Jump",
-    CurrentValue = false,
-    Callback = function(v)
-        getgenv().infJump = v
-        -- Infinite Jump code
+       print("Running Auto Dungeon...")
+       -- ใส่โค้ด Auto Dungeon ที่นี่
     end
 })
+
+-- ════════════════════════════
+-- 3) PLAYER TAB
+-- ════════════════════════════
+local TabPlayer = Window:CreateTab("Player", 147826918)  
+local SectionPlayer = TabPlayer:CreateSection("Player Options")
+
+getgenv().infJump = false
+SectionPlayer:CreateToggle({
+    Name = "Infinite Jump",
+    CurrentValue = getgenv().infJump,
+    Flag = "InfJumpToggle",
+    Callback = function(val)
+        getgenv().infJump = val
+        if val then
+            local plr = game.Players.LocalPlayer
+            plr.Character.Humanoid.JumpPower = 50
+            game:GetService("UserInputService").JumpRequest:Connect(function()
+                if getgenv().infJump then
+                    plr.Character.Humanoid:ChangeState("Jumping")
+                end
+            end)
+        end
+    end
+})
+
 SectionPlayer:CreateSlider({
     Name = "Walkspeed",
-    Range = {10, 100},
+    Range = {16, 200},
     Increment = 1,
     Suffix = "Speed",
     CurrentValue = 16,
-    Callback = function(Value)
-        game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = Value
-    end,
+    Flag = "WalkSpeedSlider",
+    Callback = function(val)
+        game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = val
+    end
 })
 
--- สามารถเพิ่ม Tab อื่นๆ ได้เช่น "Place", "Misc", "Settings" ตามตัวอย่างในคลิป
+-- ════════════════════════════
+-- 4) MISC TAB
+-- ════════════════════════════
+local TabMisc = Window:CreateTab("Misc", 5012544693)
+local SectionMisc = TabMisc:CreateSection("Utilities")
+SectionMisc:CreateButton({
+    Name = "Teleport to Spawn",
+    Callback = function()
+        local spawnCFrame = workspace.SpawnLocation.CFrame
+        game.Players.LocalPlayer.Character.HumanoidRootPart.CFrame = spawnCFrame
+    end
+})
