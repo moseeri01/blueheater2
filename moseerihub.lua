@@ -1,25 +1,24 @@
-local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local Window = Rayfield:CreateWindow({
-   Name = "Moseeri Hub",
-   LoadingTitle = "Loading...",
-   LoadingSubtitle = "Auto Farm System",
-   ConfigurationSaving = {
-      Enabled = true,
-      FolderName = "Moseeri",
-      FileName = "HubData"
-   },
-KeySystem = true,
-KeySettings = {
-   Title = "Moseeri Key",
-   Subtitle = "Get your key from Discord",
-   Note = "https://discord.gg/uGX2X3xWv",
-   FileName = "MoseeriKey",
-   SaveKey = true,
-   GrabKeyFromSite = true,
-   Key = {"https://raw.githubusercontent.com/moseeri01/blueheater2/main/key.txt"}
-}
-
+    Name = "Moseeri Hub",
+    LoadingTitle = "Loading...",
+    LoadingSubtitle = "Auto Farm System",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = nil,
+        FileName = "MoseeriHub"
+    },
+    KeySystem = true,
+    KeySettings = {
+        Title = "Moseeri Key",
+        Subtitle = "Get your key from Discord",
+        Note = "https://discord.gg/uGX2X3xWvY",
+        FileName = "MoseeriKey",
+        SaveKey = true,
+        GrabKeyFromSite = true,
+        Key = {"https://raw.githubusercontent.com/moseeri01/key/main/key.txt"}
+    }
 })
 
 Rayfield:Notify({
