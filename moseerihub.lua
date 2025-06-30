@@ -48,10 +48,20 @@ local HomeTab = Window:CreateTab("🏠 Home", nil)
 local HomeSection = HomeTab:CreateSection("Main")
 
 HomeSection:CreateLabel("Welcome to Moseeri Hub!")
+
+-- ปุ่ม Rejoin Server
 HomeSection:CreateButton({
    Name = "Rejoin Server",
    Callback = function()
       game:GetService("TeleportService"):Teleport(game.PlaceId)
+   end,
+})
+
+-- ปุ่ม Destroy GUI
+HomeSection:CreateButton({
+   Name = "Destroy GUI",
+   Callback = function()
+      Rayfield:Destroy()
    end,
 })
 
@@ -60,7 +70,6 @@ local TP = Window:CreateTab("🏝 Teleports", nil)
 local TPsec = TP:CreateSection("Maps")
 
 TPsec:CreateButton({ Name = "Starter Island", Callback = function()
-   -- ใส่ CFrame หรือ CFrame.new() ของ Starter Island
    local plr = game.Players.LocalPlayer
    plr.Character:SetPrimaryPartCFrame(CFrame.new(0,10,0))
 end })
@@ -110,6 +119,19 @@ local dropdown = AFsec:CreateDropdown({
    CurrentOption = mobList[1],
    Callback = function(opt)
       getgenv().selectedMob = opt
+   end,
+})
+
+-- ปุ่ม Refresh Mob List
+AFsec:CreateButton({
+   Name = "Refresh Mob List",
+   Callback = function()
+      updateMobs()
+      Rayfield:Notify({
+         Title = "Refreshed",
+         Content = "Mob list has been updated",
+         Duration = 2
+      })
    end,
 })
 
