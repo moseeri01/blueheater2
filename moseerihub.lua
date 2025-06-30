@@ -1,84 +1,76 @@
+-- โหลด Rayfield UI
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
+-- สร้างหน้าต่าง UI
 local Window = Rayfield:CreateWindow({
-    Name = "Moseeri Hub",
-    LoadingTitle = "กำลังโหลด...",
-    LoadingSubtitle = "Auto Farm",
-    ConfigurationSaving = {
-        Enabled = true,
-        FolderName = nil,
-        FileName = "MoseeriHub"
-    },
-    KeySystem = false
+   Name = "Moseeri Hub",
+   LoadingTitle = "กำลังโหลด Auto Farm",
+   LoadingSubtitle = "Powered by Rayfield",
+   ConfigurationSaving = {
+      Enabled = false
+   },
+   KeySystem = false
 })
 
-local AutoFarmTab = Window:CreateTab("📦 Auto Farm")
-local FarmSection = AutoFarmTab:CreateSection("ตั้งค่าฟาร์ม")
+-- สร้างแท็บ "Auto Farm"
+local FarmTab = Window:CreateTab("Auto Farm", nil)
+local FarmSection = FarmTab:CreateSection("ตั้งค่าการฟาร์ม")
 
--- ✅ ตัวแปร
-getgenv().autofarm = false
-getgenv().selectedMob = nil
-getgenv().farmDelay = 0.1
+-- ตัวแปรควบคุม
+getgenv().AutofarmEnabled = false
+getgenv().SelectedMob = nil
+getgenv().FarmDelay = 0.3
 
-task.wait(1) -- สำคัญ!! เพื่อให้ UI โหลดเสร็จก่อน
+-- รอสักครู่เพื่อให้ UI โหลดเสร็จ
+task.defer(function()
+    task.wait(0.5)
 
--- ✅ ดึงชื่อมอน
-local mobs = {}
-local mobFolder = game:GetService("Workspace"):FindFirstChild("Monster") and game:GetService("Workspace").Monster:FindFirstChild("Mon")
-
-if mobFolder then
-    for _, v in pairs(mobFolder:GetChildren()) do
-        if not table.find(mobs, v.Name) then
-            table.insert(mobs, v.Name)
+    -- ดึงชื่อมอนสเตอร์จาก Workspace
+    local mobs = {}
+    local path = workspace:FindFirstChild("Monster") and workspace.Monster:FindFirstChild("Mon")
+    if path then
+        for _, mob in ipairs(path:GetChildren()) do
+            mobs[#mobs+1] = mob.Name
         end
     end
-else
-    warn("❌ ไม่พบ Workspace.Monster.Mon")
-end
 
--- ✅ Dropdown
-FarmSection:CreateDropdown({
-    Name = "เลือกมอนสเตอร์",
-    Options = mobs,
-    CurrentOption = mobs[1] or "None",
-    Callback = function(option)
-        getgenv().selectedMob = option
-    end
-})
+    -- Dropdown: เลือกมอนสเตอร์
+    FarmSection:CreateDropdown({
+        Name = "เลือกมอนสเตอร์",
+        Options = mobs,
+        CurrentOption = mobs[1] or "",
+        Callback = function(option) getgenv().SelectedMob = option end
+    })
 
--- ✅ Slider
-FarmSection:CreateSlider({
-    Name = "ดีเลย์การตี (วินาที)",
-    Range = {0.05, 1},
-    Increment = 0.05,
-    CurrentValue = 0.1,
-    Callback = function(val)
-        getgenv().farmDelay = val
-    end
-})
+    -- Slider: ตั้งดีเลย์การตี
+    FarmSection:CreateSlider({
+        Name = "Delay (วินาที)",
+        Range = {0.05, 1},
+        Increment = 0.05,
+        CurrentValue = getgenv().FarmDelay,
+        Callback = function(val) getgenv().FarmDelay = val end
+    })
 
--- ✅ Toggle
-FarmSection:CreateToggle({
-    Name = "เริ่ม Auto Farm",
-    CurrentValue = false,
-    Callback = function(value)
-        getgenv().autofarm = value
-        if value then
-            AutoFarm()
-        end
-    end
-})
-
--- ✅ ฟังก์ชัน Auto Farm
-function AutoFarm()
-    spawn(function()
-        while getgenv().autofarm do
-            local mob = mobFolder and mobFolder:FindFirstChild(getgenv().selectedMob)
-            if mob and mob:FindFirstChild("HumanoidRootPart") then
-                local hrp = game.Players.LocalPlayer.Character.HumanoidRootPart
-                hrp.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
+    -- Toggle: เปิด/ปิด Auto Farm
+    FarmSection:CreateToggle({
+        Name = "เปิด Auto Farm",
+        CurrentValue = false,
+        Callback = function(state)
+            getgenv().AutofarmEnabled = state
+            if state then
+                spawn(function()
+                    while getgenv().AutofarmEnabled do
+                        if getgenv().SelectedMob and path then
+                            local mob = path:FindFirstChild(getgenv().SelectedMob)
+                            if mob and mob:FindFirstChild("HumanoidRootPart") then
+                                local plr = game.Players.LocalPlayer
+                                plr.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0,0,2)
+                            end
+                        end
+                        task.wait(getgenv().FarmDelay)
+                    end
+                end)
             end
-            task.wait(getgenv().farmDelay)
         end
-    end)
-end
+    })
+end)
