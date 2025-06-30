@@ -3,7 +3,7 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
     LoadingTitle = "กำลังโหลด...",
-    LoadingSubtitle = "ระบบ Auto Farm",
+    LoadingSubtitle = "Auto Farm",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = nil,
@@ -12,33 +12,41 @@ local Window = Rayfield:CreateWindow({
     KeySystem = false
 })
 
--- ✅ TAB และ SECTION
-local AutoFarmTab = Window:CreateTab("📦 Auto Farm", 4483362458) -- icon optional
+local AutoFarmTab = Window:CreateTab("📦 Auto Farm")
 local FarmSection = AutoFarmTab:CreateSection("ตั้งค่าฟาร์ม")
 
--- ✅ ตัวแปรใช้งาน
+-- ✅ ตัวแปร
 getgenv().autofarm = false
 getgenv().selectedMob = nil
 getgenv().farmDelay = 0.1
 
--- ✅ สร้าง Dropdown มอนสเตอร์
+task.wait(1) -- สำคัญ!! เพื่อให้ UI โหลดเสร็จก่อน
+
+-- ✅ ดึงชื่อมอน
 local mobs = {}
-for _, v in pairs(game:GetService("Workspace"):WaitForChild("Monster"):WaitForChild("Mon"):GetChildren()) do
-    if not table.find(mobs, v.Name) then
-        table.insert(mobs, v.Name)
+local mobFolder = game:GetService("Workspace"):FindFirstChild("Monster") and game:GetService("Workspace").Monster:FindFirstChild("Mon")
+
+if mobFolder then
+    for _, v in pairs(mobFolder:GetChildren()) do
+        if not table.find(mobs, v.Name) then
+            table.insert(mobs, v.Name)
+        end
     end
+else
+    warn("❌ ไม่พบ Workspace.Monster.Mon")
 end
 
+-- ✅ Dropdown
 FarmSection:CreateDropdown({
     Name = "เลือกมอนสเตอร์",
     Options = mobs,
-    CurrentOption = mobs[1],
+    CurrentOption = mobs[1] or "None",
     Callback = function(option)
         getgenv().selectedMob = option
     end
 })
 
--- ✅ สร้าง Slider ตั้งค่าหน่วง
+-- ✅ Slider
 FarmSection:CreateSlider({
     Name = "ดีเลย์การตี (วินาที)",
     Range = {0.05, 1},
@@ -49,7 +57,7 @@ FarmSection:CreateSlider({
     end
 })
 
--- ✅ Toggle เปิด/ปิด AutoFarm
+-- ✅ Toggle
 FarmSection:CreateToggle({
     Name = "เริ่ม Auto Farm",
     CurrentValue = false,
@@ -61,16 +69,14 @@ FarmSection:CreateToggle({
     end
 })
 
--- ✅ ฟังก์ชัน AutoFarm
+-- ✅ ฟังก์ชัน Auto Farm
 function AutoFarm()
     spawn(function()
         while getgenv().autofarm do
-            local mob = game:GetService("Workspace").Monster.Mon:FindFirstChild(getgenv().selectedMob)
+            local mob = mobFolder and mobFolder:FindFirstChild(getgenv().selectedMob)
             if mob and mob:FindFirstChild("HumanoidRootPart") then
-                local player = game.Players.LocalPlayer
-                player.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
-                -- ถ้ามีระบบโจมตีอัตโนมัติแบบกด
-                game:GetService("VirtualUser"):Button1Down(Vector2.new(0, 0))
+                local hrp = game.Players.LocalPlayer.Character.HumanoidRootPart
+                hrp.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
             end
             task.wait(getgenv().farmDelay)
         end
