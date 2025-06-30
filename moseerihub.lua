@@ -1,13 +1,15 @@
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+-- โหลด Rayfield GUI
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
+-- สร้างหน้าต่างหลัก
 local Window = Rayfield:CreateWindow({
     Name = "Moseeri Hub",
     LoadingTitle = "Loading...",
     LoadingSubtitle = "Auto Farm System",
     ConfigurationSaving = {
         Enabled = true,
-        FolderName = nil,
-        FileName = "MoseeriHub"
+        FolderName = "MoseeriHub",
+        FileName = "Settings"
     },
     KeySystem = true,
     KeySettings = {
@@ -21,6 +23,7 @@ local Window = Rayfield:CreateWindow({
     }
 })
 
+-- แจ้งเตือนตอนเริ่ม
 Rayfield:Notify({
    Title = "Welcome!",
    Content = "Moseeri Hub Loaded",
@@ -34,65 +37,68 @@ Rayfield:Notify({
    }
 })
 
--- Section: Auto Farm
+-- สร้าง Tab “Auto Farm”
 local Tab = Window:CreateTab("🏹 Auto Farm")
 local Section = Tab:CreateSection("Farming Control")
 
+-- ตัวแปร global สำหรับควบคุม AutoFarm
 getgenv().autoFarm = false
 getgenv().selectedMob = ""
 getgenv().delay = 0.1
 
--- Dropdown
+-- รวบรวมชื่อมอนจาก Workspace
 local mobs = {}
-for _, v in pairs(game:GetService("Workspace").Monster.Mon:GetChildren()) do
-   if not table.find(mobs, v.Name) then
-      table.insert(mobs, v.Name)
-   end
+for _, v in ipairs(game:GetService("Workspace").Monster.Mon:GetChildren()) do
+    if not table.find(mobs, v.Name) then
+        table.insert(mobs, v.Name)
+    end
 end
 
+-- Dropdown เลือกมอน
 Section:CreateDropdown({
-   Name = "Select Mob",
-   Options = mobs,
-   CurrentOption = mobs[1],
-   Callback = function(Option)
-      getgenv().selectedMob = Option
-   end,
+    Name = "Select Mob",
+    Options = mobs,
+    CurrentOption = mobs[1] or "",
+    Flag = "SelectMob",
+    Callback = function(Option)
+        getgenv().selectedMob = Option
+    end
 })
 
--- Delay Slider
+-- Slider ตั้งค่า Delay
 Section:CreateSlider({
-   Name = "Delay Between Warps",
-   Range = {0.05, 1},
-   Increment = 0.05,
-   Suffix = "Sec",
-   CurrentValue = 0.1,
-   Callback = function(Value)
-      getgenv().delay = Value
-   end,
+    Name = "Delay Between Warps",
+    Range = {0.05, 1},
+    Increment = 0.05,
+    Suffix = " sec",
+    CurrentValue = getgenv().delay,
+    Flag = "WarpDelay",
+    Callback = function(Value)
+        getgenv().delay = Value
+    end
 })
 
--- Toggle AutoFarm
+-- Toggle ปุ่มเปิด/ปิด Auto Farm
 Section:CreateToggle({
-   Name = "Auto Farm",
-   CurrentValue = false,
-   Callback = function(Value)
-      getgenv().autoFarm = Value
-      if Value then
-         AutoFarm()
-      end
-   end,
+    Name = "Auto Farm",
+    CurrentValue = false,
+    Flag = "ToggleAutoFarm",
+    Callback = function(Value)
+        getgenv().autoFarm = Value
+        if Value then AutoFarm() end
+    end
 })
 
--- Farming Function
+-- ฟังก์ชัน AutoFarm
 function AutoFarm()
-   spawn(function()
-      while getgenv().autoFarm do
-         local mob = game:GetService("Workspace").Monster.Mon:FindFirstChild(getgenv().selectedMob)
-         if mob and mob:FindFirstChild("HumanoidRootPart") then
-            local plr = game.Players.LocalPlayer
-            plr.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
-         end
-         task.wait(getgenv().delay)
-      end
-   end)
+    spawn(function()
+        while getgenv().autoFarm do
+            local mob = game:GetService("Workspace").Monster.Mon:FindFirstChild(getgenv().selectedMob)
+            if mob and mob:FindFirstChild("HumanoidRootPart") then
+                local plr = game.Players.LocalPlayer
+                plr.Character.HumanoidRootPart.CFrame = mob.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
+            end
+            task.wait(getgenv().delay)
+        end
+    end)
 end
