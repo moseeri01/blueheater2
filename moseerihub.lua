@@ -17,6 +17,6 @@ local Window = Rayfield:CreateWindow({
       FileName = "MoseeriKey",
       SaveKey = true,
       GrabKeyFromSite = true,
-      Key = "https://raw.githubusercontent.com/moseeri01/key/main/key.txt"
+      Key = {"https://raw.githubusercontent.com/moseeri01/key/main/key.txt"}
    }
 })
