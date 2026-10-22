@@ -32,7 +32,7 @@ local Config = {
     ListLines = 14,
     ScanMaxLines = 300,
     ScreenFill = 0.9,
-    Keybind = Enum.KeyCode.P,
+    Keybind = Enum.KeyCode.RightShift,
 }
 local MacroFolder = Config.Folder .. "/macros"
 local ConfigFile = Config.Folder .. "/config.json"
@@ -78,6 +78,7 @@ local UnitAI = {
     abilityCooldown = 5,
     autoBuff = false,
     buffInterval = 10,
+    minUnitsForBuff = 4,
     autoPlaceFollow = false,
     running = false,
     abilityConnection = nil,
@@ -179,6 +180,7 @@ local function saveConfig()
                 abilityCooldown = UnitAI.abilityCooldown,
                 autoBuff = UnitAI.autoBuff,
                 buffInterval = UnitAI.buffInterval,
+                minUnitsForBuff = UnitAI.minUnitsForBuff,
                 autoPlaceFollow = UnitAI.autoPlaceFollow,
             },
             autoFarm = {
@@ -223,6 +225,7 @@ local function loadConfig()
         if data.unitAI then
             if type(data.unitAI.abilityCooldown) == "number" then UnitAI.abilityCooldown = data.unitAI.abilityCooldown end
             if type(data.unitAI.buffInterval) == "number" then UnitAI.buffInterval = data.unitAI.buffInterval end
+            if type(data.unitAI.minUnitsForBuff) == "number" then UnitAI.minUnitsForBuff = data.unitAI.minUnitsForBuff end
             if data.unitAI.autoAbilities then pendingToggles.autoAbilities = true end
             if data.unitAI.autoBuff then pendingToggles.autoBuff = true end
             if data.unitAI.autoPlaceFollow then pendingToggles.autoPlaceFollow = true end
@@ -1161,9 +1164,13 @@ function PlaybackModule.Play(fromGameStart)
             refreshStatus()
             Tools.totalActions = Tools.totalActions + 1
 
-            local waitTime = (startTime + (action.t + shift) / speedMul) - os.clock()
+            local scheduledTime = startTime + (action.t + shift) / speedMul
+            local waitTime = scheduledTime - os.clock()
             if canRetry and action.spent == true then
-                -- placement: skip wait, fire immediately (fireUntilSpent retries until money spent)
+                -- placement: don't wait, fire now (fireUntilSpent retries until money spent)
+                if waitTime > 0.01 then
+                    shift = shift - (waitTime * speedMul)
+                end
             else
                 if waitTime > 0.01 then task.wait(waitTime) end
             end
@@ -1526,7 +1533,7 @@ local function refreshUnitStatus()
     if not unitStatusParagraph then return end
     local parts = {}
     if UnitAI.autoAbilities then table.insert(parts, "Abilities: ON (every " .. UnitAI.abilityCooldown .. "s)") end
-    if UnitAI.autoBuff then table.insert(parts, "Buff loop: ON (every " .. UnitAI.buffInterval .. "s)") end
+    if UnitAI.autoBuff then table.insert(parts, "Buff loop: ON (every " .. UnitAI.buffInterval .. "s, min " .. UnitAI.minUnitsForBuff .. " units)") end
     if UnitAI.autoPlaceFollow then table.insert(parts, "Auto-place: ON") end
     local folder = unitsFolder()
     local unitCount = folder and #folder:GetChildren() or 0
@@ -1569,17 +1576,19 @@ function UnitAIModule.StartBuff()
             if isGameRunning() then
                 local folder = unitsFolder()
                 if folder then
+                    local myUnits = {}
                     for _, unit in ipairs(folder:GetChildren()) do
-                        if not UnitAI.autoBuff then break end
                         if isMyUnit(unit) then
-                            local stats = unit:FindFirstChild("_stats")
-                            local activeAtk = stats and stats:FindFirstChild("active_attack")
-                            if activeAtk and tostring(activeAtk.Value) ~= "nil" then
-                                local remote = getAARemote("use_active_attack")
-                                if remote then
-                                    pcall(function() remote:InvokeServer(unit) end)
-                                    task.wait(0.1)
-                                end
+                            table.insert(myUnits, unit)
+                        end
+                    end
+                    if #myUnits >= UnitAI.minUnitsForBuff then
+                        local remote = getAARemote("use_active_attack")
+                        if remote then
+                            for _, unit in ipairs(myUnits) do
+                                if not UnitAI.autoBuff then break end
+                                pcall(function() remote:InvokeServer(unit) end)
+                                task.wait(0.1)
                             end
                         end
                     end
@@ -2064,6 +2073,13 @@ buffSection:Slider({
     Default = 10,
     Callback = function(v) UnitAI.buffInterval = v; refreshUnitStatus(); saveConfig() end,
 }, "BuffInterval")
+buffSection:Slider({
+    Name = "Min units before buff starts",
+    Minimum = 1,
+    Maximum = 10,
+    Default = 4,
+    Callback = function(v) UnitAI.minUnitsForBuff = v; refreshUnitStatus(); saveConfig() end,
+}, "MinUnitsForBuff")
 
 buffSection:Header({ Text = "Auto place" })
 buffSection:Toggle({
