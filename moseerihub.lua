@@ -32,7 +32,7 @@ local Config = {
     ListLines = 14,
     ScanMaxLines = 300,
     ScreenFill = 0.9,
-    Keybind = Enum.KeyCode.LeftControl,
+    Keybind = Enum.KeyCode.P,
 }
 local MacroFolder = Config.Folder .. "/macros"
 local ConfigFile = Config.Folder .. "/config.json"
@@ -1162,7 +1162,11 @@ function PlaybackModule.Play(fromGameStart)
             Tools.totalActions = Tools.totalActions + 1
 
             local waitTime = (startTime + (action.t + shift) / speedMul) - os.clock()
-            if waitTime > 0.01 then task.wait(waitTime) end
+            if canRetry and action.spent == true then
+                -- placement: skip wait, fire immediately (fireUntilSpent retries until money spent)
+            else
+                if waitTime > 0.01 then task.wait(waitTime) end
+            end
             if not State.replaying then break end
 
             if canRetry and action.spent == true then
@@ -1475,9 +1479,6 @@ end
 --------------------------------------------------------------------------------
 local UnitAIModule = {}
 
-local ABILITY_KEYWORDS = { "skill", "ability", "activate", "special", "ultimate", "ult", "enchantment" }
-local BUFF_KEYWORDS = { "buff", "boost", "damage", "atk", "def", "speed", "heal", "power", "enhance", "enchantment" }
-
 local function isGameRunning()
     if State.replaying then return true end
     local _data = workspace:FindFirstChild("_DATA")
@@ -1492,84 +1493,33 @@ local function isGameRunning()
     return false
 end
 
-local function selectUnit(unit)
-    if type(fireclickdetector) == "function" then
-        local cd = unit:FindFirstChildOfClass("ClickDetector")
-        if cd then
-            pcall(fireclickdetector, cd)
-            return true
-        end
-        for _, desc in ipairs(unit:GetDescendants()) do
-            if desc:IsA("ClickDetector") then
-                pcall(fireclickdetector, desc)
-                return true
-            end
-        end
-    end
-    local ok = pcall(function()
-        local pivot = unit:GetPivot()
-        local camera = workspace.CurrentCamera
-        if not camera then return end
-        local screenPos, onScreen = camera:WorldToScreenPoint(pivot.Position)
-        if onScreen then
-            VirtualInputManager:SendMouseButtonEvent(screenPos.X, screenPos.Y, 0, true, game, 0)
-            task.wait(0.05)
-            VirtualInputManager:SendMouseButtonEvent(screenPos.X, screenPos.Y, 0, false, game, 0)
-        end
-    end)
+local function getAARemote(name)
+    local endpoints = ReplicatedStorage:FindFirstChild("endpoints")
+    if not endpoints then return nil end
+    local cts = endpoints:FindFirstChild("client_to_server")
+    if not cts then return nil end
+    return cts:FindFirstChild(name)
+end
+
+local function isMyUnit(unit)
+    local stats = unit:FindFirstChild("_stats")
+    if not stats then return false end
+    local playerVal = stats:FindFirstChild("player")
+    if not playerVal then return false end
+    return tostring(playerVal.Value) == Players.LocalPlayer.Name
+end
+
+local function useActiveAttack(unit)
+    local stats = unit:FindFirstChild("_stats")
+    if not stats then return false end
+    local activeAtk = stats:FindFirstChild("active_attack")
+    if activeAtk and tostring(activeAtk.Value) == "nil" then return false end
+    local stateVal = stats:FindFirstChild("state")
+    if stateVal and stateVal.Value ~= "attack" then return false end
+    local remote = getAARemote("use_active_attack")
+    if not remote then return false end
+    local ok = pcall(function() remote:InvokeServer(unit) end)
     return ok
-end
-
-local function findGuiButtons(keywords)
-    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not gui then return {} end
-    local found = {}
-    for _, d in ipairs(gui:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
-            local textLower = d:IsA("TextButton") and string.lower(d.Text) or ""
-            local nameLower = string.lower(d.Name)
-            for _, kw in ipairs(keywords) do
-                if textLower:find(kw, 1, true) or nameLower:find(kw, 1, true) then
-                    table.insert(found, d)
-                    break
-                end
-            end
-        end
-    end
-    return found
-end
-
-local function enableAbilityToggle()
-    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not gui then return end
-    for _, d in ipairs(gui:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("TextLabel")) and d.Visible then
-            local text = string.lower(d:IsA("TextButton") and d.Text or "")
-            local name = string.lower(d.Name)
-            if text == "off" or name:find("toggle") or name:find("ability_off") or name:find("enchant_off") then
-                if d:IsA("TextButton") then
-                    pcall(function() clickButton(d) end)
-                    task.wait(0.15)
-                end
-            end
-        end
-    end
-end
-
-local function tryAbilityRemotes(unit)
-    local names = { "use_ability", "activate_skill", "activate_ability", "unit_ability", "use_skill" }
-    for _, name in ipairs(names) do
-        local remote = ReplicatedStorage:FindFirstChild(name)
-        if remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
-            pcall(function()
-                if remote:IsA("RemoteEvent") then
-                    remote:FireServer(unit)
-                else
-                    remote:InvokeServer(unit)
-                end
-            end)
-        end
-    end
 end
 
 local function refreshUnitStatus()
@@ -1592,25 +1542,13 @@ function UnitAIModule.StartAbilities()
             if isGameRunning() then
                 local folder = unitsFolder()
                 if folder then
-                    local units = folder:GetChildren()
-                    for _, unit in ipairs(units) do
+                    for _, unit in ipairs(folder:GetChildren()) do
                         if not UnitAI.autoAbilities then break end
-                        selectUnit(unit)
-                        task.wait(0.3)
-                        enableAbilityToggle()
-                        local buttons = findGuiButtons(ABILITY_KEYWORDS)
-                        for _, btn in ipairs(buttons) do
-                            pcall(function() clickButton(btn) end)
-                            task.wait(0.15)
+                        if isMyUnit(unit) then
+                            useActiveAttack(unit)
+                            task.wait(0.1)
                         end
-                        tryAbilityRemotes(unit)
-                        task.wait(0.2)
                     end
-                end
-                local globalButtons = findGuiButtons(ABILITY_KEYWORDS)
-                for _, btn in ipairs(globalButtons) do
-                    pcall(function() clickButton(btn) end)
-                    task.wait(0.1)
                 end
             end
             task.wait(UnitAI.abilityCooldown)
@@ -1629,16 +1567,21 @@ function UnitAIModule.StartBuff()
     UnitAI.buffConnection = task.spawn(function()
         while UnitAI.autoBuff do
             if isGameRunning() then
-                local buttons = findGuiButtons(BUFF_KEYWORDS)
-                for _, btn in ipairs(buttons) do
-                    pcall(function() clickButton(btn) end)
-                    task.wait(0.2)
-                end
-                local buffNames = { "use_buff", "activate_buff", "buff", "use_item" }
-                for _, name in ipairs(buffNames) do
-                    local remote = ReplicatedStorage:FindFirstChild(name)
-                    if remote and remote:IsA("RemoteEvent") then
-                        pcall(function() remote:FireServer() end)
+                local folder = unitsFolder()
+                if folder then
+                    for _, unit in ipairs(folder:GetChildren()) do
+                        if not UnitAI.autoBuff then break end
+                        if isMyUnit(unit) then
+                            local stats = unit:FindFirstChild("_stats")
+                            local activeAtk = stats and stats:FindFirstChild("active_attack")
+                            if activeAtk and tostring(activeAtk.Value) ~= "nil" then
+                                local remote = getAARemote("use_active_attack")
+                                if remote then
+                                    pcall(function() remote:InvokeServer(unit) end)
+                                    task.wait(0.1)
+                                end
+                            end
+                        end
                     end
                 end
             end
@@ -1657,19 +1600,28 @@ function UnitAIModule.StartAutoPlace()
     if UnitAI.placeConnection then return end
     UnitAI.placeConnection = task.spawn(function()
         while UnitAI.autoPlaceFollow do
-            local spawnRemote = ReplicatedStorage:FindFirstChild(Config.SpawnRemote)
+            local spawnRemote = getAARemote("spawn_unit")
             if not spawnRemote or not isGameRunning() then
                 task.wait(1)
             else
-                local bases = workspace:FindFirstChild("_BASES")
-                if bases then
-                    for _, base in ipairs(bases:GetChildren()) do
-                        if not base:GetAttribute("occupied") then
-                            pcall(function()
-                                local pos = base:GetPivot().Position
-                                spawnRemote:FireServer(pos + Vector3.new(0, 1, 0))
-                            end)
-                            task.wait(0.5)
+                local inventory = Players.LocalPlayer:FindFirstChild("_stats")
+                local units = inventory and inventory:FindFirstChild("units")
+                if units then
+                    for _, child in ipairs(units:GetChildren()) do
+                        if not UnitAI.autoPlaceFollow then break end
+                        local uuid = child.Name
+                        local bases = workspace:FindFirstChild("_BASES")
+                        if bases then
+                            for _, base in ipairs(bases:GetChildren()) do
+                                if not base:GetAttribute("occupied") then
+                                    pcall(function()
+                                        local pos = base:GetPivot().Position
+                                        spawnRemote:InvokeServer(uuid, CFrame.new(pos))
+                                    end)
+                                    task.wait(0.3)
+                                    break
+                                end
+                            end
                         end
                     end
                 end
