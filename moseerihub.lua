@@ -174,11 +174,37 @@ local function saveConfig()
         writefile(ConfigFile, HttpService:JSONEncode({
             webhook = { url = Webhook.url, notifyComplete = Webhook.notifyComplete, notifyFail = Webhook.notifyFail },
             dungeon = { remoteMap = DungeonBot.remoteMap, shrineEnabled = DungeonBot.shrineEnabled, autoBuyBuffs = DungeonBot.autoBuyBuffs },
-            unitAI = { abilityCooldown = UnitAI.abilityCooldown, buffInterval = UnitAI.buffInterval },
-            autoFarm = { speedMultiplier = AutoFarm.speedMultiplier },
+            unitAI = {
+                autoAbilities = UnitAI.autoAbilities,
+                abilityCooldown = UnitAI.abilityCooldown,
+                autoBuff = UnitAI.autoBuff,
+                buffInterval = UnitAI.buffInterval,
+                autoPlaceFollow = UnitAI.autoPlaceFollow,
+            },
+            autoFarm = {
+                autoReplay = AutoFarm.autoReplay,
+                autoNextStage = AutoFarm.autoNextStage,
+                autoLeave = AutoFarm.autoLeave,
+                leaveAtWave = AutoFarm.leaveAtWave,
+                speedMultiplier = AutoFarm.speedMultiplier,
+                autoSell = AutoFarm.autoSell,
+                sellAtWave = AutoFarm.sellAtWave,
+                sellUnitName = AutoFarm.sellUnitName,
+            },
+            macro = {
+                retryPlacements = State.retryPlacements,
+                autoPlay = State.autoPlay,
+                showAllMacros = State.showAllMacros,
+                lastMacro = State.macroName,
+            },
+            tools = {
+                antiAfk = Tools.antiAfk,
+            },
         }))
     end)
 end
+
+local pendingToggles = {}
 
 local function loadConfig()
     if not hasFileApi() or not isfile(ConfigFile) then return end
@@ -197,9 +223,30 @@ local function loadConfig()
         if data.unitAI then
             if type(data.unitAI.abilityCooldown) == "number" then UnitAI.abilityCooldown = data.unitAI.abilityCooldown end
             if type(data.unitAI.buffInterval) == "number" then UnitAI.buffInterval = data.unitAI.buffInterval end
+            if data.unitAI.autoAbilities then pendingToggles.autoAbilities = true end
+            if data.unitAI.autoBuff then pendingToggles.autoBuff = true end
+            if data.unitAI.autoPlaceFollow then pendingToggles.autoPlaceFollow = true end
         end
         if data.autoFarm then
             if type(data.autoFarm.speedMultiplier) == "number" then AutoFarm.speedMultiplier = data.autoFarm.speedMultiplier end
+            if data.autoFarm.autoReplay then AutoFarm.autoReplay = true end
+            if data.autoFarm.autoNextStage then AutoFarm.autoNextStage = true end
+            if data.autoFarm.autoLeave then AutoFarm.autoLeave = true end
+            if type(data.autoFarm.leaveAtWave) == "number" then AutoFarm.leaveAtWave = data.autoFarm.leaveAtWave end
+            if data.autoFarm.autoSell then AutoFarm.autoSell = true end
+            if type(data.autoFarm.sellAtWave) == "number" then AutoFarm.sellAtWave = data.autoFarm.sellAtWave end
+            if type(data.autoFarm.sellUnitName) == "string" then AutoFarm.sellUnitName = data.autoFarm.sellUnitName end
+        end
+        if data.macro then
+            if data.macro.retryPlacements ~= nil then State.retryPlacements = data.macro.retryPlacements end
+            if data.macro.autoPlay then State.autoPlay = true end
+            if data.macro.showAllMacros then State.showAllMacros = true end
+            if type(data.macro.lastMacro) == "string" and #data.macro.lastMacro > 0 then
+                State.macroName = data.macro.lastMacro
+            end
+        end
+        if data.tools then
+            if data.tools.antiAfk then pendingToggles.antiAfk = true end
         end
     end)
 end
@@ -1428,14 +1475,21 @@ end
 --------------------------------------------------------------------------------
 local UnitAIModule = {}
 
-local ABILITY_KEYWORDS = { "skill", "ability", "activate", "special", "ultimate", "ult" }
-local BUFF_KEYWORDS = { "buff", "boost", "damage", "atk", "def", "speed", "heal", "power", "enhance" }
+local ABILITY_KEYWORDS = { "skill", "ability", "activate", "special", "ultimate", "ult", "enchantment" }
+local BUFF_KEYWORDS = { "buff", "boost", "damage", "atk", "def", "speed", "heal", "power", "enhance", "enchantment" }
 
 local function isGameRunning()
+    if State.replaying then return true end
     local _data = workspace:FindFirstChild("_DATA")
-    if not _data then return false end
-    local gameStarted = _data:FindFirstChild("GameStarted")
-    return (gameStarted and gameStarted.Value == true) or State.replaying
+    if _data then
+        local gameStarted = _data:FindFirstChild("GameStarted")
+        if gameStarted and gameStarted.Value == true then return true end
+        local wave = _data:FindFirstChild("Wave") or _data:FindFirstChild("CurrentWave")
+        if wave and (wave:IsA("IntValue") or wave:IsA("NumberValue")) and wave.Value > 0 then return true end
+    end
+    local folder = unitsFolder()
+    if folder and #folder:GetChildren() > 0 then return true end
+    return false
 end
 
 local function selectUnit(unit)
@@ -1485,6 +1539,23 @@ local function findGuiButtons(keywords)
     return found
 end
 
+local function enableAbilityToggle()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    for _, d in ipairs(gui:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("TextLabel")) and d.Visible then
+            local text = string.lower(d:IsA("TextButton") and d.Text or "")
+            local name = string.lower(d.Name)
+            if text == "off" or name:find("toggle") or name:find("ability_off") or name:find("enchant_off") then
+                if d:IsA("TextButton") then
+                    pcall(function() clickButton(d) end)
+                    task.wait(0.15)
+                end
+            end
+        end
+    end
+end
+
 local function tryAbilityRemotes(unit)
     local names = { "use_ability", "activate_skill", "activate_ability", "unit_ability", "use_skill" }
     for _, name in ipairs(names) do
@@ -1526,6 +1597,7 @@ function UnitAIModule.StartAbilities()
                         if not UnitAI.autoAbilities then break end
                         selectUnit(unit)
                         task.wait(0.3)
+                        enableAbilityToggle()
                         local buttons = findGuiButtons(ABILITY_KEYWORDS)
                         for _, btn in ipairs(buttons) do
                             pcall(function() clickButton(btn) end)
@@ -1948,17 +2020,17 @@ autoStatusParagraph = autoReplaySection:Paragraph({ Header = "Status", Body = "A
 autoReplaySection:Toggle({
     Name = "Auto replay (same stage)",
     Default = false,
-    Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus() end,
+    Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoReplay")
 autoReplaySection:Toggle({
     Name = "Auto next stage (on victory)",
     Default = false,
-    Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus() end,
+    Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoNext")
 autoReplaySection:Toggle({
     Name = "Auto leave (on defeat)",
     Default = false,
-    Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus() end,
+    Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoLeave")
 
 autoExtraSection:Header({ Text = "Wave controls" })
@@ -1972,7 +2044,7 @@ autoExtraSection:Slider({
 autoExtraSection:Toggle({
     Name = "Auto sell unit at wave",
     Default = false,
-    Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus() end,
+    Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoSell")
 autoExtraSection:Slider({
     Name = "Sell at wave (0 = off)",
@@ -2012,7 +2084,7 @@ abilitySection:Toggle({
     Callback = function(on)
         UnitAI.autoAbilities = on
         if on then UnitAIModule.StartAbilities() else UnitAIModule.StopAbilities() end
-        refreshUnitStatus()
+        refreshUnitStatus(); saveConfig()
     end,
 }, "AutoAbilities")
 abilitySection:Slider({
@@ -2030,7 +2102,7 @@ buffSection:Toggle({
     Callback = function(on)
         UnitAI.autoBuff = on
         if on then UnitAIModule.StartBuff() else UnitAIModule.StopBuff() end
-        refreshUnitStatus()
+        refreshUnitStatus(); saveConfig()
     end,
 }, "AutoBuff")
 buffSection:Slider({
@@ -2048,7 +2120,7 @@ buffSection:Toggle({
     Callback = function(on)
         UnitAI.autoPlaceFollow = on
         if on then UnitAIModule.StartAutoPlace() else UnitAIModule.StopAutoPlace() end
-        refreshUnitStatus()
+        refreshUnitStatus(); saveConfig()
     end,
 }, "AutoPlace")
 buffSection:Paragraph({ Header = "", Body = "Places units on available _BASES spots.\nRequires money + units in your inventory." })
@@ -2096,7 +2168,7 @@ optionsSection:Header({ Text = "Macro options" })
 optionsSection:Toggle({
     Name = "Retry placements until money spent",
     Default = true,
-    Callback = function(on) State.retryPlacements = on end,
+    Callback = function(on) State.retryPlacements = on; saveConfig() end,
 }, "RetryPlacements")
 optionsSection:Toggle({
     Name = "Saved list: show all stages",
@@ -2112,6 +2184,7 @@ optionsSection:Toggle({
     Callback = function(on)
         Tools.antiAfk = on
         if on then ToolsModule.StartAntiAfk() else ToolsModule.StopAntiAfk() end
+        saveConfig()
     end,
 }, "AntiAfk")
 
@@ -2256,6 +2329,44 @@ Window.onUnloaded(function()
     if recordUnitConnection then recordUnitConnection:Disconnect() end
     if replayUnitConnection then replayUnitConnection:Disconnect() end
     saveConfig()
+end)
+
+-- Restore saved toggle states and auto-start features
+task.spawn(function()
+    task.wait(0.5)
+    if State.macroName ~= "" then
+        local ok = ProfilesModule.Load(State.macroName)
+        if ok then setMacroName(State.macroName) end
+    end
+    if AutoFarm.autoReplay or AutoFarm.autoNextStage or AutoFarm.autoLeave or AutoFarm.autoSell then
+        refreshAutoStatus()
+    end
+    if pendingToggles.autoAbilities then
+        UnitAI.autoAbilities = true
+        UnitAIModule.StartAbilities()
+    end
+    if pendingToggles.autoBuff then
+        UnitAI.autoBuff = true
+        UnitAIModule.StartBuff()
+    end
+    if pendingToggles.autoPlaceFollow then
+        UnitAI.autoPlaceFollow = true
+        UnitAIModule.StartAutoPlace()
+    end
+    if pendingToggles.antiAfk then
+        Tools.antiAfk = true
+        ToolsModule.StartAntiAfk()
+    end
+    refreshUnitStatus()
+    refreshAutoStatus()
+    local restored = {}
+    if UnitAI.autoAbilities then table.insert(restored, "Abilities") end
+    if UnitAI.autoBuff then table.insert(restored, "Buff") end
+    if Tools.antiAfk then table.insert(restored, "Anti-AFK") end
+    if AutoFarm.autoReplay then table.insert(restored, "Auto Replay") end
+    if #restored > 0 then
+        notify("Restored: " .. table.concat(restored, ", "))
+    end
 end)
 
 refreshStatus()
