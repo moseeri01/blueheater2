@@ -21,9 +21,10 @@ local Config = {
     MaxActions = 5000,
     MaxDuration = 3600,
     VerifyWindow = 1.5,
-    ReplayVerifyWindow = 4,
-    RetryInterval = 0.5,
-    RetryTimeout = 60,
+    ReplayVerifyWindow = 1.5,
+    RetryInterval = 0.3,
+    RetryTimeout = 180,
+    MaxPlaceMisses = 8,
     MaxTrackedValues = 200,
     SpawnRemote = "spawn_unit",
     UnitMatchWindow = 3,
@@ -77,7 +78,7 @@ local UnitAI = {
     autoAbilities = false,
     abilityCooldown = 2,
     autoBuff = false,
-    buffInterval = 2,
+    buffInterval = 1,
     minUnitsForBuff = 4,
 }
 
@@ -430,7 +431,10 @@ local function describeAction(i, action, limits)
     for j = 1, nArgs do
         parts[j] = refs[j] and ("<unit from #" .. refs[j] .. ">") or describeValue(args[j], 0, limits)
     end
-    local mark = action.spent == true and " [$]" or ""
+    local mark = ""
+    if action.spent == true then
+        mark = type(action.cost) == "number" and string.format(" [$%d]", math.floor(action.cost + 0.5)) or " [$]"
+    end
     return string.format("%d. %s  %s%s  %s", i, formatDuration(action.t), action.name, mark, table.concat(parts, ", "))
 end
 
@@ -568,6 +572,79 @@ local function anyDecrease(before, now)
     return false
 end
 
+-- Paths are stored relative to the local player ("LP.") so a macro works on any account.
+local function trackedPath(entry)
+    local ok, path = pcall(function() return entry.obj:GetFullName() end)
+    if not ok or type(path) ~= "string" then return nil end
+    local lpOk, lpPath = pcall(function() return Players.LocalPlayer:GetFullName() end)
+    if lpOk and path:sub(1, #lpPath) == lpPath then path = "LP" .. path:sub(#lpPath + 1) end
+    if entry.attr then path = path .. "@" .. entry.attr end
+    return path
+end
+
+local function readCostValue(path)
+    if type(path) ~= "string" then return nil end
+    local instPath, attr = path:match("^(.-)@(.+)$")
+    instPath = instPath or path
+    local ok, value = pcall(function()
+        local current
+        local rest = instPath
+        if instPath:sub(1, 2) == "LP" then
+            current = Players.LocalPlayer
+            rest = instPath:sub(3)
+        else
+            current = game
+        end
+        for segment in rest:gmatch("[^%.]+") do
+            if not (current == game and segment == "game") then
+                current = current:FindFirstChild(segment)
+                if not current then return nil end
+            end
+        end
+        if attr then return current:GetAttribute(attr) end
+        return current.Value
+    end)
+    return ok and tonumber(value) or nil
+end
+
+local SPEND_REMOTES = { spawn_unit = true, upgrade_unit_ingame = true }
+
+-- A drop in a tracked value is charged to ONE action: the earliest still-unresolved
+-- spend remote (spawn/upgrade), else the earliest unresolved action. Charging every
+-- nearby action made unrelated remotes look like purchases and stall replay.
+-- Values that go down while no action is waiting (timers, countdowns) are not money.
+local noisyTracked = {}
+
+local function attributeSpending(prev, snap)
+    if not prev then return end
+    -- AA only takes money through spawn/upgrade; once those show up, nothing else is charged.
+    local spendSeen, pendingSpend, pendingAny = false, nil, nil
+    for _, a in ipairs(State.actions) do
+        if SPEND_REMOTES[a.name] then
+            spendSeen = true
+            if a.spent == nil and not pendingSpend then pendingSpend = a end
+        end
+        if a.spent == nil and not pendingAny then pendingAny = a end
+    end
+    local chosen = pendingSpend or (not spendSeen and pendingAny) or nil
+    local bestIdx, bestDrop = nil, 0
+    for idx, old in pairs(prev) do
+        local new = snap[idx]
+        if old and new and new < old - 1e-6 then
+            if not chosen then
+                noisyTracked[idx] = true
+            elseif not noisyTracked[idx] and old - new > bestDrop then
+                bestIdx, bestDrop = idx, old - new
+            end
+        end
+    end
+    if bestIdx and chosen then
+        chosen.spent = true
+        chosen.cost = bestDrop
+        chosen.costPath = trackedPath(State.tracked[bestIdx])
+    end
+end
+
 -- Placed units: match units appearing in workspace._UNITS to the spawn action at that spot.
 local function unitsFolder()
     return workspace:FindFirstChild("_UNITS")
@@ -672,6 +749,8 @@ local function validAction(action, lastTime, index)
         and (action.method == "FireServer" or action.method == "InvokeServer")
         and type(action.args) == "table"
         and (action.spent == nil or type(action.spent) == "boolean")
+        and (action.cost == nil or (type(action.cost) == "number" and action.cost >= 0))
+        and (action.costPath == nil or type(action.costPath) == "string")
         and validUnitRefs(action.unitRefs, index)
 end
 
@@ -718,6 +797,8 @@ function Files.encode(name, duration, startOffset, actions)
             name = action.name,
             method = action.method,
             spent = action.spent == true or nil,
+            cost = action.spent == true and tonumber(action.cost) or nil,
+            costPath = action.spent == true and action.costPath or nil,
             unitRefs = action.unitRefs,
             argCount = nArgs,
             args = sArgs,
@@ -972,8 +1053,17 @@ local function finalizeRecording()
         recordUnitConnection = nil
     end
     local snap = readTracked()
+    attributeSpending(State.snapshot, snap)
+    local spendSeen = false
     for _, action in ipairs(State.actions) do
-        if action.spent == nil then action.spent = anyDecrease(action.before, snap) end
+        if SPEND_REMOTES[action.name] then spendSeen = true break end
+    end
+    for _, action in ipairs(State.actions) do
+        if action.spent == nil then action.spent = false end
+        if spendSeen and action.spent and not SPEND_REMOTES[action.name] then
+            action.spent, action.cost, action.costPath = false, nil, nil
+        end
+        action.before = nil
     end
     local costRemotes = {}
     for _, action in ipairs(State.actions) do
@@ -1030,6 +1120,7 @@ function RecordingModule.Start()
     if not installHook() then return false end
     State.tracked = buildTracked()
     State.snapshot = readTracked()
+    noisyTracked = {}
     State.actions = {}
     State.startedAt = os.clock()
     State.startOffset = nil
@@ -1052,6 +1143,7 @@ end
 local PlaybackModule = {}
 local replayUnits, replayNewUnits = {}, {}
 local replayUnitConnection
+local playGen = 0
 
 local function addReplayLog(line)
     if #State.replayLog >= 300 then return end
@@ -1109,12 +1201,12 @@ local function fireAction(i, action)
     return ok
 end
 
-local function claimSpawnedUnit(i, action, firedAt)
+local function claimSpawnedUnit(i, action, firedAt, alive)
     if action.name ~= Config.SpawnRemote then return end
     local target = actionPosition(action)
     if not target then return end
     local deadline = os.clock() + Config.UnitMatchWindow
-    while State.replaying and os.clock() < deadline do
+    while alive() and os.clock() < deadline do
         local staleThreshold = os.clock() - Config.UnitMatchWindow * 2
         local j = 1
         while j <= #replayNewUnits do
@@ -1135,26 +1227,84 @@ local function claimSpawnedUnit(i, action, firedAt)
     addReplayLog(string.format("#%d %s: could not find the placed unit", i, action.name))
 end
 
-local function fireUntilSpent(i, action)
+local function decreaseIgnoring(before, now, noisy)
+    for i, old in pairs(before) do
+        local new = now[i]
+        if old and new and new < old - 1e-6 and not (noisy and noisy[i]) then return true end
+    end
+    return false
+end
+
+-- Macros saved without a cost: fire, and count it as bought when a tracked value drops.
+-- ctx.noisy holds values seen dropping on their own (timers), which do not count.
+local function fireUntilSpent(i, action, alive, ctx)
+    ctx = ctx or {}
     local firstFire = os.clock()
     local giveUpAt = firstFire + Config.RetryTimeout
     local lastFire = firstFire
-    while State.replaying do
+    while alive() do
         local before = readTracked()
         lastFire = os.clock()
-        if not fireAction(i, action) and action.unitRefs then
+        ctx.firing = true
+        local fired = fireAction(i, action)
+        if not fired and action.unitRefs then
+            ctx.firing = false
             return false, lastFire - firstFire, lastFire
         end
         local verifyUntil = lastFire + Config.ReplayVerifyWindow
-        while State.replaying and os.clock() < verifyUntil do
+        while alive() and os.clock() < verifyUntil do
             task.wait(0.1)
-            if anyDecrease(before, readTracked()) then
+            if decreaseIgnoring(before, readTracked(), ctx.noisy) then
+                ctx.firing = false
                 return true, lastFire - firstFire, lastFire
             end
         end
+        ctx.firing = false
         if os.clock() >= giveUpAt then break end
         addReplayLog(string.format("#%d %s: money did not go down, retrying", i, action.name))
         task.wait(Config.RetryInterval)
+    end
+    ctx.firing = false
+    return false, os.clock() - firstFire, lastFire
+end
+
+-- Macros recorded with a cost: wait until the money value reaches that cost, then fire
+-- at once and confirm by the money dropping. Waits as long as the macro is playing.
+local function placeWhenAffordable(i, action, alive, ctx)
+    local firstFire = os.clock()
+    local lastFire = firstFire
+    local misses = 0
+    local loggedWait = false
+    while alive() do
+        local money = readCostValue(action.costPath)
+        if money == nil then
+            return fireUntilSpent(i, action, alive, ctx)
+        end
+        if money + 1e-6 < action.cost then
+            if not loggedWait then
+                addReplayLog(string.format("#%d %s: waiting for money (%s / %s)", i, action.name,
+                    tostring(math.floor(money)), tostring(math.floor(action.cost))))
+                loggedWait = true
+            end
+            task.wait(0.05)
+        else
+            lastFire = os.clock()
+            if not fireAction(i, action) and action.unitRefs then
+                return false, lastFire - firstFire, lastFire
+            end
+            local verifyUntil = lastFire + Config.ReplayVerifyWindow
+            while alive() and os.clock() < verifyUntil do
+                local now = readCostValue(action.costPath)
+                if now and now < money - 1e-6 then
+                    return true, lastFire - firstFire, lastFire
+                end
+                task.wait(0.05)
+            end
+            misses = misses + 1
+            if misses >= Config.MaxPlaceMisses then break end
+            addReplayLog(string.format("#%d %s: money did not go down, retrying (%d/%d)", i, action.name, misses, Config.MaxPlaceMisses))
+            task.wait(Config.RetryInterval)
+        end
     end
     return false, os.clock() - firstFire, lastFire
 end
@@ -1189,17 +1339,23 @@ function PlaybackModule.Play(fromGameStart)
         return false
     end
 
+    playGen = playGen + 1
+    local gen = playGen
+    local function alive() return State.replaying and gen == playGen end
+
     State.replaying = true
     State.replayIndex = 0
     State.replayLog = {}
     State.replayStartedAt = os.clock()
     State.tracked = buildTracked()
     replayUnits, replayNewUnits = {}, {}
+    local conn
     local folder = unitsFolder()
     if folder then
-        replayUnitConnection = folder.ChildAdded:Connect(function(unit)
-            table.insert(replayNewUnits, { unit = unit, at = os.clock() })
+        conn = folder.ChildAdded:Connect(function(unit)
+            if gen == playGen then table.insert(replayNewUnits, { unit = unit, at = os.clock() }) end
         end)
+        replayUnitConnection = conn
     end
     local canRetry = State.retryPlacements and #State.tracked > 0
     local speedMul = math.max(0.1, AutoFarm.speedMultiplier)
@@ -1210,53 +1366,121 @@ function PlaybackModule.Play(fromGameStart)
     refreshStatus()
     notify(string.format("Playing %s (%d actions).", cleanName(State.macroName) or "macro", #State.actions))
 
-    task.spawn(function()
-        local startTime = os.clock()
-        local shift = fromGameStart and -(State.startOffset or 0) or 0
-        local failed = 0
-        local actionCount = #State.actions
-        for i = 1, actionCount do
-            local action = State.actions[i]
-            if not State.replaying then break end
-            State.replayIndex = i
-            refreshStatus()
-            Tools.totalActions = Tools.totalActions + 1
+    -- Two tracks. Purchases run one after another, each the moment money allows,
+    -- without waiting behind the noise remotes the client fired while the player was
+    -- waiting. Everything else keeps its recorded timing; actions that point at a unit
+    -- wait until the purchases before them are done and that unit is on the map.
+    local actions = State.actions
+    local actionCount = #actions
+    local startTime = os.clock()
+    local base = fromGameStart and -(State.startOffset or 0) or 0
+    local failed = 0
+    local purchaseDone = 0
+    local lanesLeft = 2
 
-            local scheduledTime = startTime + (action.t + shift) / speedMul
-            local waitTime = scheduledTime - os.clock()
-            if canRetry and action.spent == true then
-                -- placement: don't wait, fire now (fireUntilSpent retries until money spent)
-                if waitTime > 0.01 then
-                    shift = shift - (waitTime * speedMul)
-                end
-            else
-                if waitTime > 0.01 then task.wait(waitTime) end
+    local function hasCost(a)
+        return State.retryPlacements and a.spent == true and type(a.cost) == "number" and type(a.costPath) == "string"
+    end
+    local function isPurchase(a) return hasCost(a) or (canRetry and a.spent == true) end
+    local function waitForRefs(a)
+        if not a.unitRefs then return end
+        local deadline = os.clock() + Config.UnitMatchWindow + 2
+        while alive() and os.clock() < deadline do
+            local ready = true
+            for _, r in ipairs(a.unitRefs) do
+                local u = replayUnits[r.ref]
+                if not (u and u.Parent) then ready = false break end
             end
-            if not State.replaying then break end
+            if ready then return end
+            task.wait(0.05)
+        end
+    end
+    local function markProgress(i)
+        if i > State.replayIndex then State.replayIndex = i end
+        Tools.totalActions = Tools.totalActions + 1
+    end
 
-            if canRetry and action.spent == true then
-                local ok, delay, firedAt = fireUntilSpent(i, action)
-                shift = shift + delay * speedMul
-                if ok then
-                    claimSpawnedUnit(i, action, firedAt)
-                elseif State.replaying then
-                    failed = failed + 1
-                    addReplayLog(string.format("#%d %s: gave up", i, action.name))
+    -- Values that drop while no purchase is being fired are timers, not money.
+    local ctx = { noisy = {}, firing = false }
+    if canRetry then
+        task.spawn(function()
+            local prev = readTracked()
+            while alive() do
+                task.wait(0.1)
+                local now = readTracked()
+                if not ctx.firing then
+                    for idx, old in pairs(prev) do
+                        local new = now[idx]
+                        if old and new and new < old - 1e-6 then ctx.noisy[idx] = true end
+                    end
                 end
-            else
+                prev = now
+            end
+        end)
+    end
+
+    task.spawn(function()
+        local watched = false
+        for i = 1, actionCount do
+            if not alive() then break end
+            local a = actions[i]
+            if isPurchase(a) then
+                markProgress(i)
+                waitForRefs(a)
+                local ok, _, firedAt
+                if hasCost(a) then
+                    ok, _, firedAt = placeWhenAffordable(i, a, alive, ctx)
+                else
+                    if not watched then
+                        watched = true
+                        task.wait(1)
+                    end
+                    ok, _, firedAt = fireUntilSpent(i, a, alive, ctx)
+                end
+                if ok then
+                    task.spawn(claimSpawnedUnit, i, a, firedAt, alive)
+                elseif alive() then
+                    failed = failed + 1
+                    addReplayLog(string.format("#%d %s: gave up", i, a.name))
+                end
+            end
+            purchaseDone = i
+        end
+        lanesLeft = lanesLeft - 1
+    end)
+
+    task.spawn(function()
+        for i = 1, actionCount do
+            if not alive() then break end
+            local a = actions[i]
+            if not isPurchase(a) then
+                local waitTime = startTime + (a.t + base) / speedMul - os.clock()
+                if waitTime > 0.01 then task.wait(waitTime) end
+                if a.unitRefs then
+                    while alive() and purchaseDone < i - 1 do task.wait(0.05) end
+                    waitForRefs(a)
+                end
+                if not alive() then break end
+                markProgress(i)
                 local firedAt = os.clock()
-                if fireAction(i, action) then
-                    claimSpawnedUnit(i, action, firedAt)
+                if fireAction(i, a) then
+                    task.spawn(claimSpawnedUnit, i, a, firedAt, alive)
                 else
                     failed = failed + 1
                 end
             end
         end
+        lanesLeft = lanesLeft - 1
+    end)
 
-        if replayUnitConnection then
-            replayUnitConnection:Disconnect()
-            replayUnitConnection = nil
+    task.spawn(function()
+        while lanesLeft > 0 and alive() do
+            task.wait(0.1)
+            refreshStatus()
         end
+        if conn then conn:Disconnect() end
+        if replayUnitConnection == conn then replayUnitConnection = nil end
+        if gen ~= playGen then return end
         local finished = State.replaying
         State.replaying = false
         State.replayIndex = 0
@@ -1539,7 +1763,7 @@ local function isResultsShowing()
         if (d:IsA("TextLabel") or d:IsA("TextButton")) and #d.Text > 0 then
             local lower = string.lower(d.Text)
             for _, word in ipairs(END_WORDS) do
-                if lower:find(word, 1, true) and isOnScreen(d) then return true end
+                if lower:find(word, 1, true) and isOnScreen(d) and not isOwnGui(d) then return true end
             end
         end
     end
@@ -1550,7 +1774,7 @@ local function resultIsVictory()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not gui then return false end
     for _, d in ipairs(gui:GetDescendants()) do
-        if d:IsA("TextLabel") and string.lower(d.Text):find("victory", 1, true) and isOnScreen(d) then
+        if d:IsA("TextLabel") and string.lower(d.Text):find("victory", 1, true) and isOnScreen(d) and not isOwnGui(d) then
             return true
         end
     end
@@ -1567,7 +1791,7 @@ local function refreshAutoStatus()
     local parts = {}
     if AutoFarm.autoReplay then table.insert(parts, "Replay: ON") end
     if AutoFarm.autoNextStage then table.insert(parts, "Next stage: ON") end
-    if AutoFarm.autoLeave then table.insert(parts, "Leave on defeat: ON") end
+    if AutoFarm.autoLeave then table.insert(parts, "Leave when you lose: ON") end
     if AutoFarm.leaveAtWave > 0 then table.insert(parts, "Leave at wave " .. AutoFarm.leaveAtWave) end
     if AutoFarm.autoSell and AutoFarm.sellAtWave > 0 then table.insert(parts, "Sell at wave " .. AutoFarm.sellAtWave) end
     if AutoFarm.speedMultiplier ~= 1 then table.insert(parts, string.format("Speed: %.1fx", AutoFarm.speedMultiplier)) end
@@ -1598,7 +1822,7 @@ function AutoFarmModule.OnGameEnd()
     local goal, words = endGoal()
     if not goal then return end
     endHandling = true
-    notify("Game over: auto " .. goal .. "...")
+    notify("Match ended: auto " .. goal .. "...")
     task.wait(1.5)
 
     local voteRemote = getAARemote("set_game_finished_vote")
@@ -1606,29 +1830,38 @@ function AutoFarmModule.OnGameEnd()
         task.spawn(function() pcall(function() voteRemote:InvokeServer(goal) end) end)
     end
 
+    -- The goal is fixed now, while Victory/Defeat is visible: the next page of the result
+    -- screen no longer shows it, and re-deciding there would turn a win into "leave".
     local giveUpAt = os.clock() + 45
     local advanced = 0
-    while os.clock() < giveUpAt and isResultsShowing() do
-        goal, words = endGoal()
-        if not goal then break end
+    local done = false
+    while os.clock() < giveUpAt and not State.unloaded do
+        if not (AutoFarm.autoReplay or AutoFarm.autoNextStage or AutoFarm.autoLeave) then break end
         local target = findScreenButton(words)
         if target then
             clickButton(target)
             task.wait(2)
-        else
+            if not target.Parent or not isOnScreen(target) then
+                done = true
+                break
+            end
+        elseif isResultsShowing() then
             local nextBtn = advanced < 6 and findScreenButton(ADVANCE_WORDS, ADVANCE_EXCLUDE)
             if nextBtn then
                 clickButton(nextBtn)
                 advanced = advanced + 1
             end
             task.wait(1)
+        else
+            task.wait(0.5)
         end
     end
 
-    if goal == "leave" and isResultsShowing() then
+    if not done and goal == "leave" then
         pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
+        done = true
     end
-    if isResultsShowing() then
+    if not done then
         notify("Auto " .. tostring(goal) .. ": could not find the button. Run Settings > Scan game on the result screen and send me the log.")
     end
     endHandling = false
@@ -1637,7 +1870,7 @@ end
 -- Polls for the result screen: works even when _DATA.GameFinished does not exist.
 local lastEndAttempt = 0
 task.spawn(function()
-    while true do
+    while not State.unloaded do
         task.wait(1)
         if (AutoFarm.autoReplay or AutoFarm.autoNextStage or AutoFarm.autoLeave)
             and not endHandling and os.clock() - lastEndAttempt > 20 and isResultsShowing() then
@@ -1653,10 +1886,12 @@ function AutoFarmModule.CheckWaveLeave()
     if wave >= AutoFarm.leaveAtWave then
         PlaybackModule.Stop()
         task.wait(0.5)
+        notify("Leave at wave " .. AutoFarm.leaveAtWave .. ": leaving.")
         local btn = findScreenButton({ "lobby", "return", "leave" })
         if btn then
-            notify("Leave at wave " .. AutoFarm.leaveAtWave .. ": leaving.")
             clickButton(btn)
+        else
+            pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
         end
     end
 end
@@ -1698,10 +1933,11 @@ local function isGameRunning()
     return false
 end
 
--- InvokeServer can hold the reply while an ability is on cooldown, so each unit
--- fires in its own thread with a busy lock; the loop itself never blocks.
-local unitBusy = setmetatable({}, { __mode = "k" })
-local UNIT_INVOKE_TIMEOUT = 8
+-- InvokeServer can hold the reply while an ability is on cooldown, so each call runs in
+-- its own thread and the loop never blocks. A unit may have a few calls in flight: a lock
+-- of one would delay the recast until the held reply came back.
+local unitInFlight = setmetatable({}, { __mode = "k" })
+local MAX_IN_FLIGHT = 6
 
 local function hasActiveAttack(unit)
     local stats = unit:FindFirstChild("_stats")
@@ -1720,14 +1956,14 @@ local function inAttackState(unit)
 end
 
 local function fireActiveAttack(unit)
-    local busyUntil = unitBusy[unit]
-    if busyUntil and os.clock() < busyUntil then return end
+    local inFlight = unitInFlight[unit] or 0
+    if inFlight >= MAX_IN_FLIGHT then return end
     local remote = getAARemote("use_active_attack")
     if not remote then return end
-    unitBusy[unit] = os.clock() + UNIT_INVOKE_TIMEOUT
+    unitInFlight[unit] = inFlight + 1
     task.spawn(function()
         pcall(function() remote:InvokeServer(unit) end)
-        unitBusy[unit] = nil
+        unitInFlight[unit] = math.max(0, (unitInFlight[unit] or 1) - 1)
     end)
 end
 
@@ -1996,10 +2232,13 @@ end
 --------------------------------------------------------------------------------
 local ToolsModule = {}
 
+local antiAfkGen = 0
+
 function ToolsModule.StartAntiAfk()
-    if Tools.antiAfkConnection then return end
-    Tools.antiAfkConnection = task.spawn(function()
-        while Tools.antiAfk do
+    antiAfkGen = antiAfkGen + 1
+    local gen = antiAfkGen
+    task.spawn(function()
+        while Tools.antiAfk and gen == antiAfkGen do
             pcall(function()
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
                 task.wait(0.1)
@@ -2007,13 +2246,12 @@ function ToolsModule.StartAntiAfk()
             end)
             task.wait(60)
         end
-        Tools.antiAfkConnection = nil
     end)
 end
 
 function ToolsModule.StopAntiAfk()
     Tools.antiAfk = false
-    Tools.antiAfkConnection = nil
+    antiAfkGen = antiAfkGen + 1
 end
 
 function ToolsModule.RefreshStats()
@@ -2094,10 +2332,10 @@ playToggle = controlSection:Toggle({
         end
     end,
 }, "PlayToggle")
-controlSection:Toggle({
+Controls.autoPlay = controlSection:Toggle({
     Name = "Wait for wave start (auto play)",
-    Default = false,
-    Callback = function(on) State.autoPlay = on end,
+    Default = State.autoPlay,
+    Callback = function(on) State.autoPlay = on; saveConfig() end,
 }, "AutoPlay")
 
 fileSection:Header({ Text = "Macro file" })
@@ -2153,7 +2391,7 @@ autoNextToggle = autoReplaySection:Toggle({
     Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoNext")
 autoLeaveToggle = autoReplaySection:Toggle({
-    Name = "Auto leave (on defeat)",
+    Name = "Auto leave (when you lose)",
     Default = AutoFarm.autoLeave,
     Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoLeave")
@@ -2451,15 +2689,10 @@ table.insert(State.connections, RunService.Heartbeat:Connect(function()
     -- Recording heartbeat
     if State.recording or State.finalizing then
         local snap = readTracked()
-        local actionCount = #State.actions
-        for idx = 1, actionCount do
-            local action = State.actions[idx]
-            if action.spent == nil then
-                if anyDecrease(action.before, snap) then
-                    action.spent = true
-                elseif now - action.at >= Config.VerifyWindow then
-                    action.spent = false
-                end
+        attributeSpending(State.snapshot, snap)
+        for _, action in ipairs(State.actions) do
+            if action.spent == nil and now - action.at >= Config.VerifyWindow then
+                action.spent = false
             end
         end
         State.snapshot = snap
@@ -2491,15 +2724,22 @@ table.insert(State.connections, RunService.Heartbeat:Connect(function()
     -- Auto farm wave checks
     if State.replaying and now >= nextWaveCheck then
         nextWaveCheck = now + 2
-        AutoFarmModule.CheckWaveLeave()
-        AutoFarmModule.CheckAutoSell()
+        if isResultsShowing() then
+            addReplayLog("result screen shown, stopping playback")
+            PlaybackModule.Stop()
+        else
+            task.spawn(AutoFarmModule.CheckWaveLeave)
+            AutoFarmModule.CheckAutoSell()
+        end
     end
 end))
 
--- Cleanup
-Window.onUnloaded(function()
+-- Cleanup: runs once, when the window closes or when the script is run again.
+local function shutdown()
+    if State.unloaded then return end
     saveConfig()
     configReady = false
+    State.unloaded = true
     State.recording = false
     State.finalizing = false
     State.replaying = false
@@ -2512,7 +2752,20 @@ Window.onUnloaded(function()
     if viewportConnection then viewportConnection:Disconnect() end
     if recordUnitConnection then recordUnitConnection:Disconnect() end
     if replayUnitConnection then replayUnitConnection:Disconnect() end
-end)
+    AutoFarm.autoReplay, AutoFarm.autoNextStage, AutoFarm.autoLeave = false, false, false
+end
+Window.onUnloaded(shutdown)
+
+-- Running the script again closes the copy that is already running, so two copies
+-- never click the result screen or fire abilities at the same time.
+do
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.__MacroLabShutdown) == "function" then pcall(env.__MacroLabShutdown) end
+    env.__MacroLabShutdown = function()
+        if not pcall(function() Window:Unload() end) then shutdown() end
+        shutdown()
+    end
+end
 
 local function setControl(control, value)
     if not control or value == nil then return end
@@ -2545,6 +2798,7 @@ applyRuntimeFeatures = function()
     setControl(Controls.abilityCooldown, UnitAI.abilityCooldown)
     setControl(Controls.buffInterval, UnitAI.buffInterval)
     setControl(Controls.minUnitsForBuff, UnitAI.minUnitsForBuff)
+    setControl(Controls.autoPlay, State.autoPlay)
     setControl(Controls.retryPlacements, State.retryPlacements)
     setControl(Controls.showAllMacros, State.showAllMacros)
     setControl(Controls.webhookUrl, Webhook.url)
@@ -2571,9 +2825,9 @@ applyRuntimeFeatures = function()
     configReady = wasReady
 end
 
--- Restore saved toggle states and auto-start features
+-- Restore saved toggle states and auto-start features (right away, so nothing the
+-- player clicks in the first moments gets overwritten by the restore).
 task.spawn(function()
-    task.wait(0.5)
     if State.macroName ~= "" then
         local ok = ProfilesModule.Load(State.macroName)
         if ok then setMacroName(State.macroName) end
