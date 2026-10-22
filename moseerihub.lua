@@ -32,7 +32,7 @@ local Config = {
     ListLines = 14,
     ScanMaxLines = 300,
     ScreenFill = 0.9,
-    Keybind = Enum.KeyCode.RightShift,
+    Keybind = Enum.KeyCode.LeftControl,
 }
 local MacroFolder = Config.Folder .. "/macros"
 local ConfigFile = Config.Folder .. "/config.json"
@@ -121,6 +121,8 @@ local Window
 local statusParagraph, actionsParagraph, autoStatusParagraph, unitStatusParagraph
 local dungeonStatusParagraph, statsText
 local recordToggle, playToggle, savedDropdown, nameInput, pasteInput
+local autoReplayToggle, autoNextToggle, autoLeaveToggle, autoSellToggle
+local autoAbilitiesToggle, autoBuffToggle, autoPlaceToggle, antiAfkToggle
 local oldNamecall
 local hookInstalled = false
 local syncing = false
@@ -948,11 +950,10 @@ local function finishRecording(message)
     if not State.recording then return false end
     State.duration = math.min(Config.MaxDuration, os.clock() - State.startedAt)
     State.recording = false
-    State.finalizing = true
-    State.finalizeAt = os.clock() + Config.VerifyWindow
     setToggle(recordToggle, false)
     refreshStatus()
     if message then notify(message) end
+    finalizeRecording()
     return true
 end
 
@@ -1389,14 +1390,16 @@ end
 local function isGameOver()
     local dataFolder = workspace:FindFirstChild("_DATA")
     if not dataFolder then return false end
-    local gameOver = dataFolder:FindFirstChild("GameOver") or dataFolder:FindFirstChild("GameEnded")
-    if gameOver and gameOver:IsA("BoolValue") then return gameOver.Value == true end
-    local btn = findScreenButton({ "victory", "defeat", "clear", "retry", "replay", "next" })
-    return btn ~= nil
+    local gameFinished = dataFolder:FindFirstChild("GameFinished") or dataFolder:FindFirstChild("GameOver") or dataFolder:FindFirstChild("GameEnded")
+    if gameFinished and gameFinished:IsA("BoolValue") then return gameFinished.Value == true end
+    return false
 end
 
-local function isVictory()
-    return findScreenButton({ "victory", "clear" }) ~= nil or findScreenButton({ "next" }) ~= nil
+local function isResultsShowing()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return false end
+    local results = gui:FindFirstChild("ResultsUI")
+    return results and results.Enabled == true
 end
 
 --------------------------------------------------------------------------------
@@ -1419,31 +1422,30 @@ end
 
 function AutoFarmModule.OnGameEnd()
     if State.recording or State.finalizing then return end
-    task.wait(1)
+    task.wait(2)
 
-    if AutoFarm.autoLeave and not isVictory() then
-        local btn = findScreenButton({ "lobby", "return", "leave" })
-        if btn then
-            notify("Auto leave: returning to lobby (defeat).")
-            clickButton(btn)
-            return
-        end
+    local voteRemote = getAARemote("set_game_finished_vote")
+
+    if AutoFarm.autoLeave and not AutoFarm.autoReplay and not AutoFarm.autoNextStage then
+        notify("Auto leave: returning to lobby.")
+        pcall(function()
+            game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer)
+        end)
+        return
     end
 
-    if AutoFarm.autoNextStage and isVictory() then
-        local btn = findScreenButton({ "next" })
-        if btn then
+    if AutoFarm.autoNextStage then
+        if voteRemote then
             notify("Auto next stage.")
-            clickButton(btn)
+            pcall(function() voteRemote:InvokeServer("next_story") end)
             return
         end
     end
 
     if AutoFarm.autoReplay then
-        local btn = findScreenButton({ "replay", "retry" })
-        if btn then
+        if voteRemote then
             notify("Auto replay: starting again.")
-            clickButton(btn)
+            pcall(function() voteRemote:InvokeServer("replay") end)
             return
         end
     end
@@ -1471,10 +1473,10 @@ function AutoFarmModule.CheckAutoSell()
     if not folder then return end
     local targetName = string.lower(AutoFarm.sellUnitName)
     for _, unit in ipairs(folder:GetChildren()) do
-        if string.lower(unit.Name):find(targetName, 1, true) then
-            local sellRemote = ReplicatedStorage:FindFirstChild("sell_unit")
-            if sellRemote and sellRemote:IsA("RemoteEvent") then
-                pcall(function() sellRemote:FireServer(unit) end)
+        if string.lower(unit.Name):find(targetName, 1, true) and isMyUnit(unit) then
+            local sellRemote = getAARemote("sell_unit_ingame")
+            if sellRemote then
+                pcall(function() sellRemote:InvokeServer(unit) end)
                 addReplayLog("Auto sold " .. unit.Name)
             end
         end
@@ -1519,6 +1521,9 @@ end
 local function useActiveAttack(unit)
     local stats = unit:FindFirstChild("_stats")
     if not stats then return false end
+    local id = stats:FindFirstChild("id")
+    local idVal = id and tostring(id.Value) or ""
+    if idVal == "pucci_heaven" then return false end
     local activeAtk = stats:FindFirstChild("active_attack")
     if activeAtk and tostring(activeAtk.Value) == "nil" then return false end
     local stateVal = stats:FindFirstChild("state")
@@ -1552,8 +1557,7 @@ function UnitAIModule.StartAbilities()
                     for _, unit in ipairs(folder:GetChildren()) do
                         if not UnitAI.autoAbilities then break end
                         if isMyUnit(unit) then
-                            useActiveAttack(unit)
-                            task.wait(0.1)
+                            pcall(useActiveAttack, unit)
                         end
                     end
                 end
@@ -1583,13 +1587,9 @@ function UnitAIModule.StartBuff()
                         end
                     end
                     if #myUnits >= UnitAI.minUnitsForBuff then
-                        local remote = getAARemote("use_active_attack")
-                        if remote then
-                            for _, unit in ipairs(myUnits) do
-                                if not UnitAI.autoBuff then break end
-                                pcall(function() remote:InvokeServer(unit) end)
-                                task.wait(0.1)
-                            end
+                        for _, unit in ipairs(myUnits) do
+                            if not UnitAI.autoBuff then break end
+                            pcall(useActiveAttack, unit)
                         end
                     end
                 end
@@ -1978,17 +1978,17 @@ local autoExtraSection = autoTab:Section({ Side = "Right" })
 autoReplaySection:Header({ Text = "Stage automation" })
 autoStatusParagraph = autoReplaySection:Paragraph({ Header = "Status", Body = "All off" })
 
-autoReplaySection:Toggle({
+autoReplayToggle = autoReplaySection:Toggle({
     Name = "Auto replay (same stage)",
     Default = false,
     Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoReplay")
-autoReplaySection:Toggle({
+autoNextToggle = autoReplaySection:Toggle({
     Name = "Auto next stage (on victory)",
     Default = false,
     Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoNext")
-autoReplaySection:Toggle({
+autoLeaveToggle = autoReplaySection:Toggle({
     Name = "Auto leave (on defeat)",
     Default = false,
     Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
@@ -2002,7 +2002,7 @@ autoExtraSection:Slider({
     Default = 0,
     Callback = function(v) AutoFarm.leaveAtWave = v; refreshAutoStatus() end,
 }, "LeaveWave")
-autoExtraSection:Toggle({
+autoSellToggle = autoExtraSection:Toggle({
     Name = "Auto sell unit at wave",
     Default = false,
     Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus(); saveConfig() end,
@@ -2039,7 +2039,7 @@ local buffSection = unitsTab:Section({ Side = "Right" })
 
 abilitySection:Header({ Text = "Auto abilities" })
 unitStatusParagraph = abilitySection:Paragraph({ Header = "Status", Body = "All off" })
-abilitySection:Toggle({
+autoAbilitiesToggle = abilitySection:Toggle({
     Name = "Auto use unit abilities",
     Default = false,
     Callback = function(on)
@@ -2057,7 +2057,7 @@ abilitySection:Slider({
 }, "AbilityCooldown")
 
 buffSection:Header({ Text = "Auto buff loop" })
-buffSection:Toggle({
+autoBuffToggle = buffSection:Toggle({
     Name = "Auto use buffs",
     Default = false,
     Callback = function(on)
@@ -2146,7 +2146,7 @@ optionsSection:Toggle({
         refreshSavedList(cleanName(State.macroName))
     end,
 }, "ShowAllMacros")
-optionsSection:Toggle({
+antiAfkToggle = optionsSection:Toggle({
     Name = "Anti-AFK",
     Default = false,
     Callback = function(on)
@@ -2211,11 +2211,11 @@ task.spawn(function()
     table.insert(State.connections, started.Changed:Connect(function(value)
         if value == true then onGameStarted() end
     end))
-    local gameOver = dataFolder:FindFirstChild("GameOver") or dataFolder:FindFirstChild("GameEnded")
-    if gameOver and gameOver:IsA("BoolValue") then
-        table.insert(State.connections, gameOver.Changed:Connect(function(value)
+    local gameFinished = dataFolder:FindFirstChild("GameFinished") or dataFolder:FindFirstChild("GameOver") or dataFolder:FindFirstChild("GameEnded")
+    if gameFinished and gameFinished:IsA("BoolValue") then
+        table.insert(State.connections, gameFinished.Changed:Connect(function(value)
             if value == true then
-                task.delay(1, function() AutoFarmModule.OnGameEnd() end)
+                task.delay(2, function() AutoFarmModule.OnGameEnd() end)
             end
         end))
     end
@@ -2309,12 +2309,18 @@ task.spawn(function()
     if AutoFarm.autoReplay or AutoFarm.autoNextStage or AutoFarm.autoLeave or AutoFarm.autoSell then
         refreshAutoStatus()
     end
+    if AutoFarm.autoReplay then setToggle(autoReplayToggle, true) end
+    if AutoFarm.autoNextStage then setToggle(autoNextToggle, true) end
+    if AutoFarm.autoLeave then setToggle(autoLeaveToggle, true) end
+    if AutoFarm.autoSell then setToggle(autoSellToggle, true) end
     if pendingToggles.autoAbilities then
         UnitAI.autoAbilities = true
+        setToggle(autoAbilitiesToggle, true)
         UnitAIModule.StartAbilities()
     end
     if pendingToggles.autoBuff then
         UnitAI.autoBuff = true
+        setToggle(autoBuffToggle, true)
         UnitAIModule.StartBuff()
     end
     if pendingToggles.autoPlaceFollow then
@@ -2323,6 +2329,7 @@ task.spawn(function()
     end
     if pendingToggles.antiAfk then
         Tools.antiAfk = true
+        setToggle(antiAfkToggle, true)
         ToolsModule.StartAntiAfk()
     end
     refreshUnitStatus()
@@ -2332,6 +2339,8 @@ task.spawn(function()
     if UnitAI.autoBuff then table.insert(restored, "Buff") end
     if Tools.antiAfk then table.insert(restored, "Anti-AFK") end
     if AutoFarm.autoReplay then table.insert(restored, "Auto Replay") end
+    if AutoFarm.autoNextStage then table.insert(restored, "Next Stage") end
+    if AutoFarm.autoLeave then table.insert(restored, "Auto Leave") end
     if #restored > 0 then
         notify("Restored: " .. table.concat(restored, ", "))
     end
