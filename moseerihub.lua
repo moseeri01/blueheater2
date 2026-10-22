@@ -1428,12 +1428,88 @@ end
 --------------------------------------------------------------------------------
 local UnitAIModule = {}
 
+local ABILITY_KEYWORDS = { "skill", "ability", "activate", "special", "ultimate", "ult" }
+local BUFF_KEYWORDS = { "buff", "boost", "damage", "atk", "def", "speed", "heal", "power", "enhance" }
+
+local function isGameRunning()
+    local _data = workspace:FindFirstChild("_DATA")
+    if not _data then return false end
+    local gameStarted = _data:FindFirstChild("GameStarted")
+    return (gameStarted and gameStarted.Value == true) or State.replaying
+end
+
+local function selectUnit(unit)
+    if type(fireclickdetector) == "function" then
+        local cd = unit:FindFirstChildOfClass("ClickDetector")
+        if cd then
+            pcall(fireclickdetector, cd)
+            return true
+        end
+        for _, desc in ipairs(unit:GetDescendants()) do
+            if desc:IsA("ClickDetector") then
+                pcall(fireclickdetector, desc)
+                return true
+            end
+        end
+    end
+    local ok = pcall(function()
+        local pivot = unit:GetPivot()
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        local screenPos, onScreen = camera:WorldToScreenPoint(pivot.Position)
+        if onScreen then
+            VirtualInputManager:SendMouseButtonEvent(screenPos.X, screenPos.Y, 0, true, game, 0)
+            task.wait(0.05)
+            VirtualInputManager:SendMouseButtonEvent(screenPos.X, screenPos.Y, 0, false, game, 0)
+        end
+    end)
+    return ok
+end
+
+local function findGuiButtons(keywords)
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return {} end
+    local found = {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            local textLower = d:IsA("TextButton") and string.lower(d.Text) or ""
+            local nameLower = string.lower(d.Name)
+            for _, kw in ipairs(keywords) do
+                if textLower:find(kw, 1, true) or nameLower:find(kw, 1, true) then
+                    table.insert(found, d)
+                    break
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function tryAbilityRemotes(unit)
+    local names = { "use_ability", "activate_skill", "activate_ability", "unit_ability", "use_skill" }
+    for _, name in ipairs(names) do
+        local remote = ReplicatedStorage:FindFirstChild(name)
+        if remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
+            pcall(function()
+                if remote:IsA("RemoteEvent") then
+                    remote:FireServer(unit)
+                else
+                    remote:InvokeServer(unit)
+                end
+            end)
+        end
+    end
+end
+
 local function refreshUnitStatus()
     if not unitStatusParagraph then return end
     local parts = {}
     if UnitAI.autoAbilities then table.insert(parts, "Abilities: ON (every " .. UnitAI.abilityCooldown .. "s)") end
     if UnitAI.autoBuff then table.insert(parts, "Buff loop: ON (every " .. UnitAI.buffInterval .. "s)") end
     if UnitAI.autoPlaceFollow then table.insert(parts, "Auto-place: ON") end
+    local folder = unitsFolder()
+    local unitCount = folder and #folder:GetChildren() or 0
+    table.insert(parts, "Units on map: " .. unitCount)
     if #parts == 0 then table.insert(parts, "All off") end
     unitStatusParagraph:UpdateBody(table.concat(parts, "\n"))
 end
@@ -1442,26 +1518,27 @@ function UnitAIModule.StartAbilities()
     if UnitAI.abilityConnection then return end
     UnitAI.abilityConnection = task.spawn(function()
         while UnitAI.autoAbilities do
-            local _data = workspace:FindFirstChild("_DATA")
-            local gameStarted = _data and _data:FindFirstChild("GameStarted")
-            if State.replaying or (gameStarted and gameStarted.Value) then
-                local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-                if gui then
-                    for _, d in ipairs(gui:GetDescendants()) do
-                        if d:IsA("TextButton") and d.Visible and (d.Name:lower():find("skill") or d.Name:lower():find("ability")) then
-                            pcall(function() clickButton(d) end)
-                            task.wait(0.1)
+            if isGameRunning() then
+                local folder = unitsFolder()
+                if folder then
+                    local units = folder:GetChildren()
+                    for _, unit in ipairs(units) do
+                        if not UnitAI.autoAbilities then break end
+                        selectUnit(unit)
+                        task.wait(0.3)
+                        local buttons = findGuiButtons(ABILITY_KEYWORDS)
+                        for _, btn in ipairs(buttons) do
+                            pcall(function() clickButton(btn) end)
+                            task.wait(0.15)
                         end
+                        tryAbilityRemotes(unit)
+                        task.wait(0.2)
                     end
                 end
-                local abilityRemote = ReplicatedStorage:FindFirstChild("use_ability") or ReplicatedStorage:FindFirstChild("activate_skill")
-                if abilityRemote then
-                    local folder = unitsFolder()
-                    if folder then
-                        for _, unit in ipairs(folder:GetChildren()) do
-                            pcall(function() abilityRemote:FireServer(unit) end)
-                        end
-                    end
+                local globalButtons = findGuiButtons(ABILITY_KEYWORDS)
+                for _, btn in ipairs(globalButtons) do
+                    pcall(function() clickButton(btn) end)
+                    task.wait(0.1)
                 end
             end
             task.wait(UnitAI.abilityCooldown)
@@ -1479,19 +1556,17 @@ function UnitAIModule.StartBuff()
     if UnitAI.buffConnection then return end
     UnitAI.buffConnection = task.spawn(function()
         while UnitAI.autoBuff do
-            local buffRemote = ReplicatedStorage:FindFirstChild("use_buff") or ReplicatedStorage:FindFirstChild("activate_buff")
-            if buffRemote then
-                pcall(function() buffRemote:FireServer() end)
-            end
-            local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-            if gui then
-                for _, d in ipairs(gui:GetDescendants()) do
-                    if d:IsA("TextButton") and d.Visible then
-                        local lower = string.lower(d.Text)
-                        if lower:find("buff") or lower:find("boost") or lower:find("damage") then
-                            pcall(function() clickButton(d) end)
-                            task.wait(0.1)
-                        end
+            if isGameRunning() then
+                local buttons = findGuiButtons(BUFF_KEYWORDS)
+                for _, btn in ipairs(buttons) do
+                    pcall(function() clickButton(btn) end)
+                    task.wait(0.2)
+                end
+                local buffNames = { "use_buff", "activate_buff", "buff", "use_item" }
+                for _, name in ipairs(buffNames) do
+                    local remote = ReplicatedStorage:FindFirstChild(name)
+                    if remote and remote:IsA("RemoteEvent") then
+                        pcall(function() remote:FireServer() end)
                     end
                 end
             end
@@ -1511,7 +1586,7 @@ function UnitAIModule.StartAutoPlace()
     UnitAI.placeConnection = task.spawn(function()
         while UnitAI.autoPlaceFollow do
             local spawnRemote = ReplicatedStorage:FindFirstChild(Config.SpawnRemote)
-            if not spawnRemote or not State.replaying then
+            if not spawnRemote or not isGameRunning() then
                 task.wait(1)
             else
                 local bases = workspace:FindFirstChild("_BASES")
