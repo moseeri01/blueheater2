@@ -6543,6 +6543,17 @@ task.spawn(function()
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
             pcall(Lobby.TowerResult, win)
+            -- (while Watch is on: one line per game in AAMacro/games.txt, to measure a strategy)
+            if State.watching then
+                pcall(function()
+                    local old
+                    pcall(function() old = readfile(Config.Folder .. "/games.txt") end)
+                    local line = string.format("%s | %s | %s | wave %d | units %d | candy %s | gains %s", os.date("%Y-%m-%d %H:%M:%S"),
+                        tostring(State.stage), win and "WIN" or "LOSS", math.max(gameWave, waveNow()), #ownedUnits(),
+                        tostring(Lobby.candy), table.concat(resultScreenGains(), " "))
+                    AutoPlaceModule.Catalog.save("games.txt", ((type(old) == "string" and old ~= "") and (old .. "\n") or "") .. line)
+                end)
+            end
             task.wait(1.5) -- let the game add the rewards first
             local pings = {}
             -- bag turned full (once until it has room again)
