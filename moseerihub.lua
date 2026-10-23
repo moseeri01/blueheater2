@@ -5992,6 +5992,8 @@ local function playerSnapshot()
     snap.hasInventory = inv ~= nil
     return snap
 end
+-- (the Bag cleaner's "When bag is over": same reading as the report's Bag line)
+function Lobby.BagFraction() return select(2, Webhook.BagLine(playerSnapshot())) end
 
 -- "+20", "+55 XP" ... shown on the result screen.
 local function resultScreenGains()
@@ -7388,13 +7390,27 @@ function Lobby.LevelId(mode, worldName, act)
 end
 
 -- Lobby rooms ("_lobbytemplategreen1" ...): models named _lobbytemplate* in the lobby.
-function Lobby.Rooms()
-    local out = {}
+-- Watched: Story used "_lobbytemplategreen1", Raid "_lobbytemplate213", a portal
+-- "_lobbytemplateportal23". kind "raid" = number-only rooms, "portal" = portal rooms,
+-- else the green (story) rooms; any other non-portal room only when none of those exist.
+function Lobby.Rooms(kind)
+    local want, other = {}, {}
     for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Model") and d.Name:find("^_lobbytemplate") then table.insert(out, d.Name) end
+        local n = d:IsA("Model") and d.Name
+        if n and n:find("^_lobbytemplate") then
+            local rest = n:sub(15)
+            local isPortal, isRaid, isGreen = rest:find("^portal") ~= nil, rest:find("^%d+$") ~= nil, rest:find("^green") ~= nil
+            if (kind == "portal" and isPortal) or (kind == "raid" and isRaid) or (kind ~= "portal" and kind ~= "raid" and isGreen) then
+                table.insert(want, n)
+            elseif not isPortal then
+                table.insert(other, n)
+            end
+        end
     end
-    table.sort(out)
-    return out
+    table.sort(want)
+    table.sort(other)
+    if #want == 0 and kind ~= "portal" then return other end
+    return want
 end
 
 function Lobby.Status(text)
@@ -7410,7 +7426,7 @@ function Lobby.Join()
     if not level then Lobby.Status("Auto join: pick a Stage for " .. c.mode) return false end
     local join, lock, start = getAARemote("request_join_lobby"), getAARemote("request_lock_level"), getAARemote("request_start_game")
     if not (join and lock and start) then Lobby.Status("Auto join: the game's join calls were not found") return false end
-    for _, room in ipairs(Lobby.Rooms()) do
+    for _, room in ipairs(Lobby.Rooms(c.mode == "Raid" and "raid" or "story")) do
         local ok, reply = pcall(function() return join:InvokeServer(room) end)
         if ok and reply ~= false then
             task.wait(0.5)
@@ -7430,27 +7446,160 @@ function Lobby.Loop()
     while not State.unloaded do
         local c = Lobby.cfg
         local cfg = workspace:FindFirstChild("_MAP_CONFIG")
-        local isLobby = cfg and cfg:FindFirstChild("IsLobby")
-        if c.autoJoin and not State.watching and isLobby and isLobby.Value == true and c.mode ~= "Infinity Mansion"
-            and os.clock() - (Lobby.lastJoin or -1e9) > 20 then
-            Lobby.lastJoin = os.clock()
-            pcall(Lobby.Join)
+        local flag = cfg and cfg:FindFirstChild("IsLobby")
+        local inLobbyNow = flag and flag.Value == true
+        local busy = false
+        -- order in the lobby: clean the bag, open eggs, then a portal, else Auto join
+        -- (nothing while Watch is teaching); in a stage only the cleaner, when allowed
+        if not State.watching then
+            if c.clean and (inLobbyNow or c.cleanInStage) and os.clock() - (Lobby.lastClean or -1e9) > 30 then
+                Lobby.lastClean = os.clock()
+                pcall(Lobby.Clean)
+            end
+            if inLobbyNow and c.openEggs then
+                local ok, opened = pcall(Lobby.OpenEggs)
+                busy = ok and opened == true
+            end
+            if inLobbyNow and not busy and os.clock() - (Lobby.lastJoin or -1e9) > 20 then
+                local used = false
+                if c.usePortals then
+                    Lobby.lastJoin = os.clock()
+                    local ok, r = pcall(Lobby.UsePortal)
+                    used = ok and r == true
+                end
+                if not used and c.autoJoin and c.mode ~= "Infinity Mansion" then
+                    Lobby.lastJoin = os.clock()
+                    pcall(Lobby.Join)
+                end
+            end
         end
-        task.wait(5)
+        task.wait(busy and 2 or 5)
     end
 end
 
 -- Portal and item ids in the bag (pretty names), for the Portals and Bag cleaner lists.
-function Lobby.BagNames()
-    local portals, items = {}, {}
-    local counts = Lobby.itemCounts(Lobby.inventoryData())
-    for id in pairs(counts) do
-        local name = Lobby.prettyName(id)
-        table.insert(id:find("^portal") and portals or items, name)
+-- The bag as the game keeps it: unique items (portals and others, each with a uuid, the
+-- only kind delete_unique_items takes) and normal items by count (eggs are capsule_*).
+function Lobby.Bag()
+    local bag = { uniques = {}, counts = {} }
+    local data = Lobby.inventoryData()
+    for k, v in pairs(data and type(data.unique_items) == "table" and data.unique_items or {}) do
+        if type(v) == "table" then
+            local id, uuid = v.item_id or v.id, v.uuid or (type(k) == "string" and k or nil)
+            if type(id) == "string" and type(uuid) == "string" then table.insert(bag.uniques, { id = id, uuid = uuid, data = v }) end
+        end
     end
-    table.sort(portals)
-    table.sort(items)
-    return portals, items
+    for k, v in pairs(data and type(data.normal_items) == "table" and data.normal_items or {}) do
+        local n = type(v) == "number" and v or (type(v) == "table" and tonumber(v.amount or v.count or v.quantity)) or 0
+        local id = type(v) == "table" and (v.item_id or v.id) or k
+        if n > 0 then bag.counts[tostring(id)] = (bag.counts[tostring(id)] or 0) + n end
+    end
+    return bag
+end
+
+-- A portal's tier: the first number field named tier anywhere inside its item data.
+function Lobby.Tier(item, depth)
+    depth = depth or 0
+    if type(item) ~= "table" or depth > 4 then return nil end
+    if tonumber(item.tier) then return tonumber(item.tier) end
+    for _, v in pairs(item) do
+        local t = type(v) == "table" and Lobby.Tier(v, depth + 1)
+        if t then return t end
+    end
+    return nil
+end
+
+-- Lists for the dropdowns (pretty names): portal kinds, other unique items, eggs.
+function Lobby.BagNames()
+    local portals, items, eggs, seen = {}, {}, {}, {}
+    local bag = Lobby.Bag()
+    for _, u in ipairs(bag.uniques) do
+        local name = Lobby.prettyName(u.id)
+        if not seen[name] then
+            seen[name] = true
+            table.insert(u.id:find("^portal") and portals or items, name)
+        end
+    end
+    for id in pairs(bag.counts) do
+        if id:find("^capsule") then table.insert(eggs, Lobby.prettyName(id)) end
+    end
+    table.sort(portals) table.sort(items) table.sort(eggs)
+    return portals, items, eggs
+end
+
+function Lobby.Picked(list, name)
+    for _, n in ipairs(list or {}) do if n == name then return true end end
+    return false
+end
+
+-- Portals: the picked portal kind with the lowest tier at or above "Lowest tier" is used
+-- (use_portal(uuid), as watched), then its new portal room is started. Returns true when
+-- one was used, false when none is left (Auto join takes over).
+function Lobby.UsePortal()
+    local c = Lobby.cfg
+    if c.portal == "" then return false end
+    local best, bestTier
+    for _, u in ipairs(Lobby.Bag().uniques) do
+        if u.id:find("^portal") and Lobby.prettyName(u.id) == c.portal then
+            local tier = Lobby.Tier(u.data) or 0
+            if tier >= (tonumber(c.portalTier) or 1) and (not best or tier < bestTier) then best, bestTier = u, tier end
+        end
+    end
+    if not best then Lobby.Status("Portals: no " .. c.portal .. " at tier " .. c.portalTier .. "+ left - Auto join") return false end
+    local use, start = getAARemote("use_portal"), getAARemote("request_start_game")
+    if not (use and start) then return false end
+    local before = {}
+    for _, r in ipairs(Lobby.Rooms("portal")) do before[r] = true end
+    pcall(function() use:InvokeServer(best.uuid) end)
+    for _ = 1, 20 do
+        for _, r in ipairs(Lobby.Rooms("portal")) do
+            if not before[r] then
+                task.wait(0.5)
+                pcall(function() start:InvokeServer(r) end)
+                Lobby.Status(string.format("Portals: started %s (tier %s) in %s", c.portal, tostring(bestTier), r))
+                return true
+            end
+        end
+        task.wait(0.25)
+    end
+    Lobby.Status("Portals: used " .. c.portal .. " but no portal room showed up")
+    return true
+end
+
+-- Eggs: each picked egg kind is opened while there are any (use_item(id, { use10 }), as
+-- watched): 10 at a time when 10 or more are left. Lobby only, one open every 2 s.
+function Lobby.OpenEggs()
+    local use = getAARemote("use_item")
+    if not use then return end
+    for id, n in pairs(Lobby.Bag().counts) do
+        if id:find("^capsule") and n > 0 and Lobby.Picked(Lobby.cfg.eggs, Lobby.prettyName(id)) then
+            pcall(function() use:InvokeServer(id, { use10 = n >= 10 }) end)
+            Lobby.Status(string.format("Eggs: opened %s (%d left before)", Lobby.prettyName(id), n))
+            return true
+        end
+    end
+    return false
+end
+
+-- Bag cleaner: once the bag is over the set share, every unique item whose kind was picked
+-- in "Delete portals" / "Delete items" goes in one delete_unique_items({ uuids }) call (as
+-- watched). Nothing is picked by default, nothing else is ever deleted.
+function Lobby.Clean()
+    local c = Lobby.cfg
+    if #c.deletePortals == 0 and #c.deleteItems == 0 then return false end
+    local frac = Lobby.BagFraction and Lobby.BagFraction()
+    if not frac or frac * 100 < c.cleanAt then return false end
+    local uuids = {}
+    for _, u in ipairs(Lobby.Bag().uniques) do
+        local name = Lobby.prettyName(u.id)
+        local list = u.id:find("^portal") and c.deletePortals or c.deleteItems
+        if Lobby.Picked(list, name) and #uuids < 50 then table.insert(uuids, u.uuid) end
+    end
+    local del = getAARemote("delete_unique_items")
+    if #uuids == 0 or not del then return false end
+    pcall(function() del:InvokeServer(uuids) end)
+    Lobby.Status(string.format("Bag cleaner: deleted %d picked item(s) (bag was %d%%)", #uuids, math.floor(frac * 100)))
+    return true
 end
 
 -- Watch: every remote the player fires (lobby buttons, portals, deleting, eggs, rewards) with
@@ -7538,7 +7687,7 @@ join:Toggle({ Name = "Watch (teach me once)", Default = false, Callback = functi
     end
 end }, "LobbyWatch")
 
-local portals, items = Lobby.BagNames()
+local portals, items, eggs = Lobby.BagNames()
 local portal = UIRef.tabs.lobby:Section({ Side = "Right" })
 portal:Header({ Text = "Portals" })
 portal:Toggle({ Name = "Use portals", Default = Lobby.cfg.usePortals, Callback = set("usePortals") }, "LobbyUsePortals")
@@ -7560,11 +7709,11 @@ bag:Slider({ Name = "When bag is over (%)", Minimum = 50, Maximum = 100, Default
     Callback = set("cleanAt") }, "LobbyCleanAt")
 bag:Toggle({ Name = "Also during stages", Default = Lobby.cfg.cleanInStage, Callback = set("cleanInStage") }, "LobbyCleanInStage")
 bag:Button({ Name = "Refresh bag lists", Callback = function()
-    local p, i = Lobby.BagNames()
+    local p, i, e = Lobby.BagNames()
     pcall(function()
         for _, d in ipairs({ portalDropdown, delPortals }) do d:ClearOptions() d:InsertOptions(p) end
         delItems:ClearOptions() delItems:InsertOptions(i)
-        if UIRef.lobbyEggs then UIRef.lobbyEggs:ClearOptions() UIRef.lobbyEggs:InsertOptions(i) end
+        if UIRef.lobbyEggs then UIRef.lobbyEggs:ClearOptions() UIRef.lobbyEggs:InsertOptions(e) end
     end)
     notify(string.format("Bag: %d portal kinds, %d item kinds", #p, #i))
 end })
@@ -7573,7 +7722,7 @@ local gifts = UIRef.tabs.lobby:Section({ Side = "Left" })
 gifts:Header({ Text = "Eggs and rewards" })
 gifts:Toggle({ Name = "Open eggs I have", Default = Lobby.cfg.openEggs, Callback = set("openEggs") }, "LobbyOpenEggs")
 -- (which bag items are eggs is not in the game data we have: the player picks them)
-UIRef.lobbyEggs = gifts:Dropdown({ Name = "Eggs to open", Multi = true, Required = false, Options = items,
+UIRef.lobbyEggs = gifts:Dropdown({ Name = "Eggs to open", Multi = true, Required = false, Options = eggs,
     Default = picked(Lobby.cfg.eggs), Callback = setList("eggs") }, "LobbyEggs")
 gifts:Toggle({ Name = "Claim rewards", Default = Lobby.cfg.claim, Callback = set("claim") }, "LobbyClaim")
 gifts:Paragraph({ Header = "Never buys", Body = "Daily, quests, level and battle pass rewards; eggs you already own." })
