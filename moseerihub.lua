@@ -99,6 +99,8 @@ local AutoPlace = {
     roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
     unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
     placeMode = "Balanced",       -- damage units: "Safe" near our base, "Fast clear" near the enemy spawn
+    lastTeam = {},                -- [slot] = { uuid, name } last read from game data (used when it is not readable)
+    smartFreeze = true,           -- freeze skills (Shadowgirl timestop) only at the best moment
 }
 
 -- Dungeon Bot state
@@ -231,6 +233,8 @@ local function buildConfigData()
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
             unitInfo = next(AutoPlace.unitInfo or {}) and AutoPlace.unitInfo or nil,
             placeMode = AutoPlace.placeMode,
+            lastTeam = next(AutoPlace.lastTeam or {}) and AutoPlace.lastTeam or nil,
+            smartFreeze = AutoPlace.smartFreeze,
         },
     }
 end
@@ -286,6 +290,16 @@ local function applyConfigData(data)
     AutoPlace.moneyPath = pick(ap.moneyPath, "string", AutoPlace.moneyPath)
     if type(ap.unitInfo) == "table" then AutoPlace.unitInfo = ap.unitInfo end
     AutoPlace.placeMode = pick(ap.placeMode, "string", AutoPlace.placeMode)
+    AutoPlace.smartFreeze = pick(ap.smartFreeze, "boolean", AutoPlace.smartFreeze)
+    if type(ap.lastTeam) == "table" then
+        AutoPlace.lastTeam = {}
+        for k, v in pairs(ap.lastTeam) do
+            local slot = tonumber(k)
+            if slot and type(v) == "table" and type(v.uuid) == "string" then
+                AutoPlace.lastTeam[tostring(slot)] = { uuid = v.uuid, name = tostring(v.name) }
+            end
+        end
+    end
     if type(ap.paths) == "table" then AutoPlace.paths = ap.paths end
     if type(ap.caps) == "table" then AutoPlace.caps = ap.caps end
     if type(ap.roles) == "table" then AutoPlace.roles = ap.roles end
@@ -2327,6 +2341,15 @@ local function statNum(unit, name)
     return v and tonumber(v.Value) or nil
 end
 
+-- Skills that stop enemies (Shadowgirl "homura:timestop", freeze, stun): Auto Place fires
+-- them at the best moment instead of whenever they are ready.
+function BuffRot.isControlSkill(unit)
+    local stats = unit:FindFirstChild("_stats")
+    local a = stats and stats:FindFirstChild("active_attack")
+    local name = a and string.lower(tostring(a.Value)) or ""
+    return name:find("stop", 1, true) ~= nil or name:find("freeze", 1, true) ~= nil or name:find("stun", 1, true) ~= nil
+end
+
 function BuffRot.isBuffUnit(unit)
     if UnitAI.learned[unitType(unit)] then return true end
     local stats = unit:FindFirstChild("_stats")
@@ -2562,7 +2585,8 @@ function UnitAIModule.StartAbilities()
         while UnitAI.autoAbilities and gen == abilityGen do
             if isGameRunning() then
                 for _, unit in ipairs(myUnitsWithAbility()) do
-                    if inAttackState(unit) then fireActiveAttack(unit) end
+                    local held = AutoPlace.enabled and AutoPlace.smartFreeze and BuffRot.isControlSkill(unit)
+                    if inAttackState(unit) and not held then fireActiveAttack(unit) end
                 end
             end
             task.wait(math.max(1, UnitAI.abilityCooldown))
@@ -2776,7 +2800,8 @@ local TRAITS = {
     reaper = { dmg = 1.15 },
     godspeed = { spa = 0.8 },
     sniper = { range = 1.25 },
-    culling = { dmg = 1.1 },
+    culling = { dmg = 1.05 }, -- +20% only on enemies under 30% hp
+    ethereal = { dmg = 1.1 },
     nimble = { spa = { 0.95, 0.925, 0.88 } },
     range = { range = { 1.1, 1.125, 1.15 } },
     superior = { dmg = { 1.1, 1.125, 1.15 } },
@@ -2995,6 +3020,7 @@ function AutoPlaceModule.RefreshTeam()
         pcall(function()
             for _, v in ipairs(getgc(true)) do
                 if type(v) == "table" and rawget(v, "uuid") and rawget(v, "equipped_slot") and rawget(v, "unit_id") then
+                    local okOne, errOne = pcall(function()
                     local slot = tonumber(rawget(v, "equipped_slot"))
                     if slot and slot >= 1 and slot <= 6 then
                         -- this copy's random rolls (speed_stat, potency_stat, range_stat, ...)
@@ -3038,9 +3064,31 @@ function AutoPlaceModule.RefreshTeam()
                         team[slot] = { uuid = tostring(rawget(v, "uuid")), name = tostring(rawget(v, "unit_id")),
                             rolls = rolls, traits = traits, traitRaw = table.concat(raw, " "), fields = table.concat(keys, ",") }
                     end
+                    end)
+                    if not okOne then AutoPlaceModule.teamError = clip(tostring(errOne), 120) end
                 end
             end
         end)
+    end
+    -- The game does not always keep the team in memory (seen 2026-10-23: cid and elyssia
+    -- never placed because only units already on the map were known). Remember the last
+    -- team read from game data and fill the missing slots from it.
+    AutoPlace.lastTeam = AutoPlace.lastTeam or {}
+    local foundAny = false
+    for slot, t in pairs(team) do
+        AutoPlace.lastTeam[tostring(slot)] = { uuid = t.uuid, name = t.name }
+        foundAny = true
+    end
+    if foundAny then saveConfig() end
+    local inTeam = {}
+    for _, t in pairs(team) do inTeam[(tostring(t.uuid):gsub("[{}%s]", ""))] = true end
+    for k, v in pairs(AutoPlace.lastTeam) do
+        local slot = tonumber(k)
+        local key = (tostring(v.uuid):gsub("[{}%s]", ""))
+        if slot and not team[slot] and not inTeam[key] then
+            team[slot] = { uuid = v.uuid, name = v.name, fromLastTeam = true }
+            inTeam[key] = true
+        end
     end
     local known = {}
     for _, t in pairs(team) do known[(tostring(t.uuid):gsub("[{}%s]", ""))] = true end
@@ -3640,6 +3688,15 @@ local function tick()
         badSpots[key] = true
         recentBad[#recentBad + 1] = key
         failsInRow = failsInRow + 1
+        t.refused = (t.refused or 0) + 1
+        if t.refused >= 8 and #placedOf(t.uuid) == 0 then
+            -- refused on 8 spots and never placed: not in the equipped team any more
+            AutoPlaceModule.full[t.uuid] = true
+            AutoPlaceModule.Note(string.format("%s refused 8 times - left out (not equipped?)", t.name))
+            for _, k in ipairs(recentBad) do badSpots[k] = nil end
+            recentBad, failsInRow = {}, 0
+            return 0.1
+        end
         if failsInRow >= 4 and not t.gameCap then
             -- refused on 4 different spots with money in hand: this unit is at its limit,
             -- and those spots were fine for other units
@@ -3657,9 +3714,88 @@ local function tick()
     return 1
 end
 
+-- The best moment to stop time: enemies about to reach the base, a boss (3x the usual HP)
+-- inside our damage units' range, or most enemies bunched inside that range.
+-- A number from a unit's _stats folder (nil when missing).
+function AutoPlaceModule.StatNum(u, name)
+    local st = u:FindFirstChild("_stats")
+    local v = st and st:FindFirstChild(name)
+    return v and tonumber(v.Value) or nil
+end
+
+function AutoPlaceModule.FreezeMoment()
+    local folder = unitsFolder()
+    local enemies, hps = {}, {}
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(u) then
+            local p = rootPos(u)
+            if p then
+                -- max HP (base_health): current health makes hurt enemies look small and a fresh one a "boss"
+                local hp = AutoPlaceModule.StatNum(u, "base_health") or AutoPlaceModule.StatNum(u, "health") or 0
+                table.insert(enemies, { p = p, hp = hp })
+                table.insert(hps, hp)
+            end
+        end
+    end
+    if #enemies == 0 then return nil end
+    if AutoPlaceModule.danger then return "base is taking damage" end
+    if AutoPlaceModule.EnemyProgress() >= 0.75 then return "enemies close to the base" end
+    local zone = {}
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" then
+            local p = rootPos(u)
+            local def = AutoPlaceModule.UnitDef(unitType(u))
+            local r = (AutoPlaceModule.StatNum(u, "range") or (def and tonumber(def.range)) or DEFAULT_RANGE) * (AutoPlaceModule.StatNum(u, "range_multiplier") or 1)
+            if p then table.insert(zone, { p = p, r = r }) end
+        end
+    end
+    table.sort(hps)
+    local median = hps[math.ceil(#hps / 2)] or 0
+    local inZone, boss = 0, false
+    for _, e in ipairs(enemies) do
+        for _, z in ipairs(zone) do
+            local dx, dz = e.p.X - z.p.X, e.p.Z - z.p.Z
+            if dx * dx + dz * dz <= z.r * z.r then
+                inZone = inZone + 1
+                if #enemies >= 3 and median > 0 and e.hp >= 3 * median then boss = true end
+                break
+            end
+        end
+    end
+    if boss then return "boss inside the damage zone" end
+    if inZone >= math.max(5, math.ceil(#enemies * 0.6)) then return string.format("%d enemies inside the damage zone", inZone) end
+    return nil
+end
+
+local function freezeLoop(gen)
+    local last, lastAny = {}, -1e9
+    while AutoPlace.enabled and gen == apGen and not State.unloaded do
+        if AutoPlace.smartFreeze and isGameRunning() and not isResultsShowing() then
+            pcall(function()
+                local why
+                for _, u in ipairs(ownedUnits()) do
+                    if BuffRot.isControlSkill(u) and os.clock() - lastAny >= 4 then
+                        local cd = AutoPlaceModule.StatNum(u, "active_attack_cooldown") or 30
+                        if os.clock() - (last[u] or -1e9) >= cd + 0.5 then
+                            if why == nil then why = AutoPlaceModule.FreezeMoment() or false end
+                            if why and fireActiveAttack(u) then
+                                last[u], lastAny = os.clock(), os.clock()
+                                AutoPlaceModule.Note(string.format("%s stopped time: %s", unitType(u), why))
+                                break
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+        task.wait(0.3)
+    end
+end
+
 function AutoPlaceModule.Start()
     apGen = apGen + 1
     local gen = apGen
+    task.spawn(freezeLoop, gen)
     AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
     AutoPlaceModule.noSpot = {}
     task.spawn(function()
@@ -3717,6 +3853,19 @@ function AutoPlaceModule.StatusText()
         end
     end
     table.insert(lines, "Team: " .. (#team > 0 and table.concat(team, ", ") or "not read yet"))
+    local rank = {}
+    for _, t in pairs(AutoPlaceModule.team) do
+        if AutoPlaceModule.RoleOf(t) == "dps" then
+            local st = AutoPlaceModule.Stats(t)
+            table.insert(rank, { name = t.name, dps = st.damage / math.max(0.1, st.cooldown) })
+        end
+    end
+    table.sort(rank, function(a, b) return a.dps > b.dps end)
+    if #rank > 0 then
+        local parts = {}
+        for i, r in ipairs(rank) do table.insert(parts, string.format("%d. %s %.0f/s", i, r.name, r.dps)) end
+        table.insert(lines, "Strongest (traits + rolls): " .. table.concat(parts, ", "))
+    end
     table.insert(lines, string.format("Path: %d points for %s", #pathPoints(), stageKey()))
     if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
     if #AutoPlaceModule.log > 0 then
@@ -3779,6 +3928,19 @@ function AutoPlaceModule.MapReport()
         end)
         if found == 0 then table.insert(lines, "  team data: no table in memory holds our unit uuids") end
     end
+    if AutoPlaceModule.teamError then table.insert(lines, "  team read error: " .. AutoPlaceModule.teamError) end
+    local hotbarTexts = {}
+    pcall(function()
+        local h = workspace.CurrentCamera.ViewportSize.Y
+        local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and not isOwnGui(d)
+                and d.AbsolutePosition.Y > h * 0.75 and #d.Text > 0 and #hotbarTexts < 30 then
+                table.insert(hotbarTexts, string.format("%s=%q", d.Name, clip(d.Text, 24)))
+            end
+        end
+    end)
+    table.insert(lines, "bottom of screen texts: " .. (#hotbarTexts > 0 and table.concat(hotbarTexts, " ") or "none"))
     table.insert(lines, "money value: " .. tostring(AutoPlace.moneyPath) .. " = " .. tostring(AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)))
     local top = {}
     for _, c in ipairs(workspace:GetChildren()) do table.insert(top, c.Name) end
@@ -3839,6 +4001,45 @@ function AutoPlaceModule.MapReport()
         end
     end
     table.insert(lines, "unit air/target keys: " .. (#airKeys > 0 and table.concat(airKeys, " ") or "none"))
+    -- attack shapes (circle / cone / line / full): the attack data modules, entries for our team
+    pcall(function()
+        local data = ReplicatedStorage.src.Data
+        local names = {}
+        for _, c in ipairs(data:GetChildren()) do table.insert(names, c.Name) end
+        table.insert(lines, "src.Data has: " .. clip(table.concat(names, ", "), 400))
+        local wantedAttacks = {}
+        for s = 1, 6 do
+            local t = AutoPlaceModule.team[s]
+            local def = t and AutoPlaceModule.UnitDef(t.name)
+            if def then
+                for _, k in ipairs({ "primary_attack_no_upgrades", "primary_attack", "active_attack" }) do
+                    if type(def[k]) == "string" then wantedAttacks[def[k]] = t.name end
+                end
+            end
+        end
+        local shown = 0
+        for _, m in ipairs(data:GetDescendants()) do
+            if m:IsA("ModuleScript") and string.lower(m.Name):find("attack", 1, true) and shown < 12 then
+                local ok, mod = pcall(require, m)
+                if ok and type(mod) == "table" then
+                    for id, owner in pairs(wantedAttacks) do
+                        local e = mod[id]
+                        if type(e) == "table" and shown < 12 then
+                            shown = shown + 1
+                            local parts = {}
+                            for k, v in pairs(e) do
+                                local shownV = type(v) == "table" and "{table}" or clip(tostring(v), 24)
+                                table.insert(parts, tostring(k) .. "=" .. shownV)
+                            end
+                            table.sort(parts)
+                            table.insert(lines, string.format("attack %s (%s, %s): %s", id, owner, m.Name, clip(table.concat(parts, " "), 500)))
+                        end
+                    end
+                end
+            end
+        end
+        if shown == 0 then table.insert(lines, "attack data: not found in modules named *attack*") end
+    end)
     local hpNow, hpMax = AutoPlaceModule.BaseHp()
     table.insert(lines, string.format("base hp read from screen: %s / %s (danger mode needs this), leading enemy %.0f%% of the way",
         tostring(hpNow), tostring(hpMax), AutoPlaceModule.EnemyProgress() * 100))
@@ -4103,57 +4304,87 @@ local function waveNow()
     return w
 end
 
-local ICON = { Gems = "💎", Gold = "🪙", XP = "⭐" }
+-- Player headshot for the embed thumbnail (looked up once).
+local avatarUrl
+local function playerAvatar()
+    if avatarUrl ~= nil then return avatarUrl or nil end
+    avatarUrl = false
+    pcall(function()
+        local id = Players.LocalPlayer.UserId
+        local raw = game:HttpGet("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" .. id .. "&size=150x150&format=Png")
+        local data = HttpService:JSONDecode(raw)
+        local url = data and data.data and data.data[1] and data.data[1].imageUrl
+        if type(url) == "string" and url:find("^https://") then avatarUrl = url end
+    end)
+    return avatarUrl or nil
+end
+
+-- "Normal" / "Hard" / "Nightmare" shown under the stage name on the result screen.
+local function difficultyText()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
+            local t = tostring(d.Text):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            local low = string.lower(t)
+            if low == "normal" or low == "hard" or low == "nightmare" or low == "insane" then return t end
+        end
+    end
+    return nil
+end
+
+local function yamlValue(v)
+    return (tostring(v):gsub("\n", " "):gsub("`", "'"))
+end
 
 function Webhook.BuildReport(kind)
     local now = playerSnapshot()
     local before = startSnap or now
     local win = kind == "win"
+    local result = (kind == "test" and "TEST") or (win and "VICTORY") or "DEFEAT"
     local head = (kind == "test" and "🧪  TEST REPORT") or (win and "🏆  VICTORY") or "💀  DEFEAT"
     local runTime = startSnap and (now.at - startSnap.at) or 0
 
+    -- Match Results (yaml block: keys and values get colours in Discord)
+    local match = {}
+    table.insert(match, "Stage: " .. yamlValue(State.stage or "Unknown stage"))
+    local diff = difficultyText()
+    if diff then table.insert(match, "Difficulty: " .. yamlValue(diff)) end
+    table.insert(match, "Result: " .. result)
+    table.insert(match, "Time: " .. clock(runTime))
+    table.insert(match, "Wave: " .. math.max(gameWave, waveNow()))
+
+    -- Rewards: totals with what this game added, then items
     local rewards = {}
-    local function delta(label, a, b)
-        if a and b and b ~= a then
-            table.insert(rewards, string.format("%s `%s%s` %s", ICON[label] or "▫️", b > a and "+" or "", commas(b - a), label))
+    local function line(label, a, b)
+        if b then
+            local d = (a and b) and (b - a) or 0
+            table.insert(rewards, string.format("%s: %s (%s%s)", label, commas(b), d >= 0 and "+" or "", commas(d)))
         end
     end
-    delta("Gems", before.gems, now.gems)
-    delta("Gold", before.gold, now.gold)
+    line("Gems", before.gems, now.gems)
+    line("Gold", before.gold, now.gold)
     if before.level and now.level and now.level > before.level then
-        table.insert(rewards, string.format("🆙 `+%d` Level", now.level - before.level))
-    else
-        delta("XP", before.xp, now.xp)
+        table.insert(rewards, string.format("Level: %d (+%d)", now.level, now.level - before.level))
+    elseif before.xp and now.xp and now.xp ~= before.xp then
+        table.insert(rewards, string.format("XP: +%s", commas(now.xp - before.xp)))
     end
     local gotItems = {}
     for id, n in pairs(now.items or {}) do
         local was = (before.items or {})[id] or 0
-        if n > was then table.insert(gotItems, { id = id, n = n - was }) end
+        if n > was then table.insert(gotItems, { id = id, n = n, got = n - was }) end
     end
-    table.sort(gotItems, function(a, b) return a.n > b.n end)
+    table.sort(gotItems, function(a, b) return a.got > b.got end)
+    if #gotItems > 0 then table.insert(rewards, "# Items #") end
     for i, it in ipairs(gotItems) do
-        if i > 10 then table.insert(rewards, string.format("▫️ ... and %d more", #gotItems - 10)) break end
-        table.insert(rewards, string.format("📦 `+%d` %s", it.n, prettyName(it.id)))
+        if i > 10 then table.insert(rewards, string.format("# ... and %d more", #gotItems - 10)) break end
+        table.insert(rewards, string.format("%s: %s (+%d)", yamlValue(prettyName(it.id)), commas(it.n), it.got))
     end
     if #rewards == 0 then
-        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "▫️ `" .. g .. "`") end
+        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "Gained: " .. yamlValue(g)) end
     end
-    if #rewards == 0 then table.insert(rewards, "*nothing new*") end
+    if #rewards == 0 then table.insert(rewards, "# nothing new") end
 
-    local player = {}
-    if now.level then
-        table.insert(player, string.format("Lv **%d**", now.level))
-        if now.xp and now.xpMax and now.xpMax > 0 then
-            local f = now.xp / now.xpMax
-            table.insert(player, string.format("`%s` %d%%", bar(f), math.floor(f * 100)))
-        end
-    end
-    if now.gems then table.insert(player, "💎 **" .. commas(now.gems) .. "**") end
-    if now.gold then table.insert(player, "🪙 **" .. commas(now.gold) .. "**") end
-    if #player == 0 then table.insert(player, "*not readable*") end
-
-    -- The bag size is compared with the number of different items first (a bag of 100
-    -- slots holds stacks), then with the total count; if neither fits, no size is shown.
+    -- Bag
     local bag = {}
     if not now.hasInventory then
         table.insert(bag, "*not readable*")
@@ -4162,40 +4393,44 @@ function Webhook.BuildReport(kind)
             or (now.bagMax and now.kinds <= now.bagMax and now.kinds) or nil
         if used then
             local f = used / now.bagMax
-            table.insert(bag, string.format("**%s** / %s", commas(used), commas(now.bagMax)))
-            table.insert(bag, string.format("`%s` %d%%", bar(f), math.floor(f * 100 + 0.5)))
-            if f >= 1 then table.insert(bag, "⛔ **FULL**")
-            elseif f >= 0.9 then table.insert(bag, "⚠️ **Almost full**")
-            else table.insert(bag, "✅ space left") end
+            local state = (f >= 1 and "⛔ **FULL**") or (f >= 0.9 and "⚠️ **Almost full**") or "✅ space left"
+            table.insert(bag, string.format("**%s** / %s  `%s` %d%%", commas(used), commas(now.bagMax), bar(f), math.floor(f * 100 + 0.5)))
+            table.insert(bag, state)
         else
-            table.insert(bag, string.format("**%s** items", commas(now.itemTotal)))
-            table.insert(bag, string.format("%d kinds", now.kinds))
+            table.insert(bag, string.format("**%s** items · %d kinds", commas(now.itemTotal), now.kinds))
         end
     end
 
+    -- Session
     local elapsed = os.clock() - session.started
-    local farm = {}
-    table.insert(farm, string.format("✅ **%d**  ·  ❌ **%d**", session.wins, session.losses))
-    table.insert(farm, "⏱ " .. clock(elapsed))
+    local farm = { string.format("✅ **%d**  ·  ❌ **%d**  ·  ⏱ %s", session.wins, session.losses, clock(elapsed)) }
     local first = firstSnap or before
     if first.gems and now.gems and elapsed > 60 and now.gems > first.gems then
-        table.insert(farm, string.format("💎 %s / h", commas((now.gems - first.gems) * 3600 / elapsed)))
+        table.insert(farm, string.format("💎 %s / hour", commas((now.gems - first.gems) * 3600 / elapsed)))
+    end
+
+    local who = {}
+    table.insert(who, "Username: ||" .. tostring(Players.LocalPlayer.Name) .. "||")
+    if now.level then
+        table.insert(who, string.format("Level: **%d**%s", now.level,
+            (now.xp and now.xpMax) and string.format(" [%s/%s]", commas(now.xp), commas(now.xpMax)) or ""))
     end
 
     local embed = {
         author = { name = "MACRO // LAB" },
         title = head,
         color = kind == "test" and 5793266 or (win and 5763719 or 15548997),
-        description = string.format("**%s**\n⏱ `%s`   🌊 Wave `%d`", State.stage or "Unknown stage", clock(runTime),
-            math.max(gameWave, waveNow())),
+        description = table.concat(who, "\n"),
         fields = {
-            { name = "🎁 Rewards", value = table.concat(rewards, "\n"), inline = false },
-            { name = "👤 Player", value = table.concat(player, "\n"), inline = true },
+            { name = "Match Results", value = "```yaml\n" .. table.concat(match, "\n") .. "\n```", inline = false },
+            { name = "Rewards", value = "```yaml\n" .. table.concat(rewards, "\n") .. "\n```", inline = false },
             { name = "🎒 Bag", value = table.concat(bag, "\n"), inline = true },
             { name = "📈 Session", value = table.concat(farm, "\n"), inline = true },
         },
-        footer = { text = "MACRO // LAB" },
+        footer = { text = "MACRO // LAB · Notify" },
     }
+    local avatar = playerAvatar()
+    if avatar then embed.thumbnail = { url = avatar } end
     pcall(function() embed.timestamp = DateTime.now():ToIsoDate() end)
     return { username = "MACRO // LAB", embeds = { embed } }
 end
@@ -4760,6 +4995,11 @@ Controls.placeMode = placeMain:Dropdown({
         saveConfig()
     end,
 }, "AutoPlaceMode")
+Controls.smartFreeze = placeMain:Toggle({
+    Name = "Time stop / freeze skills at the best moment",
+    Default = AutoPlace.smartFreeze,
+    Callback = function(on) AutoPlace.smartFreeze = on; saveConfig() end,
+}, "AutoPlaceFreeze")
 placeMain:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
@@ -5127,6 +5367,7 @@ applyRuntimeFeatures = function()
     if Tools.antiAfk then ToolsModule.StartAntiAfk() else ToolsModule.StopAntiAfk() end
     setControl(Controls.autoPlaceUpgrade, AutoPlace.upgrade)
     pcall(function() Controls.placeMode:UpdateSelection(AutoPlace.placeMode) end)
+    setControl(Controls.smartFreeze, AutoPlace.smartFreeze)
     for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
     AutoPlace.enabled = pendingToggles.autoPlace == true
     setControl(Controls.autoPlace, AutoPlace.enabled)
