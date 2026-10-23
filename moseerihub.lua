@@ -140,7 +140,7 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, eggs = {}, claim = false },
+        openEggs = false, eggs = {}, claim = false, towerRoom = 0 },
     watchLog = {},
 }
 
@@ -6350,6 +6350,7 @@ task.spawn(function()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
+            pcall(Lobby.TowerResult, win)
             task.wait(1.5) -- let the game add the rewards first
             local pings = {}
             -- bag turned full (once until it has room again)
@@ -7441,6 +7442,28 @@ function Lobby.Join()
     return false
 end
 
+-- Infinity Mansion: the game starts the player's current room (watched:
+-- request_start_infinite_tower(141, "Hard")). The room comes from the stage name of the
+-- last tower game ("Infinity Mansion Room 141"): won = the next room, lost = the same.
+function Lobby.TowerResult(win)
+    local n = tonumber(tostring(State.stage or ""):match("[Ii]nfinity [Mm]ansion[^%d]*(%d+)"))
+    if not n then return end
+    Lobby.cfg.towerRoom = win and n + 1 or n
+    saveConfig()
+end
+function Lobby.JoinTower()
+    local c = Lobby.cfg
+    if (c.towerRoom or 0) < 1 then
+        Lobby.Status("Infinity Mansion: play one tower room with the script on, so it knows your room")
+        return false
+    end
+    local start = getAARemote("request_start_infinite_tower")
+    if not start then return false end
+    pcall(function() start:InvokeServer(c.towerRoom, c.difficulty) end)
+    Lobby.Status(string.format("Infinity Mansion: starting room %d (%s)", c.towerRoom, c.difficulty))
+    return true
+end
+
 -- Every 5 s in the lobby (not while Watch is teaching): join again 20 s after a try.
 function Lobby.Loop()
     while not State.unloaded do
@@ -7467,9 +7490,9 @@ function Lobby.Loop()
                     local ok, r = pcall(Lobby.UsePortal)
                     used = ok and r == true
                 end
-                if not used and c.autoJoin and c.mode ~= "Infinity Mansion" then
+                if not used and c.autoJoin then
                     Lobby.lastJoin = os.clock()
-                    pcall(Lobby.Join)
+                    pcall(c.mode == "Infinity Mansion" and Lobby.JoinTower or Lobby.Join)
                 end
             end
         end
@@ -7656,7 +7679,7 @@ local function picked(list) local m = {} for _, n in ipairs(list) do m[n] = true
 
 local join = UIRef.tabs.lobby:Section({ Side = "Left" })
 join:Header({ Text = "Auto join" })
-UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "Auto join works for Story, Infinite, Legend and Raid. Infinity Mansion, portals, cleaning, eggs and rewards wait for Watch: press it and do each of them yourself once." })
+UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "In the lobby: clean bag, open eggs, use a portal, else Auto join. Infinity Mansion learns your room from one tower game. Rewards wait for Watch." })
 join:Toggle({ Name = "Auto join", Default = Lobby.cfg.autoJoin, Callback = set("autoJoin") }, "LobbyAutoJoin")
 local worldDropdown
 join:Dropdown({ Name = "Join mode", Multi = false, Required = true,
