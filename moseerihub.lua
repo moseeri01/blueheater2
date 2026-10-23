@@ -7599,7 +7599,10 @@ function Lobby.Loop()
                 end
                 if not used and c.autoJoin then
                     Lobby.lastJoin = os.clock()
-                    pcall(c.mode == "Infinity Mansion" and Lobby.JoinTower or Lobby.Join)
+                    local ok, joined = pcall(c.mode == "Infinity Mansion" and Lobby.JoinTower or Lobby.Join)
+                    -- an event room starts on its own after a countdown: joining again restarts
+                    -- it, so the next try waits a minute (+20 s)
+                    if ok and joined and c.mode == "Event" then Lobby.lastJoin = os.clock() + 60 end
                 end
             end
         end
