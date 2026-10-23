@@ -2680,9 +2680,47 @@ function AutoPlaceModule.RefreshTeam()
     for s, t in pairs(team) do
         local old = AutoPlaceModule.team[s]
         if old and old.uuid == t.uuid then t.cost = old.cost end
+        -- price and placement limit straight from the game's unit data, when it has them
+        local def = AutoPlaceModule.UnitDef(t.name)
+        if def then
+            t.cost = t.cost or tonumber(def.cost)
+            if not AutoPlace.caps[t.name] then
+                for k, v in pairs(def) do
+                    local key = string.lower(tostring(k))
+                    if type(v) == "number" and v >= 1 and v <= 20 and (key:find("cap", 1, true) or key:find("limit", 1, true)) then
+                        AutoPlace.caps[t.name] = v
+                        break
+                    end
+                end
+            end
+        end
     end
     AutoPlaceModule.team = team
     return team
+end
+
+-- The game's unit definitions (ReplicatedStorage.src.Data.Units.*), read once.
+local unitDefsCache
+function AutoPlaceModule.UnitDef(name)
+    if not unitDefsCache then
+        unitDefsCache = {}
+        pcall(function()
+            local src = ReplicatedStorage:FindFirstChild("src")
+            local data = src and src:FindFirstChild("Data")
+            local units = data and data:FindFirstChild("Units")
+            for _, m in ipairs(units and units:GetDescendants() or {}) do
+                if m:IsA("ModuleScript") then
+                    local ok, defs = pcall(require, m)
+                    if ok and type(defs) == "table" then
+                        for id, def in pairs(defs) do
+                            if type(def) == "table" then unitDefsCache[tostring(id)] = def end
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    return unitDefsCache[name]
 end
 
 local function normUuid(u) return (tostring(u):gsub("[{}%s]", "")) end
@@ -2776,6 +2814,71 @@ local function upgradeStep()
     pcall(function() remote:InvokeServer(pick) end)
 end
 
+-- The game shows each team slot's price on the hotbar ("800 ¥") and the cash just above it
+-- ("10175¥"). Reading them means the first placement of a game needs no guessing, and a
+-- "Cannot place unit here!" spot is skipped at once instead of retried.
+local function parseYen(text)
+    local num = tostring(text):match("^%s*([%d,]+)%s*¥%s*$")
+    return num and tonumber((num:gsub(",", ""))) or nil
+end
+
+function AutoPlaceModule.ReadHud()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return nil, {} end
+    local labels = {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local v = parseYen(d.Text)
+            if v and isOnScreen(d) and not isOwnGui(d) then
+                local p = d.AbsolutePosition
+                table.insert(labels, { v = v, x = p.X, y = p.Y })
+            end
+        end
+    end
+    local rowY, rowN = nil, 0
+    for _, a in ipairs(labels) do
+        local n = 0
+        for _, b in ipairs(labels) do if math.abs(a.y - b.y) <= 6 then n = n + 1 end end
+        if n > rowN then rowY, rowN = a.y, n end
+    end
+    local prices, money, moneyDist = {}, nil, nil
+    if rowN >= 2 then
+        local row = {}
+        for _, a in ipairs(labels) do if math.abs(a.y - rowY) <= 6 then table.insert(row, a) end end
+        table.sort(row, function(p, q) return p.x < q.x end)
+        local slots = {}
+        for s in pairs(AutoPlaceModule.team) do table.insert(slots, s) end
+        table.sort(slots)
+        if #slots == #row then
+            for i, a in ipairs(row) do prices[slots[i]] = a.v end
+        end
+    end
+    for _, a in ipairs(labels) do
+        if not (rowN >= 2 and math.abs(a.y - rowY) <= 6) then
+            local dist = rowY and math.abs(rowY - a.y) or 0
+            if not moneyDist or dist < moneyDist then money, moneyDist = a.v, dist end
+        end
+    end
+    return money, prices
+end
+
+-- Why the game refused a placement, from the message it flashes on screen.
+local function refusalReason()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return nil end
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("TextLabel") and #d.Text > 0 and #d.Text < 60 then
+            local t = string.lower(d.Text)
+            local kind
+            if t:find("not enough", 1, true) then kind = "money"
+            elseif t:find("cannot place", 1, true) or t:find("can't place", 1, true) or t:find("invalid", 1, true) then kind = "spot"
+            elseif t:find("max", 1, true) or t:find("limit", 1, true) then kind = "cap" end
+            if kind and isOnScreen(d) and not isOwnGui(d) then return kind end
+        end
+    end
+    return nil
+end
+
 local function tick()
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
     if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
@@ -2804,12 +2907,20 @@ local function tick()
         AutoPlaceModule.status = "Everything placed"
         return 1
     end
-    local money = AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)
-    if t.cost and money and money < t.cost then
-        AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(t.cost))
+    if not AutoPlace.moneyPath then
+        -- a recorded macro already knows which value is the money
+        for _, a in ipairs(State.actions) do
+            if type(a.costPath) == "string" then AutoPlace.moneyPath = a.costPath break end
+        end
+    end
+    local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
+    local cost = t.cost or hudPrices[slot]
+    local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
+    if cost and money and money < cost then
+        AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(cost))
         return 0.1
     end
-    local unknown = not (t.cost and money)
+    local unknown = not (cost and money)
     local spot = bestSpot(unknown and (unknownTries % 3) or 0) or bestSpot(0)
     if not spot then
         AutoPlaceModule.problem = "no free spot beside the path - the path may still be short"
@@ -2821,7 +2932,19 @@ local function tick()
         AutoPlaceModule.problem = nil
         return 0.2
     end
-    if t.cost and money and money >= t.cost then
+    local why = refusalReason()
+    if why == "money" then return 0.5 end
+    if why == "spot" then
+        badSpots[spotKey(spot)] = true
+        return 0.1
+    end
+    if why == "cap" then
+        AutoPlaceModule.full[t.uuid] = true
+        AutoPlace.caps[t.name] = #placedOf(t.uuid)
+        saveConfig()
+        return 0.1
+    end
+    if cost and money and money >= cost then
         -- enough money but refused: the spot is not allowed; several in a row = unit limit
         local key = spotKey(spot)
         badSpots[key] = true
@@ -2940,12 +3063,87 @@ function AutoPlaceModule.MapReport()
     table.insert(lines, string.format("path points: %d", #pathPoints()))
     local spot = #pathPoints() >= 8 and bestSpot()
     if spot then table.insert(lines, string.format("best spot: (%.1f, %.1f, %.1f) covers %d path points", spot.x, spot.y, spot.z, spot.score)) end
+
+    local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
+    local priceText = {}
+    for s = 1, 6 do if hudPrices[s] then table.insert(priceText, s .. "=" .. hudPrices[s]) end end
+    table.insert(lines, string.format("screen: money %s, hotbar prices %s", tostring(hudMoney), table.concat(priceText, " ")))
+
+    -- The game's own unit definitions: price, limit, farm, hill/ground, buff numbers.
+    local src = ReplicatedStorage:FindFirstChild("src")
+    local data = src and src:FindFirstChild("Data")
+    local unitsData = data and data:FindFirstChild("Units")
+    table.insert(lines, "src.Data.Units: " .. (unitsData and unitsData:GetFullName() or "not found"))
+    if unitsData then
+        local wanted = {}
+        for s = 1, 6 do
+            local t = AutoPlaceModule.team[s]
+            if t then wanted[t.name] = s end
+        end
+        local function short(v)
+            if type(v) == "table" then
+                local keys, n = {}, 0
+                for k in pairs(v) do
+                    n = n + 1
+                    if #keys < 6 then table.insert(keys, tostring(k)) end
+                end
+                return "{" .. n .. ": " .. table.concat(keys, ",") .. "}"
+            end
+            return clip(tostring(v), 30)
+        end
+        for _, m in ipairs(unitsData:GetDescendants()) do
+            if not next(wanted) then break end
+            if m:IsA("ModuleScript") then
+                local ok, defs = pcall(require, m)
+                if ok and type(defs) == "table" then
+                    for id, def in pairs(defs) do
+                        if wanted[id] and type(def) == "table" then
+                            local parts = {}
+                            for k, v in pairs(def) do table.insert(parts, tostring(k) .. "=" .. short(v)) end
+                            table.sort(parts)
+                            local up = def.upgrade or def.upgrades
+                            if type(up) == "table" and type(up[1]) == "table" then
+                                local first = {}
+                                for k, v in pairs(up[1]) do table.insert(first, tostring(k) .. "=" .. short(v)) end
+                                table.sort(first)
+                                table.insert(parts, "upgrade[1]: " .. table.concat(first, " "))
+                            end
+                            table.insert(lines, string.format("data slot %d %s (%s): %s", wanted[id], id, m.Name, clip(table.concat(parts, " "), 1200)))
+                            wanted[id] = nil
+                        end
+                    end
+                end
+            end
+        end
+        for id in pairs(wanted) do table.insert(lines, "data for " .. id .. ": not found") end
+    end
+
+    -- What each of our units shows over its head (buff %) and its buff-related numbers.
+    for _, u in ipairs(ownedUnits()) do
+        local texts = {}
+        for _, d in ipairs(u:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and #d.Text > 0 then
+                table.insert(texts, clip(d.Text, 16))
+            end
+        end
+        local nums = {}
+        local stats = u:FindFirstChild("_stats")
+        for _, v in ipairs(stats and stats:GetChildren() or {}) do
+            local n = string.lower(v.Name)
+            if n:find("buff", 1, true) or n:find("multiplier", 1, true) or n:find("active", 1, true) then
+                local ok, val = pcall(function() return v.Value end)
+                table.insert(nums, v.Name .. "=" .. (ok and clip(tostring(val), 14) or "?"))
+            end
+        end
+        table.insert(lines, string.format("unit %s labels [%s] %s", u.Name, table.concat(texts, " | "), table.concat(nums, " ")))
+    end
+
     local text = table.concat(lines, "\n")
     print(text)
     if type(setclipboard) == "function" and pcall(setclipboard, text) then
-        notify("Map report copied to clipboard - paste it to me.")
+        notify("Game data report copied to clipboard - paste it to me.")
     else
-        notify("Map report printed to the console (F9).")
+        notify("Game data report printed to the console (F9).")
     end
 end
 end
@@ -3455,7 +3653,7 @@ Controls.autoPlaceUpgrade = placeMain:Toggle({
 }, "AutoPlaceUpgrade")
 placeMain:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
-placeMain:Button({ Name = "Copy map report", Callback = AutoPlaceModule.MapReport })
+placeMain:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
 placeMain:Paragraph({ Header = "", Body = "Watches where enemies walk (saved per stage),\nthen places your team beside the path where\nit covers the most road, as soon as money\nallows. Uses whatever team you have equipped." })
 
 placeSlots:Header({ Text = "How many per team slot (0 = none)" })
