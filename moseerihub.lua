@@ -141,7 +141,7 @@ local Lobby = {
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
         openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false,
-        watchNoPause = false }, -- (config only: Watch logs without pausing the lobby automation)
+        watchNoPause = false, eventCards = false, cardMode = "Most coins", voteWay = "", eventSpells = false, spellWay = "" }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
 }
 
@@ -4588,6 +4588,7 @@ local function tick()
     -- money: the learned value, else AA's in-game yen (_stats.resource), else the screen
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
         or readCostValue("LP._stats.resource") or hudMoney
+    pcall(Lobby.SpellStep, money)
     if AutoPlace.sellFarmsLast and AutoPlaceModule.LastWave() and AutoPlaceModule.SellFarm() then return 0.3 end
     local danger = AutoPlaceModule.Danger()
     if danger and not AutoPlaceModule.danger then AutoPlaceModule.Note("base took damage: damage units first for 20 s") end
@@ -7635,6 +7636,19 @@ function Lobby.Loop()
         local busy = false
         -- order in the lobby: clean the bag, open eggs, then a portal, else Auto join
         -- (nothing while Watch is teaching); in a stage only the cleaner, when allowed
+        -- while Watch is on, a live status file for checking a run from outside the game
+        if State.watching and not inLobbyNow and os.clock() - (Lobby.lastLive or -1e9) > 15 then
+            Lobby.lastLive = os.clock()
+            pcall(function()
+                local hp, hpMax = AutoPlaceModule.ScanBaseHp()
+                local money = readCostValue("LP._stats.resource")
+                Lobby.live = Lobby.live or {}
+                table.insert(Lobby.live, string.format("%s wave %s money %s base %s/%s | %s", os.date("%H:%M:%S"), tostring(getCurrentWave()),
+                    tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), (AutoPlaceModule.StatusText():gsub("\n", " | "))))
+                if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
+                AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
+            end)
+        end
         if inLobbyNow and not Lobby.listsFilled and Lobby.RefreshLists and os.clock() - (Lobby.lastRefresh or -1e9) > 30 then
             Lobby.lastRefresh = os.clock()
             pcall(Lobby.RefreshLists, false)
@@ -7667,6 +7681,163 @@ function Lobby.Loop()
         task.wait(busy and 2 or 5)
     end
 end
+
+-- Fool's Hunt cards (watched in the real game): show_roguelike_options(seconds, { { title,
+-- option_type = "Bad" | "Good", effects = { { type, amount, ... }, ... } }, ... }), then
+-- show_roguelike_vote_result(picked, { candy_multiplier, persistent_effects }). A "Bad" card
+-- makes the enemies stronger and adds 0.3 to the coin multiplier (added up: 0.6 after two);
+-- a "Good" card helps us and adds nothing. The vote call (select_roguelike_option) was never
+-- seen with its arguments: the ways below are tried in turn; a way whose result matched the
+-- pick twice is kept (cfg.voteWay).
+Lobby.VOTE_WAYS = { "index", "index0", "title", "option" }
+
+-- Share of our damage by type (physical / magic / true ...), from the placed units' data.
+function Lobby.DamageShare()
+    local share, total = {}, 0
+    for _, u in ipairs(ownedUnits()) do
+        local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+        local kind = tostring(def._base_damage_type or "physical")
+        local dps = (tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1)
+        share[kind] = (share[kind] or 0) + dps
+        total = total + dps
+    end
+    if total <= 0 then return { physical = 0.5, magic = 0.5 } end
+    for k, v in pairs(share) do share[k] = v / total end
+    return share
+end
+
+-- How much a card hurts us (0 = nothing): enemy health and speed directly, resistance only
+-- for the damage types we deal (true damage ignores it), shields and death bombs a little.
+function Lobby.CardCost(opt, share)
+    local cost = 0
+    for _, e in ipairs(type(opt.effects) == "table" and opt.effects or {}) do
+        local t, a = tostring(e.type), tonumber(e.amount) or 0
+        if t == "candy_multiplier" then
+            -- (the reward, not a cost)
+        elseif t == "enemy_stat_mul" then cost = cost + a
+        elseif t == "enemy_speedup" then cost = cost + 2 * a
+        elseif t == "enemy_resistance_specific" then cost = cost + 1.5 * (a / 100) * (share[tostring(e.damage_type)] or 0)
+        elseif t == "enemy_shield" then cost = cost + 0.1 * a
+        elseif t == "enemy_bomb" then cost = cost + 0.2
+        elseif opt.option_type == "Bad" then cost = cost + 0.6
+        end
+    end
+    return cost
+end
+
+-- The card to pick: "Most coins" takes the Bad card that hurts least (each adds 0.3 to the
+-- coin multiplier) unless the base is losing HP or every Bad card is heavy; "Safest" takes a
+-- Good card whenever there is one.
+function Lobby.PickCard(options)
+    local share = Lobby.DamageShare()
+    local hp, hpMax = AutoPlaceModule.ScanBaseHp()
+    local hurt = hp and hpMax and hpMax > 0 and hp / hpMax < 0.8
+    local bestBad, bestBadCost, good
+    for i, o in ipairs(options) do
+        if type(o) == "table" then
+            if o.option_type == "Good" then good = good or i
+            else
+                local c = Lobby.CardCost(o, share)
+                if not bestBad or c < bestBadCost then bestBad, bestBadCost = i, c end
+            end
+        end
+    end
+    if good and (Lobby.cfg.cardMode == "Safest" or hurt or not bestBad or bestBadCost > 0.8) then return good, "help" end
+    return bestBad or 1, "coins"
+end
+
+function Lobby.OnCardOptions(seconds, options)
+    if not Lobby.cfg.eventCards or type(options) ~= "table" or #options == 0 then return end
+    local remote = getAARemote("select_roguelike_option")
+    if not remote then return end
+    local i, why = Lobby.PickCard(options)
+    local way = Lobby.cfg.voteWay ~= "" and Lobby.cfg.voteWay or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
+    local arg = (way == "index0" and i - 1) or (way == "title" and options[i].title) or (way == "option" and options[i]) or i
+    local ok, reply = pcall(function() return remote:InvokeServer(arg) end)
+    Lobby.pendingVote = { title = options[i].title, way = way }
+    AutoPlaceModule.Note(string.format("card: %s (%s, way %s, reply %s)", tostring(options[i].title), why, way, ok and tostring(reply) or "error"))
+end
+
+function Lobby.OnCardResult(picked, state)
+    if type(state) == "table" then Lobby.candy = tonumber(state.candy_multiplier) or Lobby.candy end
+    local p = Lobby.pendingVote
+    Lobby.pendingVote = nil
+    if not p or type(picked) ~= "table" or Lobby.cfg.voteWay ~= "" then return end
+    if picked.title == p.title then
+        Lobby.voteHits = (Lobby.voteHits or 0) + 1
+        if Lobby.voteHits >= 2 then
+            Lobby.cfg.voteWay = p.way
+            saveConfig()
+            AutoPlaceModule.Note("card vote way learned: " .. p.way)
+        end
+    else
+        -- (the game picked another card: this way did not count)
+        Lobby.voteHits = 0
+        Lobby.voteTry = (Lobby.voteTry or 1) % #Lobby.VOTE_WAYS + 1
+    end
+end
+
+-- Spells in hand (watched: ingame_spells({ "clone" }) every 10 s). Used: Random Buff on the
+-- strongest damage unit, Clone on the most upgraded one, Astral Summon when rich; never
+-- Refund / Ritual / Merge / Astral Gate. use_ingame_spell's arguments were never seen either:
+-- a way counts as working when the spell leaves the hand (cfg.spellWay).
+Lobby.SPELL_WAYS = { "id_unit", "index_unit", "id", "index" }
+Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "upgraded" },
+    summon = { cost = 10000, reserve = 2000 } }
+function Lobby.OnSpells(list)
+    if type(list) ~= "table" then return end
+    local before = Lobby.spellTry
+    Lobby.spells = list
+    if before and Lobby.cfg.spellWay == "" then
+        local still = false
+        for _, s in ipairs(list) do if s == before.id then still = true end end
+        if still then
+            Lobby.spellWayTry = (Lobby.spellWayTry or 1) % #Lobby.SPELL_WAYS + 1
+        else
+            Lobby.cfg.spellWay = before.way
+            saveConfig()
+            AutoPlaceModule.Note("spell way learned: " .. before.way)
+        end
+    end
+    Lobby.spellTry = nil
+end
+
+function Lobby.SpellStep(money)
+    if not Lobby.cfg.eventSpells or not money then return end
+    local remote = getAARemote("use_ingame_spell")
+    if not remote or os.clock() - (Lobby.spellAt or -1e9) < 12 then return end
+    for idx, id in ipairs(Lobby.spells or {}) do
+        local spec = Lobby.SPELLS[id]
+        if spec and money >= spec.cost + (spec.reserve or 0) then
+            local target, best
+            for _, u in ipairs(ownedUnits()) do
+                if AutoPlaceModule.RoleOf and unitType(u) then
+                    local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+                    local score = spec.target == "upgraded" and (AutoPlaceModule.StatNum(u, "upgrade") or 0)
+                        or ((tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1))
+                    if (tonumber(def.damage) or 0) > 0 and (not best or score > best) then target, best = u, score end
+                end
+            end
+            if spec.target and not target then return end
+            local way = Lobby.cfg.spellWay ~= "" and Lobby.cfg.spellWay or Lobby.SPELL_WAYS[Lobby.spellWayTry or 1]
+            local key = way:find("^index") and idx or id
+            Lobby.spellAt = os.clock()
+            Lobby.spellTry = { id = id, way = way }
+            pcall(function()
+                if way:find("_unit$") and target then remote:InvokeServer(key, target) else remote:InvokeServer(key) end
+            end)
+            AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
+            return
+        end
+    end
+end
+
+task.spawn(pcall, function()
+    local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
+    stc:WaitForChild("show_roguelike_options", 5).OnClientEvent:Connect(function(s, o) pcall(Lobby.OnCardOptions, s, o) end)
+    stc:WaitForChild("show_roguelike_vote_result", 5).OnClientEvent:Connect(function(p, st) pcall(Lobby.OnCardResult, p, st) end)
+    stc:WaitForChild("ingame_spells", 5).OnClientEvent:Connect(function(l) pcall(Lobby.OnSpells, l) end)
+end)
 
 -- Portal and item ids in the bag (pretty names), for the Portals and Bag cleaner lists.
 -- The bag as the game keeps it: unique items (portals and others, each with a uuid, the
@@ -8014,8 +8185,13 @@ UIRef.lobbyEggs = gifts:Dropdown({ Name = "Eggs to open", Multi = true, Required
 gifts:Toggle({ Name = "Claim rewards", Default = Lobby.cfg.claim, Callback = set("claim") }, "LobbyClaim")
 gifts:Paragraph({ Header = "Never buys", Body = "Daily, quests, level and battle pass rewards; eggs you already own." })
 local event = UIRef.tabs.event:Section({ Side = "Left" })
-event:Header({ Text = "Event (planned)" })
-event:Paragraph({ Header = "Coming", Body = "Fool's Hunt: random temporary units and\nspells, and card votes. Needs remotes_and_hud.txt\nand event_data.txt saved during the event with\nunits in the hotbar, and again while a card\nvote (Choose a card!) is on screen." })
+event:Header({ Text = "Fool's Hunt" })
+event:Paragraph({ Header = "How", Body = "Lobby > Join mode: Event joins it. Home AUTO places the random units. The map changes every game." })
+event:Toggle({ Name = "Vote cards", Default = Lobby.cfg.eventCards, Callback = set("eventCards") }, "EventCards")
+event:Dropdown({ Name = "Card choice", Multi = false, Required = true, Options = { "Most coins", "Safest" },
+    Default = Lobby.cfg.cardMode, Callback = set("cardMode") }, "EventCardMode")
+event:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = set("eventSpells") }, "EventSpells")
+event:Paragraph({ Header = "Cards", Body = "Most coins: the Bad card that hurts the team least (+0.3 coins each), a Good card when the base is hurt. Safest: Good cards first." })
 end
 
 -- TAB: Dungeon (data first; see MODULE: Dungeon Run)
