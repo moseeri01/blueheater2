@@ -2631,7 +2631,10 @@ function AutoPlaceModule.RoleFromDef(name)
     end
     local up = def.upgrade or def.upgrades
     if hasFarm(def) or (type(up) == "table" and type(up[1]) == "table" and hasFarm(up[1])) then return "farm" end
-    if def._show_as_buff_unit == true or def._NO_ATTACKS_UNIT == true then return "buff" end
+    if def._show_as_buff_unit == true or def._NO_ATTACKS_UNIT == true then
+        -- a buffer with passives (hoshino: damage buff + cheaper upgrades) is "support"
+        return type(def.passives) == "table" and next(def.passives) ~= nil and "support" or "buff"
+    end
     for k, v in pairs(def) do
         if type(v) == "string" and string.lower(tostring(k)):find("active", 1, true) and string.lower(v):find("buff", 1, true) then
             return "buff"
@@ -2691,13 +2694,22 @@ local function bestSpot(skip, role, range)
     if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor then
         candidates, candidatesFor = buildCandidates(pts), #pts
     end
-    local mine, helpers = {}, {}
+    local mine, helpers, farms = {}, {}, {}
     for _, u in ipairs(ownedUnits()) do
         local p = rootPos(u)
         if p then
             table.insert(mine, p)
-            if unitRole(u) == "dps" then table.insert(helpers, p) end
+            local r = unitRole(u)
+            if r == "dps" then table.insert(helpers, p) elseif r == "farm" then table.insert(farms, p) end
         end
+    end
+    local function countNear(list, c, reach)
+        local n = 0
+        for _, p in ipairs(list) do
+            local dx, dz = p.X - c.x, p.Z - c.z
+            if dx * dx + dz * dz <= reach * reach then n = n + 1 end
+        end
+        return n
     end
     local free = {}
     for _, c in ipairs(candidates) do
@@ -2711,22 +2723,29 @@ local function bestSpot(skip, role, range)
         end
     end
     if role == "farm" then
-        return free[#free - skip]
-    end
-    if role == "buff" and #helpers > 0 then
+        if #farms == 0 then return free[#free - skip] end
+        -- farms side by side (one support unit then reaches them all), on low-value spots
         local scored = {}
         for _, c in ipairs(free) do
-            local near = 0
-            for _, p in ipairs(helpers) do
-                local dx, dz = p.X - c.x, p.Z - c.z
-                if dx * dx + dz * dz <= BUFF_REACH * BUFF_REACH then near = near + 1 end
-            end
+            table.insert(scored, { c = c, k = countNear(farms, c, 6) * 100000 - c.score })
+        end
+        table.sort(scored, function(a, b) return a.k > b.k end)
+        return scored[skip + 1] and scored[skip + 1].c
+    end
+    if (role == "buff" or role == "support") and (#helpers > 0 or #farms > 0) then
+        -- buff: next to the most damage units. support (also cheapens upgrades, e.g.
+        -- hoshino): next to the farms it will cheapen, then damage units, within its range
+        local reach = (range and range > 0 and range ~= DEFAULT_RANGE) and range or BUFF_REACH
+        local scored = {}
+        for _, c in ipairs(free) do
+            local near = countNear(helpers, c, reach)
+            if role == "support" then near = near + 2 * countNear(farms, c, reach) end
             table.insert(scored, { c = c, k = near * 100000 + c.score })
         end
         table.sort(scored, function(a, b) return a.k > b.k end)
         return scored[skip + 1] and scored[skip + 1].c
     end
-    if range and range ~= DEFAULT_RANGE and role ~= "buff" then
+    if range and range ~= DEFAULT_RANGE and role ~= "buff" and role ~= "support" then
         local r2 = range * range
         local scored = {}
         for _, c in ipairs(free) do
@@ -2912,7 +2931,7 @@ end
 local function upgradeStep(money, onlyRole)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
-    local RANK = { farm = 1, dps = 2, buff = 3 }
+    local RANK = { farm = 1, dps = 2, buff = 3, support = 3 }
     local pick, pickLevel, pickRank, pickCost
     for _, u in ipairs(ownedUnits()) do
         local role = unitRole(u)
@@ -3039,7 +3058,8 @@ local function chooseNext(prices)
         end
         return best
     end
-    local pick = (dpsPlaced == 0 and cheapest("dps")) or cheapest("farm")
+    -- one cheap damage unit, then the farms, then support (cheaper upgrades before upgrading)
+    local pick = (dpsPlaced == 0 and cheapest("dps")) or cheapest("farm") or cheapest("support")
     if not pick then
         for _, e in ipairs(list) do e.value = AutoPlaceModule.Value(e.t.name, e.cost ~= math.huge and e.cost or nil) end
         table.sort(list, function(a, b)
@@ -3077,7 +3097,7 @@ local function tick()
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
     local slot, t, role, dpsPlaced = chooseNext(hudPrices)
-    if AutoPlace.upgrade and (dpsPlaced or 0) > 0 and (not t or role ~= "farm") then
+    if AutoPlace.upgrade and (dpsPlaced or 0) > 0 and (not t or (role ~= "farm" and role ~= "support")) then
         -- once one damage unit and every farm are down, farm upgrades pay for themselves
         -- quickly (speedwagon 200 -> 500 per wave), so they come before spreading more units
         local wait = upgradeStep(money, "farm")
