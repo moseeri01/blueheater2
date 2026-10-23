@@ -3497,6 +3497,9 @@ end
 -- The event hotbar: slot -> unit id (the model shown in PlayerGui.spawn_units...Units.<slot>)
 -- and price; the uuid is the game's table for a unit made this session (_creation_time) with
 -- that unit_id and no equipped_slot (the real collection was made long ago).
+-- The bar shows a unit's model by its base name ("fujitora" for fujitora_evolved, ":shiny"
+-- for skins): unit ids are compared on that base.
+function AutoPlaceModule.BaseId(id) return (tostring(id):gsub(":.*$", ""):gsub("_evolved$", "")) end
 function AutoPlaceModule.HotbarTeam()
     local team, pool, used = {}, {}, {}
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -3515,14 +3518,14 @@ function AutoPlaceModule.HotbarTeam()
             -- (a slot whose copy was placed may keep showing that unit: skipped until the game
             -- announces a newer copy of it)
             local used = AutoPlaceModule.usedSlot[s]
-            local stale = used and used.id == (model.Name:gsub(":.*$", ""))
+            local stale = used and AutoPlaceModule.BaseId(used.id) == AutoPlaceModule.BaseId(model.Name)
             if stale then
                 for _, info in pairs(AutoPlaceModule.liveTemp) do
-                    if info.id == used.id and (info.seen or 0) > used.at then stale = false end
+                    if AutoPlaceModule.BaseId(info.id) == AutoPlaceModule.BaseId(used.id) and (info.seen or 0) > used.at then stale = false end
                 end
             end
             if not stale then
-                slots[s] = { id = (model.Name:gsub(":.*$", "")), model = model,
+                slots[s] = { id = AutoPlaceModule.BaseId(model.Name), model = model,
                     price = priceLabel and tonumber((tostring(priceLabel.Text):gsub("[^%d]", ""))) }
                 sig[#sig + 1] = s .. "=" .. slots[s].id
             end
@@ -3565,20 +3568,22 @@ function AutoPlaceModule.HotbarTeam()
     table.sort(found, function(a, b) return a.made > b.made end)
     for _, f in ipairs(found) do
         if not AutoPlaceModule.goneTemp[f.uuid] and not AutoPlaceModule.badTemp[f.uuid] then
-            pool[f.id] = pool[f.id] or {}
+            local key = AutoPlaceModule.BaseId(f.id)
+            pool[key] = pool[key] or {}
             local dup = false
-            for _, u in ipairs(pool[f.id]) do if u == f.uuid then dup = true end end
-            if not dup then table.insert(pool[f.id], f.uuid) end
+            for _, u in ipairs(pool[key]) do if u.uuid == f.uuid then dup = true end end
+            if not dup then table.insert(pool[key], { uuid = f.uuid, id = f.id }) end
         end
     end
     local complete = true
     for s = 1, 6 do
         local sl = slots[s]
         if sl then
-            for _, uuid in ipairs(pool[sl.id] or {}) do
+            for _, entry in ipairs(pool[sl.id] or {}) do
+                local uuid = entry.uuid
                 if not used[uuid] then
                     used[uuid] = true
-                    team[s] = { uuid = uuid, name = sl.id, cost = sl.price, temp = true, traits = {}, rolls = {}, model = sl.model, slot = s }
+                    team[s] = { uuid = uuid, name = entry.id, cost = sl.price, temp = true, traits = {}, rolls = {}, model = sl.model, slot = s }
                     break
                 end
             end
