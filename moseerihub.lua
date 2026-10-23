@@ -67,6 +67,8 @@ local AutoFarm = {
     autoReplay = false,
     autoNextStage = false,
     autoLeave = false,
+    autoStart = false, -- vote to start the match as soon as the stage loads
+    autoSkip = false,  -- vote to skip waves
     leaveAtWave = 0,
     speedMultiplier = 1,
     autoSell = false,
@@ -205,6 +207,8 @@ local function buildConfigData()
             autoReplay = AutoFarm.autoReplay,
             autoNextStage = AutoFarm.autoNextStage,
             autoLeave = AutoFarm.autoLeave,
+            autoStart = AutoFarm.autoStart,
+            autoSkip = AutoFarm.autoSkip,
             leaveAtWave = AutoFarm.leaveAtWave,
             speedMultiplier = AutoFarm.speedMultiplier,
             autoSell = AutoFarm.autoSell,
@@ -255,6 +259,8 @@ local function applyConfigData(data)
     AutoFarm.autoReplay = pick(a.autoReplay, "boolean", AutoFarm.autoReplay)
     AutoFarm.autoNextStage = pick(a.autoNextStage, "boolean", AutoFarm.autoNextStage)
     AutoFarm.autoLeave = pick(a.autoLeave, "boolean", AutoFarm.autoLeave)
+    AutoFarm.autoStart = pick(a.autoStart, "boolean", AutoFarm.autoStart)
+    AutoFarm.autoSkip = pick(a.autoSkip, "boolean", AutoFarm.autoSkip)
     AutoFarm.leaveAtWave = pick(a.leaveAtWave, "number", AutoFarm.leaveAtWave)
     AutoFarm.speedMultiplier = pick(a.speedMultiplier, "number", AutoFarm.speedMultiplier)
     AutoFarm.autoSell = pick(a.autoSell, "boolean", AutoFarm.autoSell)
@@ -1840,6 +1846,8 @@ local function refreshAutoStatus()
     if AutoFarm.autoReplay then table.insert(parts, "Replay: ON") end
     if AutoFarm.autoNextStage then table.insert(parts, "Next stage: ON") end
     if AutoFarm.autoLeave then table.insert(parts, "Leave when you lose: ON") end
+    if AutoFarm.autoStart then table.insert(parts, "Vote start: ON" .. (AutoFarm.lastStart and (" (" .. AutoFarm.lastStart .. ")") or "")) end
+    if AutoFarm.autoSkip then table.insert(parts, "Skip waves: ON" .. (AutoFarm.lastSkip and (" (" .. AutoFarm.lastSkip .. ")") or "")) end
     if AutoFarm.leaveAtWave > 0 then table.insert(parts, "Leave at wave " .. AutoFarm.leaveAtWave) end
     if AutoFarm.autoSell and AutoFarm.sellAtWave > 0 then table.insert(parts, "Sell at wave " .. AutoFarm.sellAtWave) end
     if AutoFarm.speedMultiplier ~= 1 then table.insert(parts, string.format("Speed: %.1fx", AutoFarm.speedMultiplier)) end
@@ -1927,6 +1935,82 @@ task.spawn(function()
         end
     end
 end)
+
+-- Vote start / skip wave: the game's own remote when it has one (names used by AA), else
+-- the button on screen. Each try is shown in the status so a wrong guess is visible.
+Words.START_REMOTES = { "vote_start", "start_game", "vote_start_game", "ready_up" }
+Words.SKIP_REMOTES = { "vote_wave_skip", "skip_wave", "vote_skip_wave", "vote_skip" }
+do
+local function inLobby()
+    local cfg = workspace:FindFirstChild("_MAP_CONFIG")
+    local lobby = cfg and cfg:FindFirstChild("IsLobby")
+    return (lobby and lobby.Value == true) or not cfg
+end
+
+local function fireFirst(names, ...)
+    local args = table.pack(...)
+    for _, name in ipairs(names) do
+        local r = getAARemote(name)
+        if r then
+            task.spawn(function()
+                pcall(function()
+                    if r:IsA("RemoteFunction") then r:InvokeServer(table.unpack(args, 1, args.n))
+                    else r:FireServer(table.unpack(args, 1, args.n)) end
+                end)
+            end)
+            return name
+        end
+    end
+    return nil
+end
+
+-- A visible button whose own label contains one of the words (never ours, never "restart").
+local function labelButton(words)
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return nil end
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("GuiButton") and isOnScreen(d) and not isOwnGui(d) then
+            local text = buttonText(d)
+            if not text:find("restart", 1, true) then
+                for _, w in ipairs(words) do
+                    if text:find(w, 1, true) then return d end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function gameStarted()
+    local data = workspace:FindFirstChild("_DATA")
+    local started = data and data:FindFirstChild("GameStarted")
+    return started and started.Value == true
+end
+
+task.spawn(function()
+    local nextStart, nextSkip = 0, 0
+    while not State.unloaded do
+        task.wait(0.5)
+        local now = os.clock()
+        if (AutoFarm.autoStart or AutoFarm.autoSkip) and not inLobby() and not isResultsShowing() then
+            if AutoFarm.autoStart and not gameStarted() and now >= nextStart then
+                nextStart = now + 2
+                local via = fireFirst(Words.START_REMOTES)
+                local btn = labelButton({ "vote start", "start game", "vote to start", "start" })
+                if btn then clickButton(btn) end
+                AutoFarm.lastStart = via or (btn and "button") or "nothing found"
+            end
+            if AutoFarm.autoSkip and gameStarted() and now >= nextSkip then
+                nextSkip = now + 3
+                local via = fireFirst(Words.SKIP_REMOTES, true)
+                local btn = labelButton({ "skip wave", "skip" })
+                if btn then clickButton(btn) end
+                AutoFarm.lastSkip = via or (btn and "button") or "nothing found"
+            end
+        end
+    end
+end)
+end
 
 function AutoFarmModule.CheckWaveLeave()
     if AutoFarm.leaveAtWave <= 0 then return end
@@ -3270,6 +3354,33 @@ function AutoPlaceModule.MapReport()
     for s = 1, 6 do if hudPrices[s] then table.insert(priceText, s .. "=" .. hudPrices[s]) end end
     table.insert(lines, string.format("screen: money %s, hotbar prices %s", tostring(hudMoney), table.concat(priceText, " ")))
 
+    -- Remotes and on-screen buttons for starting / skipping / voting (for Auto vote start / skip).
+    local cts = ReplicatedStorage:FindFirstChild("endpoints")
+    cts = cts and cts:FindFirstChild("client_to_server")
+    local voteRemotes = {}
+    for _, r in ipairs(cts and cts:GetChildren() or {}) do
+        local n = string.lower(r.Name)
+        for _, w in ipairs({ "vote", "start", "skip", "wave", "ready", "speed" }) do
+            if n:find(w, 1, true) then table.insert(voteRemotes, r.Name .. "(" .. r.ClassName .. ")") break end
+        end
+    end
+    table.insert(lines, "vote/start/skip remotes: " .. (#voteRemotes > 0 and table.concat(voteRemotes, ", ") or "none"))
+    local pg = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local shown = {}
+    for _, d in ipairs(pg and pg:GetDescendants() or {}) do
+        if #shown >= 40 then break end
+        if d:IsA("GuiButton") and isOnScreen(d) and not isOwnGui(d) then
+            local label = d:IsA("TextButton") and d.Text or ""
+            if label == "" then
+                for _, c in ipairs(d:GetDescendants()) do
+                    if c:IsA("TextLabel") and #c.Text > 0 then label = c.Text break end
+                end
+            end
+            table.insert(shown, d.Name .. (label ~= "" and ("=" .. clip(label, 18)) or ""))
+        end
+    end
+    table.insert(lines, "buttons on screen: " .. table.concat(shown, ", "))
+
     -- The game's own unit definitions: price, limit, farm, hill/ground, buff numbers.
     local src = ReplicatedStorage:FindFirstChild("src")
     local data = src and src:FindFirstChild("Data")
@@ -3706,6 +3817,16 @@ UIRef.autoLeaveToggle = autoReplaySection:Toggle({
     Default = AutoFarm.autoLeave,
     Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoLeave")
+Controls.autoStart = autoReplaySection:Toggle({
+    Name = "Auto vote start",
+    Default = AutoFarm.autoStart,
+    Callback = function(on) AutoFarm.autoStart = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoStart")
+Controls.autoSkip = autoReplaySection:Toggle({
+    Name = "Auto skip waves",
+    Default = AutoFarm.autoSkip,
+    Callback = function(on) AutoFarm.autoSkip = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoSkip")
 
 autoExtraSection:Header({ Text = "Wave controls" })
 Controls.leaveAtWave = autoExtraSection:Slider({
@@ -4146,6 +4267,7 @@ local function shutdown()
     if recordUnitConnection then recordUnitConnection:Disconnect() end
     if replayUnitConnection then replayUnitConnection:Disconnect() end
     AutoFarm.autoReplay, AutoFarm.autoNextStage, AutoFarm.autoLeave = false, false, false
+    AutoFarm.autoStart, AutoFarm.autoSkip = false, false
 end
 Window.onUnloaded(shutdown)
 
@@ -4183,6 +4305,8 @@ applyRuntimeFeatures = function()
     setControl(UIRef.autoReplayToggle, AutoFarm.autoReplay)
     setControl(UIRef.autoNextToggle, AutoFarm.autoNextStage)
     setControl(UIRef.autoLeaveToggle, AutoFarm.autoLeave)
+    setControl(Controls.autoStart, AutoFarm.autoStart)
+    setControl(Controls.autoSkip, AutoFarm.autoSkip)
     setControl(UIRef.autoSellToggle, AutoFarm.autoSell)
     setControl(Controls.leaveAtWave, AutoFarm.leaveAtWave)
     setControl(Controls.sellAtWave, AutoFarm.sellAtWave)
