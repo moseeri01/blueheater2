@@ -98,6 +98,7 @@ local AutoPlace = {
     caps = {},                    -- [unit name] = how many the game lets you place, learned once
     roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
     unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
+    stageLosses = {},             -- [stage] = recent losses there (each win takes one off): play safer
     placeMode = "Balanced",       -- damage units: "Safe" near our base, "Fast clear" near the enemy spawn
     lastTeam = {},                -- [slot] = { uuid, name } last read from game data (used when it is not readable)
     smartFreeze = true,           -- freeze skills (Shadowgirl timestop) only at the best moment
@@ -233,6 +234,7 @@ local function buildConfigData()
             caps = next(AutoPlace.caps) and AutoPlace.caps or nil,
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
             unitInfo = next(AutoPlace.unitInfo or {}) and AutoPlace.unitInfo or nil,
+            stageLosses = next(AutoPlace.stageLosses or {}) and AutoPlace.stageLosses or nil,
             placeMode = AutoPlace.placeMode,
             lastTeam = next(AutoPlace.lastTeam or {}) and AutoPlace.lastTeam or nil,
             smartFreeze = AutoPlace.smartFreeze,
@@ -291,6 +293,12 @@ local function applyConfigData(data)
     end
     AutoPlace.moneyPath = pick(ap.moneyPath, "string", AutoPlace.moneyPath)
     if type(ap.unitInfo) == "table" then AutoPlace.unitInfo = ap.unitInfo end
+    if type(ap.stageLosses) == "table" then
+        AutoPlace.stageLosses = {}
+        for k, v in pairs(ap.stageLosses) do
+            if type(k) == "string" and tonumber(v) then AutoPlace.stageLosses[k] = math.max(0, math.floor(tonumber(v))) end
+        end
+    end
     AutoPlace.placeMode = pick(ap.placeMode, "string", AutoPlace.placeMode)
     AutoPlace.smartFreeze = pick(ap.smartFreeze, "boolean", AutoPlace.smartFreeze)
     AutoPlace.sellFarmsLast = pick(ap.sellFarmsLast, "boolean", AutoPlace.sellFarmsLast)
@@ -2646,6 +2654,30 @@ local unknownTries = 0
 
 local function stageKey() return State.stage or "unknown" end
 
+-- Losses remembered for this stage (see AutoPlace.stageLosses).
+function AutoPlaceModule.Losses()
+    return (AutoPlace.stageLosses or {})[stageKey()] or 0
+end
+
+-- Placement mode in use: the chosen one, but Balanced turns Safe on a stage lost before.
+function AutoPlaceModule.Mode()
+    if AutoPlace.placeMode == "Balanced" and AutoPlaceModule.Losses() > 0 then return "Safe" end
+    return AutoPlace.placeMode
+end
+
+-- Called once per finished game.
+function AutoPlaceModule.OnResult(win)
+    AutoPlace.stageLosses = AutoPlace.stageLosses or {}
+    local key, n = stageKey(), AutoPlaceModule.Losses()
+    if win then
+        AutoPlace.stageLosses[key] = n > 1 and n - 1 or nil
+    else
+        AutoPlace.stageLosses[key] = n + 1
+        AutoPlaceModule.Note(string.format("lost on %s: next runs here play safer", key))
+    end
+    saveConfig()
+end
+
 local function pathPoints()
     local key = stageKey()
     AutoPlace.paths[key] = AutoPlace.paths[key] or {}
@@ -3003,7 +3035,7 @@ local function bestSpot(skip, role, range, kind, aoe)
         local r2 = r * r
         -- Fast clear: prefer spots near the enemy spawn (kills early, waves end sooner);
         -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
-        local mode = AutoPlace.placeMode
+        local mode = AutoPlaceModule.Mode()
         local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
         local scored = {}
         for _, c in ipairs(free) do
@@ -3780,7 +3812,9 @@ local function tick()
         if wait then return wait end
         slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, false)
     end
+    -- (lost twice here: no farm upgrades until every damage unit is down)
     if not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and strongestDown
+        and (AutoPlaceModule.Losses() < 2 or (t == nil or role ~= "dps"))
         and (not t or (role ~= "farm" and role ~= "support")) then
         -- once the strongest damage unit and every farm are down, farm upgrades pay for
         -- themselves quickly (speedwagon 200 -> 500 per wave), so they come before spreading
@@ -4040,6 +4074,9 @@ function AutoPlaceModule.StatusText()
         table.insert(lines, "Strongest (traits + rolls): " .. table.concat(parts, ", "))
     end
     table.insert(lines, string.format("Path: %d points for %s", #pathPoints(), stageKey()))
+    if AutoPlaceModule.Losses() > 0 then
+        table.insert(lines, string.format("Lost here %d time(s) lately: playing safer (%s placement)", AutoPlaceModule.Losses(), AutoPlaceModule.Mode()))
+    end
     if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
     if #AutoPlaceModule.log > 0 then
         table.insert(lines, "Last actions:")
@@ -4758,6 +4795,7 @@ task.spawn(function()
         if results and not wasResults and startSnap then
             local win = resultIsVictory()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
+            pcall(AutoPlaceModule.OnResult, win)
             if (win and Webhook.notifyComplete) or (not win and Webhook.notifyFail) then
                 task.wait(1.5) -- let the game add the rewards first
                 Webhook.SendReport(win and "win" or "loss")
