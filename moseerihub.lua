@@ -4260,7 +4260,12 @@ local function upgradeStep(money, onlyRole, airOnly)
         return 0.2
     end
     AutoPlaceModule.status = string.format("Upgrading %s (level %d)", unitType(pick), pickLevel)
-    pcall(function() remote:InvokeServer(pick) end)
+    AutoPlaceModule.tickStep = "upgrade"
+    -- (an answer that never comes must not stop Auto Place: given up after 4 s)
+    local answered = false
+    task.spawn(function() pcall(function() remote:InvokeServer(pick) end) answered = true end)
+    local giveUp = os.clock() + 4
+    while not answered and os.clock() < giveUp do task.wait(0.1) end
     local lvl = pick:FindFirstChild("_stats") and pick._stats:FindFirstChild("upgrade")
     for _ = 1, 6 do -- the new level can replicate a moment after the reply
         if not lvl or (tonumber(lvl.Value) or 0) > pickLevel then break end
@@ -4595,6 +4600,8 @@ end
 
 local function tick()
     AutoPlaceModule.idleMoney = nil
+    -- (where the last tick got to, for the live status: a step that never returns shows here)
+    AutoPlaceModule.tickAt, AutoPlaceModule.tickStep = os.clock(), "start"
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
     if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
     local grew = samplePath()
@@ -4629,7 +4636,9 @@ local function tick()
     -- money: the learned value, else AA's in-game yen (_stats.resource), else the screen
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
         or readCostValue("LP._stats.resource") or hudMoney
+    AutoPlaceModule.tickStep = "spells"
     pcall(Lobby.SpellStep, money)
+    AutoPlaceModule.tickStep = "choose"
     if AutoPlace.sellFarmsLast and AutoPlaceModule.LastWave() and AutoPlaceModule.SellFarm() then return 0.3 end
     local danger = AutoPlaceModule.Danger()
     if danger and not AutoPlaceModule.danger then AutoPlaceModule.Note("base took damage: damage units first for 20 s") end
@@ -4755,6 +4764,7 @@ local function tick()
         return 0.2
     end
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
+    AutoPlaceModule.tickStep = "place"
     if tryPlace(t, spot) then
         -- (event: the copy is used up - the placed unit may carry another uuid, so it is not
         -- counted from the map; the bar is read again on the next tick)
@@ -7719,8 +7729,8 @@ function Lobby.Loop()
                     if t then table.insert(slots, s .. "=" .. t.name .. ":" .. tostring(t.uuid):sub(2, 5)) end
                 end
                 for _ in pairs(AutoPlaceModule.liveTemp) do live = live + 1 end
-                table.insert(Lobby.live, string.format("%s money %s base %s/%s units %d try %s candy %s live %d team %s | %s", os.date("%H:%M:%S"),
-                    tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), #ownedUnits(), tostring(AutoPlaceModule.lastTry),
+                table.insert(Lobby.live, string.format("%s tick %ss@%s money %s base %s/%s units %d try %s candy %s live %d team %s | %s", os.date("%H:%M:%S"),
+                    tostring(AutoPlaceModule.tickAt and math.floor(os.clock() - AutoPlaceModule.tickAt)), tostring(AutoPlaceModule.tickStep), tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), #ownedUnits(), tostring(AutoPlaceModule.lastTry),
                     tostring(Lobby.candy), live, table.concat(slots, ","), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
                 if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
