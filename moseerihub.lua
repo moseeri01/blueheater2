@@ -1547,10 +1547,8 @@ function PlaybackModule.Play(fromGameStart)
             Tools.totalReplays = Tools.totalReplays + 1
             if failed > 0 then
                 Tools.totalFails = Tools.totalFails + 1
-                if Webhook.notifyFail then sendWebhook("Macro Failed", string.format("%s: %d action(s) failed.", cleanName(State.macroName) or "macro", failed)) end
                 notify(string.format("Finished, %d action(s) failed.", failed))
             else
-                if Webhook.notifyComplete then sendWebhook("Macro Complete", string.format("%s finished (%d actions).", cleanName(State.macroName) or "macro", #State.actions)) end
                 notify("Finished.")
             end
         else
@@ -3581,6 +3579,243 @@ end
 end
 
 --------------------------------------------------------------------------------
+-- MODULE: Game report webhook (after every game: result, rewards, player, bag, team)
+--------------------------------------------------------------------------------
+do
+local function httpPost(url, body)
+    local req = (syn and syn.request) or (http and http.request) or request or http_request
+    if type(req) ~= "function" then return false end
+    return pcall(req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+end
+
+local function commas(n)
+    local s = tostring(math.floor((tonumber(n) or 0) + 0.5))
+    local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (out:gsub("^,", ""):gsub("^%-,", "-"))
+end
+
+local function prettyName(id)
+    return (tostring(id):gsub("_", " "):gsub("(%a)([%w]*)", function(a, b) return a:upper() .. b end))
+end
+
+-- AA keeps the bag in ItemInventoryServiceClient.session.inventory.inventory_profile_data;
+-- if the loader cannot be required here, find that table in memory instead.
+local function inventoryData()
+    local data
+    pcall(function()
+        local loader = require(ReplicatedStorage.src.Loader)
+        local svc = loader.load_client_service(script, "ItemInventoryServiceClient")
+        data = svc.session.inventory.inventory_profile_data
+    end)
+    if type(data) ~= "table" and type(getgc) == "function" then
+        pcall(function()
+            for _, v in ipairs(getgc(true)) do
+                if type(v) == "table" and type(rawget(v, "normal_items")) == "table" then data = v break end
+            end
+        end)
+    end
+    return type(data) == "table" and data or nil
+end
+
+-- { [item id] = count } from normal + unique items, whatever shape the game uses.
+local function itemCounts(data)
+    local counts, total = {}, 0
+    local function add(id, n)
+        id = tostring(id)
+        counts[id] = (counts[id] or 0) + n
+        total = total + n
+    end
+    for _, key in ipairs({ "normal_items", "unique_items" }) do
+        local list = data and data[key]
+        if type(list) == "table" then
+            for k, v in pairs(list) do
+                if type(v) == "number" then add(k, v)
+                elseif type(v) == "table" then
+                    add(v.item_id or v.id or v.name or k, tonumber(v.amount or v.count or v.quantity) or 1)
+                end
+            end
+        end
+    end
+    return counts, total
+end
+
+-- Bag size: a number field named like max/capacity/limit/slots on the inventory data.
+local function bagCapacity(data)
+    if not data then return nil end
+    for k, v in pairs(data) do
+        local key = string.lower(tostring(k))
+        if type(v) == "number" and v > 0 and (key:find("max", 1, true) or key:find("capacity", 1, true)
+            or key:find("limit", 1, true) or key:find("slot", 1, true)) then
+            return v, tostring(k)
+        end
+    end
+    return nil
+end
+
+local function playerSnapshot()
+    local snap = { at = os.clock() }
+    local stats = Players.LocalPlayer:FindFirstChild("_stats")
+    local function num(name)
+        local v = stats and stats:FindFirstChild(name)
+        return v and tonumber(v.Value) or nil
+    end
+    snap.gold, snap.gems = num("gold_amount"), num("gem_amount")
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if d:IsA("TextLabel") then
+            local lvl, cur, max = tostring(d.Text):match("^%s*[Ll]evel%s+(%d+)%s*%[(%d+)%s*/%s*(%d+)%]")
+            if lvl then
+                snap.level, snap.xp, snap.xpMax = tonumber(lvl), tonumber(cur), tonumber(max)
+                break
+            end
+        end
+    end
+    local inv = inventoryData()
+    snap.items, snap.itemTotal = itemCounts(inv)
+    snap.bagMax = bagCapacity(inv)
+    snap.hasInventory = inv ~= nil
+    return snap
+end
+
+-- "+20", "+55 XP" ... shown on the result screen.
+local function resultScreenGains()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local seen, out = {}, {}
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
+            local t = tostring(d.Text)
+            if t:match("^%s*%+%s*[%d,]+") and not seen[t] then
+                seen[t] = true
+                table.insert(out, t)
+            end
+        end
+    end
+    return out
+end
+
+local session = { started = os.clock(), wins = 0, losses = 0 }
+local startSnap
+
+local function bar(fraction)
+    local n = math.max(0, math.min(10, math.floor(fraction * 10 + 0.5)))
+    return string.rep("█", n) .. string.rep("░", 10 - n)
+end
+
+function Webhook.BuildReport(kind)
+    local now = playerSnapshot()
+    local before = startSnap or now
+    local win = kind == "win"
+    local title = (kind == "test" and "Test report") or (win and "Victory") or "Defeat"
+    title = title .. " · " .. (State.stage or "unknown stage")
+    local runTime = startSnap and (now.at - startSnap.at) or 0
+
+    local rewards = {}
+    local function delta(label, a, b)
+        if a and b and b ~= a then table.insert(rewards, string.format("`%s%s` %s", b > a and "+" or "", commas(b - a), label)) end
+    end
+    delta("Gems", before.gems, now.gems)
+    delta("Gold", before.gold, now.gold)
+    if before.level and now.level and now.level > before.level then
+        table.insert(rewards, string.format("`+%d` Level (now %d)", now.level - before.level, now.level))
+    else
+        delta("XP", before.xp, now.xp)
+    end
+    local gotItems = {}
+    for id, n in pairs(now.items or {}) do
+        local was = (before.items or {})[id] or 0
+        if n > was then table.insert(gotItems, { id = id, n = n - was }) end
+    end
+    table.sort(gotItems, function(a, b) return a.n > b.n end)
+    for i, it in ipairs(gotItems) do
+        if i > 12 then table.insert(rewards, string.format("... and %d more", #gotItems - 12)) break end
+        table.insert(rewards, string.format("`+%d` %s", it.n, prettyName(it.id)))
+    end
+    if #rewards == 0 then
+        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "`" .. g .. "`") end
+    end
+    if #rewards == 0 then table.insert(rewards, "nothing new") end
+
+    local player = {}
+    if now.level then table.insert(player, string.format("Level **%d**%s", now.level,
+        now.xp and string.format("  (%s / %s XP)", commas(now.xp), commas(now.xpMax)) or "")) end
+    if now.gems then table.insert(player, "Gems **" .. commas(now.gems) .. "**") end
+    if now.gold then table.insert(player, "Gold **" .. commas(now.gold) .. "**") end
+    if #player == 0 then table.insert(player, "not readable") end
+
+    local bag = {}
+    if not now.hasInventory then
+        table.insert(bag, "not readable")
+    elseif now.bagMax then
+        local f = now.itemTotal / now.bagMax
+        table.insert(bag, string.format("**%s** / %s items", commas(now.itemTotal), commas(now.bagMax)))
+        table.insert(bag, "`" .. bar(f) .. "` " .. math.floor(f * 100 + 0.5) .. "%")
+        if f >= 1 then table.insert(bag, "**FULL - new drops are lost**")
+        elseif f >= 0.9 then table.insert(bag, "**Almost full**") end
+    else
+        table.insert(bag, string.format("**%s** items", commas(now.itemTotal)))
+    end
+
+    local team = {}
+    if not next(AutoPlaceModule.team) then pcall(AutoPlaceModule.RefreshTeam) end
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s]
+        if t then
+            local role = AutoPlaceModule.RoleOf(t)
+            local st = AutoPlaceModule.Stats(t)
+            local extra = (role == "dps" or role == nil) and string.format(" · %s dmg", commas(st.damage)) or ""
+            table.insert(team, string.format("`%d` %s%s%s", s, prettyName(t.name), role and (" · " .. role) or "", extra))
+        end
+    end
+
+    local elapsed = os.clock() - session.started
+    local embed = {
+        title = title,
+        color = kind == "test" and 3447003 or (win and 3066993 or 15158332),
+        description = string.format("**Time** %s   ·   **Wave** %d", formatDuration(runTime), getCurrentWave()),
+        fields = {
+            { name = "Rewards", value = table.concat(rewards, "\n"), inline = false },
+            { name = "Player", value = table.concat(player, "\n"), inline = true },
+            { name = "Bag", value = table.concat(bag, "\n"), inline = true },
+        },
+        footer = { text = string.format("MACRO // LAB  ·  session %s  ·  %d wins / %d losses",
+            formatDuration(elapsed), session.wins, session.losses) },
+    }
+    if #team > 0 then table.insert(embed.fields, { name = "Team", value = table.concat(team, "\n"), inline = false }) end
+    return { username = "MACRO // LAB", embeds = { embed } }
+end
+
+function Webhook.SendReport(kind)
+    if #Webhook.url < 10 then return false end
+    local ok, payload = pcall(Webhook.BuildReport, kind)
+    if not ok then return false end
+    return httpPost(Webhook.url, HttpService:JSONEncode(payload))
+end
+
+-- Snapshot when a game starts, report when its result screen shows (once per game).
+task.spawn(function()
+    local wasStarted, wasResults = false, false
+    while not State.unloaded do
+        task.wait(1)
+        local data = workspace:FindFirstChild("_DATA")
+        local started = data and data:FindFirstChild("GameStarted")
+        local isStarted = started and started.Value == true
+        if isStarted and not wasStarted then startSnap = playerSnapshot() end
+        wasStarted = isStarted
+        local results = isResultsShowing()
+        if results and not wasResults and startSnap then
+            local win = resultIsVictory()
+            if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
+            if (win and Webhook.notifyComplete) or (not win and Webhook.notifyFail) then
+                task.wait(1.5) -- let the game add the rewards first
+                Webhook.SendReport(win and "win" or "loss")
+            end
+        end
+        wasResults = results
+    end
+end)
+end
+
+--------------------------------------------------------------------------------
 -- MODULE: Dungeon Bot
 --------------------------------------------------------------------------------
 local DungeonBotModule = {}
@@ -4247,18 +4482,21 @@ Controls.webhookUrl = webhookSection:Input({
     Callback = function(text) Webhook.url = text or ""; saveConfig() end,
 }, "WebhookUrl")
 Controls.notifyComplete = webhookSection:Toggle({
-    Name = "Notify on complete",
+    Name = "Send report when you win",
     Default = Webhook.notifyComplete,
     Callback = function(on) Webhook.notifyComplete = on; saveConfig() end,
 }, "WebhookComplete")
 Controls.notifyFail = webhookSection:Toggle({
-    Name = "Notify on fail",
+    Name = "Send report when you lose",
     Default = Webhook.notifyFail,
     Callback = function(on) Webhook.notifyFail = on; saveConfig() end,
 }, "WebhookFail")
 webhookSection:Button({
-    Name = "Test webhook",
-    Callback = function() sendWebhook("Test", "Webhook is working.") ; notify("Test sent.") end,
+    Name = "Send test report",
+    Callback = function()
+        if Webhook.SendReport("test") then notify("Test report sent to Discord.")
+        else notify("Could not send: check the webhook URL (and that this executor has request).") end
+    end,
 })
 
 toolsSection:Header({ Text = "Session stats" })
