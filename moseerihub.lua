@@ -3780,18 +3780,26 @@ local function playerSnapshot()
         return v and tonumber(v.Value) or nil
     end
     snap.gold, snap.gems = num("gold_amount"), num("gem_amount")
+    -- "Level 206 [755/1535]": other players' cards and max-level previews also say
+    -- "Level 999 [999999/999999]", so only visible labels count and the lowest one on
+    -- screen (our own XP bar) wins
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local bestY = -math.huge
     for _, d in ipairs(gui and gui:GetDescendants() or {}) do
-        if d:IsA("TextLabel") then
-            local lvl, cur, max = tostring(d.Text):match("^%s*[Ll]evel%s+(%d+)%s*%[(%d+)%s*/%s*(%d+)%]")
-            if lvl then
-                snap.level, snap.xp, snap.xpMax = tonumber(lvl), tonumber(cur), tonumber(max)
-                break
+        if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
+            local plain = tostring(d.Text):gsub("<[^>]->", ""):gsub(",", "")
+            local lvl, cur, max = plain:match("^%s*[Ll]evel%s+(%d+)%s*%[(%d+)%s*/%s*(%d+)%]")
+            lvl, cur, max = tonumber(lvl), tonumber(cur), tonumber(max)
+            if lvl and cur and max and cur < max and d.AbsolutePosition.Y > bestY then
+                bestY = d.AbsolutePosition.Y
+                snap.level, snap.xp, snap.xpMax = lvl, cur, max
             end
         end
     end
     local inv = inventoryData()
     snap.items, snap.itemTotal = itemCounts(inv)
+    snap.kinds = 0
+    for _ in pairs(snap.items) do snap.kinds = snap.kinds + 1 end
     snap.bagMax = bagCapacity(inv)
     snap.hasInventory = inv ~= nil
     return snap
@@ -3814,29 +3822,47 @@ local function resultScreenGains()
 end
 
 local session = { started = os.clock(), wins = 0, losses = 0 }
-local startSnap
+local startSnap, firstSnap
+local gameWave = 0 -- highest wave seen this game (the counter is reset when the result shows)
 
 local function bar(fraction)
     local n = math.max(0, math.min(10, math.floor(fraction * 10 + 0.5)))
-    return string.rep("█", n) .. string.rep("░", 10 - n)
+    return string.rep("▰", n) .. string.rep("▱", 10 - n)
 end
+
+local function clock(seconds)
+    seconds = math.max(0, math.floor(seconds or 0))
+    local h, m, s = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
+    if h > 0 then return string.format("%d:%02d:%02d", h, m, s) end
+    return string.format("%02d:%02d", m, s)
+end
+
+local function waveNow()
+    local w = getCurrentWave()
+    local alt = workspace:FindFirstChild("_wave_num")
+    if alt and tonumber(alt.Value) then w = math.max(w, tonumber(alt.Value)) end
+    return w
+end
+
+local ICON = { Gems = "💎", Gold = "🪙", XP = "⭐" }
 
 function Webhook.BuildReport(kind)
     local now = playerSnapshot()
     local before = startSnap or now
     local win = kind == "win"
-    local title = (kind == "test" and "Test report") or (win and "Victory") or "Defeat"
-    title = title .. " · " .. (State.stage or "unknown stage")
+    local head = (kind == "test" and "🧪  TEST REPORT") or (win and "🏆  VICTORY") or "💀  DEFEAT"
     local runTime = startSnap and (now.at - startSnap.at) or 0
 
     local rewards = {}
     local function delta(label, a, b)
-        if a and b and b ~= a then table.insert(rewards, string.format("`%s%s` %s", b > a and "+" or "", commas(b - a), label)) end
+        if a and b and b ~= a then
+            table.insert(rewards, string.format("%s `%s%s` %s", ICON[label] or "▫️", b > a and "+" or "", commas(b - a), label))
+        end
     end
     delta("Gems", before.gems, now.gems)
     delta("Gold", before.gold, now.gold)
     if before.level and now.level and now.level > before.level then
-        table.insert(rewards, string.format("`+%d` Level (now %d)", now.level - before.level, now.level))
+        table.insert(rewards, string.format("🆙 `+%d` Level", now.level - before.level))
     else
         delta("XP", before.xp, now.xp)
     end
@@ -3847,61 +3873,71 @@ function Webhook.BuildReport(kind)
     end
     table.sort(gotItems, function(a, b) return a.n > b.n end)
     for i, it in ipairs(gotItems) do
-        if i > 12 then table.insert(rewards, string.format("... and %d more", #gotItems - 12)) break end
-        table.insert(rewards, string.format("`+%d` %s", it.n, prettyName(it.id)))
+        if i > 10 then table.insert(rewards, string.format("▫️ ... and %d more", #gotItems - 10)) break end
+        table.insert(rewards, string.format("📦 `+%d` %s", it.n, prettyName(it.id)))
     end
     if #rewards == 0 then
-        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "`" .. g .. "`") end
+        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "▫️ `" .. g .. "`") end
     end
-    if #rewards == 0 then table.insert(rewards, "nothing new") end
+    if #rewards == 0 then table.insert(rewards, "*nothing new*") end
 
     local player = {}
-    if now.level then table.insert(player, string.format("Level **%d**%s", now.level,
-        now.xp and string.format("  (%s / %s XP)", commas(now.xp), commas(now.xpMax)) or "")) end
-    if now.gems then table.insert(player, "Gems **" .. commas(now.gems) .. "**") end
-    if now.gold then table.insert(player, "Gold **" .. commas(now.gold) .. "**") end
-    if #player == 0 then table.insert(player, "not readable") end
+    if now.level then
+        table.insert(player, string.format("Lv **%d**", now.level))
+        if now.xp and now.xpMax and now.xpMax > 0 then
+            local f = now.xp / now.xpMax
+            table.insert(player, string.format("`%s` %d%%", bar(f), math.floor(f * 100)))
+        end
+    end
+    if now.gems then table.insert(player, "💎 **" .. commas(now.gems) .. "**") end
+    if now.gold then table.insert(player, "🪙 **" .. commas(now.gold) .. "**") end
+    if #player == 0 then table.insert(player, "*not readable*") end
 
+    -- The bag size is compared with the number of different items first (a bag of 100
+    -- slots holds stacks), then with the total count; if neither fits, no size is shown.
     local bag = {}
     if not now.hasInventory then
-        table.insert(bag, "not readable")
-    elseif now.bagMax then
-        local f = now.itemTotal / now.bagMax
-        table.insert(bag, string.format("**%s** / %s items", commas(now.itemTotal), commas(now.bagMax)))
-        table.insert(bag, "`" .. bar(f) .. "` " .. math.floor(f * 100 + 0.5) .. "%")
-        if f >= 1 then table.insert(bag, "**FULL - new drops are lost**")
-        elseif f >= 0.9 then table.insert(bag, "**Almost full**") end
+        table.insert(bag, "*not readable*")
     else
-        table.insert(bag, string.format("**%s** items", commas(now.itemTotal)))
-    end
-
-    local team = {}
-    if not next(AutoPlaceModule.team) then pcall(AutoPlaceModule.RefreshTeam) end
-    for s = 1, 6 do
-        local t = AutoPlaceModule.team[s]
-        if t then
-            local role = AutoPlaceModule.RoleOf(t)
-            local st = AutoPlaceModule.Stats(t)
-            local extra = (role == "dps" or role == nil) and string.format(" · %s dmg", commas(st.damage)) or ""
-            local traitText = #(t.traits or {}) > 0 and (" · *" .. table.concat(t.traits, ", ") .. "*") or ""
-            table.insert(team, string.format("`%d` %s%s%s%s", s, prettyName(t.name), role and (" · " .. role) or "", extra, traitText))
+        local used = (now.bagMax and now.itemTotal <= now.bagMax and now.itemTotal)
+            or (now.bagMax and now.kinds <= now.bagMax and now.kinds) or nil
+        if used then
+            local f = used / now.bagMax
+            table.insert(bag, string.format("**%s** / %s", commas(used), commas(now.bagMax)))
+            table.insert(bag, string.format("`%s` %d%%", bar(f), math.floor(f * 100 + 0.5)))
+            if f >= 1 then table.insert(bag, "⛔ **FULL**")
+            elseif f >= 0.9 then table.insert(bag, "⚠️ **Almost full**")
+            else table.insert(bag, "✅ space left") end
+        else
+            table.insert(bag, string.format("**%s** items", commas(now.itemTotal)))
+            table.insert(bag, string.format("%d kinds", now.kinds))
         end
     end
 
     local elapsed = os.clock() - session.started
+    local farm = {}
+    table.insert(farm, string.format("✅ **%d**  ·  ❌ **%d**", session.wins, session.losses))
+    table.insert(farm, "⏱ " .. clock(elapsed))
+    local first = firstSnap or before
+    if first.gems and now.gems and elapsed > 60 and now.gems > first.gems then
+        table.insert(farm, string.format("💎 %s / h", commas((now.gems - first.gems) * 3600 / elapsed)))
+    end
+
     local embed = {
-        title = title,
-        color = kind == "test" and 3447003 or (win and 3066993 or 15158332),
-        description = string.format("**Time** %s   ·   **Wave** %d", formatDuration(runTime), getCurrentWave()),
+        author = { name = "MACRO // LAB" },
+        title = head,
+        color = kind == "test" and 5793266 or (win and 5763719 or 15548997),
+        description = string.format("**%s**\n⏱ `%s`   🌊 Wave `%d`", State.stage or "Unknown stage", clock(runTime),
+            math.max(gameWave, waveNow())),
         fields = {
-            { name = "Rewards", value = table.concat(rewards, "\n"), inline = false },
-            { name = "Player", value = table.concat(player, "\n"), inline = true },
-            { name = "Bag", value = table.concat(bag, "\n"), inline = true },
+            { name = "🎁 Rewards", value = table.concat(rewards, "\n"), inline = false },
+            { name = "👤 Player", value = table.concat(player, "\n"), inline = true },
+            { name = "🎒 Bag", value = table.concat(bag, "\n"), inline = true },
+            { name = "📈 Session", value = table.concat(farm, "\n"), inline = true },
         },
-        footer = { text = string.format("MACRO // LAB  ·  session %s  ·  %d wins / %d losses",
-            formatDuration(elapsed), session.wins, session.losses) },
+        footer = { text = "MACRO // LAB" },
     }
-    if #team > 0 then table.insert(embed.fields, { name = "Team", value = table.concat(team, "\n"), inline = false }) end
+    pcall(function() embed.timestamp = DateTime.now():ToIsoDate() end)
     return { username = "MACRO // LAB", embeds = { embed } }
 end
 
@@ -3920,7 +3956,11 @@ task.spawn(function()
         local data = workspace:FindFirstChild("_DATA")
         local started = data and data:FindFirstChild("GameStarted")
         local isStarted = started and started.Value == true
-        if isStarted and not wasStarted then startSnap = playerSnapshot() end
+        if isStarted and not wasStarted then
+            startSnap, gameWave = playerSnapshot(), 0
+            firstSnap = firstSnap or startSnap
+        end
+        if isStarted then gameWave = math.max(gameWave, waveNow()) end
         wasStarted = isStarted
         local results = isResultsShowing()
         if results and not wasResults and startSnap then
