@@ -6070,6 +6070,26 @@ function Webhook.BagLine(snap)
     return string.format("`%s / %s` · %s", commas(used), commas(snap.bagMax), state), f
 end
 
+-- Won or lost. The result screen can open before its VICTORY text shows (Infinity Mansion
+-- Room 51: a win was reported as a defeat 1 s after the last wave), so wait up to 4 s for
+-- the word; a "Defeat" / "Game over" label alone means lost. With neither, the base still
+-- standing (HP above 0 at the top of the screen) means won.
+function Webhook.ResultWin()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _ = 1, 16 do
+        if resultIsVictory() then return true end
+        for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+            if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
+                local t = string.lower(tostring(d.Text)):gsub("<[^>]->", ""):match("^%s*(.-)[%p%s]*$")
+                if t == "defeat" or t == "game over" then return false end
+            end
+        end
+        task.wait(0.25)
+    end
+    local cur = AutoPlaceModule.ScanBaseHp()
+    return cur ~= nil and cur > 0
+end
+
 function Webhook.BuildReport(kind)
     local now = playerSnapshot()
     local before = startSnap or now
@@ -6324,7 +6344,7 @@ task.spawn(function()
         local results = isResultsShowing()
         if results and not wasResults and startSnap and not reported then
             reported = true -- (the result screen going away and back is the same game)
-            local win = resultIsVictory()
+            local win = Webhook.ResultWin()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
