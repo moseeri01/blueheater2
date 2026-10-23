@@ -1,12 +1,12 @@
--- MacLib macro UI for Anime Adventures (v3 — full feature build).
+-- moseeri hub: MacLib macro UI for Anime Adventures (v3 — full feature build).
 -- Core: __namecall hook recorder, money-filtered replay, unit linking.
--- Tabs: Macro | Auto Farm | Units | Dungeon | Settings
+-- Tabs: Home | Lobby | Dungeon | Event | Macro | Advanced | Settings
 
 local ok_maclib, MacLib = pcall(function()
     return loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 end)
 if not ok_maclib or not MacLib then
-    warn("[Macro UI] MacLib failed to load: " .. tostring(MacLib))
+    warn("[moseeri hub] MacLib failed to load: " .. tostring(MacLib))
     return
 end
 
@@ -110,18 +110,15 @@ local AutoPlace = {
     hillBy = {},                  -- [stage] = "height" (spots above the road took hill units) | "name" (only parts named hill/cliff/...)
 }
 
--- Dungeon Bot state
-local DungeonBot = {
+-- Dungeon Run state (settings saved in config.json "dungeon"; Auto dungeon is never restored on)
+local DungeonRun = {
     enabled = false,
-    roomPriority = { "SHOP", "HOARD", "CHEST", "SHRINE", "BATTLE" },
-    shrineEnabled = false,
-    autoBuyBuffs = true,
-    buffPriority = { "DMG", "MAGIC", "TRUE_DMG" },
-    discoveryMode = false,
-    remoteMap = {},
-    currentDepth = 0,
-    dungeonActive = false,
-    statusText = "Idle",
+    roomPriority = "HOARD > CHEST > SHOP > BATTLE > SHRINE",
+    wishList = "",            -- shop items to buy, by name; empty = buy nothing
+    acceptShrines = false,
+    openRareAtEnd = true,
+    autoContinueDeath = false,
+    status = "Off",
 }
 
 -- Tools state
@@ -139,6 +136,8 @@ local Webhook = {
     url = "",
     notifyComplete = false,
     notifyFail = false,
+    pingId = "",          -- Discord user id to @ping on important events; empty = no ping
+    pingMythic = true, pingBagFull = true, pingDisconnect = true, pingLosses = true,
 }
 
 local Window
@@ -151,7 +150,7 @@ local hookInstalled = false
 local syncing = false
 
 local function notify(message)
-    Window:Notify({ Title = "Macro UI", Description = tostring(message), Lifetime = 5 })
+    Window:Notify({ Title = "moseeri hub", Description = tostring(message), Lifetime = 5 })
 end
 
 local function formatDuration(seconds)
@@ -170,7 +169,7 @@ end
 local function cleanName(name)
     if type(name) ~= "string" then return nil end
     local trimmed = name:match("^%s*(.-)%s*$")
-    if #trimmed < 1 or #trimmed > 40 or not trimmed:match("^[%w _%-#'.!&]+$") then return nil end
+    if #trimmed < 1 or #trimmed > 90 or not trimmed:match("^[%w _%-#'.!&]+$") then return nil end
     return trimmed
 end
 
@@ -203,8 +202,11 @@ local pendingToggles = {}
 local function buildConfigData()
     return {
         profile = Profile.name,
-        webhook = { url = Webhook.url, notifyComplete = Webhook.notifyComplete, notifyFail = Webhook.notifyFail },
-        dungeon = { remoteMap = DungeonBot.remoteMap, shrineEnabled = DungeonBot.shrineEnabled, autoBuyBuffs = DungeonBot.autoBuyBuffs },
+        webhook = { url = Webhook.url, notifyComplete = Webhook.notifyComplete, notifyFail = Webhook.notifyFail,
+            pingId = Webhook.pingId, pingMythic = Webhook.pingMythic, pingBagFull = Webhook.pingBagFull,
+            pingDisconnect = Webhook.pingDisconnect, pingLosses = Webhook.pingLosses },
+        dungeon = { roomPriority = DungeonRun.roomPriority, wishList = DungeonRun.wishList, shrineEnabled = DungeonRun.acceptShrines,
+            openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath },
         unitAI = {
             autoAbilities = UnitAI.autoAbilities,
             abilityCooldown = UnitAI.abilityCooldown,
@@ -263,10 +265,18 @@ local function applyConfigData(data)
     Webhook.url = pick(w.url, "string", Webhook.url)
     Webhook.notifyComplete = pick(w.notifyComplete, "boolean", Webhook.notifyComplete)
     Webhook.notifyFail = pick(w.notifyFail, "boolean", Webhook.notifyFail)
+    Webhook.pingId = pick(w.pingId, "string", Webhook.pingId)
+    Webhook.pingMythic = pick(w.pingMythic, "boolean", Webhook.pingMythic)
+    Webhook.pingBagFull = pick(w.pingBagFull, "boolean", Webhook.pingBagFull)
+    Webhook.pingDisconnect = pick(w.pingDisconnect, "boolean", Webhook.pingDisconnect)
+    Webhook.pingLosses = pick(w.pingLosses, "boolean", Webhook.pingLosses)
     local d = data.dungeon or {}
-    DungeonBot.remoteMap = pick(d.remoteMap, "table", DungeonBot.remoteMap)
-    DungeonBot.shrineEnabled = pick(d.shrineEnabled, "boolean", DungeonBot.shrineEnabled)
-    DungeonBot.autoBuyBuffs = pick(d.autoBuyBuffs, "boolean", DungeonBot.autoBuyBuffs)
+    -- (old dungeon bot keys remoteMap / autoBuyBuffs are ignored: that bot clicked any buy button)
+    DungeonRun.roomPriority = pick(d.roomPriority, "string", DungeonRun.roomPriority)
+    DungeonRun.wishList = pick(d.wishList, "string", DungeonRun.wishList)
+    DungeonRun.acceptShrines = pick(d.shrineEnabled, "boolean", DungeonRun.acceptShrines)
+    DungeonRun.openRareAtEnd = pick(d.openRareAtEnd, "boolean", DungeonRun.openRareAtEnd)
+    DungeonRun.autoContinueDeath = pick(d.autoContinueDeath, "boolean", DungeonRun.autoContinueDeath)
     local u = data.unitAI or {}
     UnitAI.abilityCooldown = pick(u.abilityCooldown, "number", UnitAI.abilityCooldown)
     UnitAI.buffGap = pick(u.buffGap, "number", UnitAI.buffGap)
@@ -551,10 +561,19 @@ function Stage.nameFromLevelData(data)
     local level = text("name") or text("id")
     if level then table.insert(parts, level) end
     local mode = text("_gamemode")
-    if mode and mode ~= "story" and not string.lower(level or ""):find(string.lower(mode), 1, true) then
+    if mode and mode ~= "story" and not string.lower(level or ""):find(string.lower(mode), 1, true)
+        and not string.lower(level or ""):find((string.lower(mode):gsub("_", " ")), 1, true) then
         table.insert(parts, mode)
     end
+    -- for people: "Mountain Temple — Infinity Mansion Room 12" (place, then mode / room;
+    -- the difficulty goes in the report title)
     local difficulty = text("_difficulty")
+    Stage.difficulty = difficulty
+    if location and #parts > 1 then
+        Stage.pretty = location .. " — " .. table.concat(parts, " ", 2)
+    else
+        Stage.pretty = nil
+    end
     if difficulty and difficulty ~= "Normal" then table.insert(parts, difficulty) end
     if #parts == 0 then return text("map") end
     return table.concat(parts, " ")
@@ -577,7 +596,14 @@ function Stage.detect()
     end
     if not name then return nil end
     name = name:gsub("[^%w _%-]", " "):gsub("%s+", " ")
-    return cleanName(name:sub(1, 34))
+    return cleanName(name:sub(1, 80))
+end
+
+-- Stage for people (with "—" between place and mode / room when the level data has both).
+function Stage.Pretty()
+    if not State.stage then return nil end
+    if Stage.pretty then return Stage.pretty end
+    return State.stage
 end
 
 local function stageMacroPattern(stage)
@@ -1408,7 +1434,7 @@ local function sendWebhook(title, message)
                 title = title,
                 description = message,
                 color = title:find("Fail") and 15158332 or 3066993,
-                footer = { text = "Macro UI // " .. os.date("%H:%M:%S") },
+                footer = { text = "moseeri hub // " .. os.date("%H:%M:%S") },
             }}
         })
         local httpRequest = (syn and syn.request) or (http and http.request) or request or http_request
@@ -1767,7 +1793,7 @@ local function isOwnGui(obj)
     if ownGuiCache[layer] == nil then
         local mine = false
         for _, d in ipairs(layer:GetDescendants()) do
-            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text == "MACRO // LAB" then mine = true break end
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and (d.Text == "moseeri hub" or d.Text == "MACRO // LAB") then mine = true break end
         end
         ownGuiCache[layer] = mine
     end
@@ -2309,7 +2335,8 @@ local function fireLearned(unit, entry)
 end
 
 function UnitAIModule.BuffReport()
-    local lines = { "[Buff report] " .. os.date("%H:%M:%S") }
+    local lines = { "[moseeri hub · Buff report] " .. os.date("%H:%M:%S") }
+    pcall(function() table.insert(lines, "status: " .. UnitAIModule.StatusDetail():gsub("\n", " | ")) end)
     local cts = ReplicatedStorage:FindFirstChild("endpoints")
     cts = cts and cts:FindFirstChild("client_to_server")
     if cts then
@@ -2562,8 +2589,8 @@ local function myUnitsWithAbility()
     return list
 end
 
-local function refreshUnitStatus()
-    if not UIRef.unitStatusParagraph then return end
+-- Full buff / ability status (in Copy buff report); the Advanced tab shows one line.
+function UnitAIModule.StatusDetail()
     local parts = {}
     if UnitAI.autoAbilities then table.insert(parts, "Abilities: ON (every " .. UnitAI.abilityCooldown .. "s)") end
     if UnitAI.autoBuff then
@@ -2597,7 +2624,23 @@ local function refreshUnitStatus()
         if BuffInfo.reply ~= "-" then table.insert(parts, "Last reply: " .. clip(BuffInfo.reply, 30)) end
     end
     table.insert(parts, "My units on map: " .. #ownedUnits())
-    UIRef.unitStatusParagraph:UpdateBody(table.concat(parts, "\n"))
+    return table.concat(parts, "\n")
+end
+
+local function refreshUnitStatus()
+    if not UIRef.unitStatusParagraph then return end
+    local line
+    if UnitAI.autoBuff then
+        local mine = #ownedUnits()
+        line = mine < UnitAI.minUnitsForBuff and string.format("Buffs waiting %d/%d units", mine, UnitAI.minUnitsForBuff)
+            or string.format("Buffs %d/%d", BuffRot.buffUnits or 0, BuffRot.buffUnits or 0)
+        if BuffRot.autoActive > 0 then line = line .. " (turn the in-game Auto skill Off)"
+        elseif mine >= UnitAI.minUnitsForBuff and BuffRot.buffUnits == 0 then line = line .. " (no buff unit: Learn buff)" end
+    else
+        line = "Buffs off"
+    end
+    line = line .. " · abilities " .. (UnitAI.autoAbilities and "on" or "off")
+    pcall(function() UIRef.unitStatusParagraph:UpdateBody(line) end)
 end
 
 local abilityGen, buffGen = 0, 0
@@ -3341,6 +3384,7 @@ function AutoPlaceModule.RefreshTeam()
     AutoPlaceModule.team = team
     AutoPlaceModule.teamReadAt = os.clock()
     if learned then saveConfig() end
+    if AutoPlaceModule.refreshSkipUI then pcall(AutoPlaceModule.refreshSkipUI) end
     return team
 end
 
@@ -4504,7 +4548,7 @@ end
 
 -- Short status: what it is doing, the two strongest units and the last two actions.
 local function shortStatus()
-    local lines = { "Status: " .. AutoPlaceModule.status }
+    local lines = { AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage), "Status: " .. AutoPlaceModule.status }
     if AutoPlaceModule.idleMoney then
         table.insert(lines, string.format("Idle money: %d ¥ – turn on Auto upgrade", math.floor(AutoPlaceModule.idleMoney)))
     end
@@ -4579,7 +4623,7 @@ function AutoPlaceModule.StatusText()
 end
 
 function AutoPlaceModule.MapReport()
-    local lines = { "[Map report] " .. os.date("%H:%M:%S") .. " stage " .. stageKey() }
+    local lines = { "[moseeri hub · Map report] " .. os.date("%H:%M:%S") .. " stage " .. stageKey() }
     table.insert(lines, "map fingerprint: " .. (AutoPlaceModule.MapFingerprint(true) or "none (no _BASES)") .. " from " .. (AutoPlaceModule.fpFrom ~= "" and AutoPlaceModule.fpFrom or "-"))
     table.insert(lines, "getgc: " .. tostring(type(getgc) == "function") .. ", Raycast: " .. tostring(pcall(function() return RaycastParams.new() end)))
     AutoPlaceModule.RefreshTeam()
@@ -5076,6 +5120,7 @@ end
 -- and id) to AAMacro/unit_catalog.txt, plus a depth-limited dump of the other data modules
 -- (traits, waves, levels ...) to AAMacro/game_data.txt, so the real field names are known.
 local Catalog = {}
+AutoPlaceModule.Catalog = Catalog -- the dumpers are used by the Dungeon Run report too
 function Catalog.text(v, n)
     if type(v) == "table" then
         local c = 0
@@ -5651,11 +5696,6 @@ local session = { started = os.clock(), wins = 0, losses = 0 }
 local startSnap, firstSnap
 local gameWave = 0 -- highest wave seen this game (the counter is reset when the result shows)
 
-local function bar(fraction)
-    local n = math.max(0, math.min(10, math.floor(fraction * 10 + 0.5)))
-    return string.rep("▰", n) .. string.rep("▱", 10 - n)
-end
-
 local function clock(seconds)
     seconds = math.max(0, math.floor(seconds or 0))
     local h, m, s = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
@@ -5702,37 +5742,47 @@ local function yamlValue(v)
     return (tostring(v):gsub("\n", " "):gsub("`", "'"))
 end
 
+-- Bag state for the report and the bag-full ping: "95 / 100", "✅ space left" ..., fraction.
+function Webhook.BagLine(snap)
+    if not snap.hasInventory then return "not readable", nil end
+    local used = (snap.bagMax and snap.itemTotal <= snap.bagMax and snap.itemTotal)
+        or (snap.bagMax and snap.kinds <= snap.bagMax and snap.kinds) or nil
+    if not used then return string.format("%s items", commas(snap.itemTotal)), nil end
+    local f = used / snap.bagMax
+    local state = (f >= 1 and "⛔ full") or (f >= 0.9 and "⚠️ almost full") or "✅ space left"
+    return string.format("%s / %s   %s", commas(used), commas(snap.bagMax), state), f
+end
+
 function Webhook.BuildReport(kind)
     local now = playerSnapshot()
     local before = startSnap or now
     local win = kind == "win"
-    local result = (kind == "test" and "TEST") or (win and "VICTORY") or "DEFEAT"
-    local head = (kind == "test" and "🧪  TEST REPORT") or (win and "🏆  VICTORY") or "💀  DEFEAT"
+    local head = (kind == "test" and "🧪 TEST REPORT") or (win and "🏆 VICTORY") or "💀 DEFEAT"
+    local diff = difficultyText() or (Stage.difficulty ~= "Normal" and Stage.difficulty) or nil
+    if diff then head = head .. " · " .. diff end
     local runTime = startSnap and (now.at - startSnap.at) or 0
 
-    -- Match Results (yaml block: keys and values get colours in Discord)
-    local match = {}
-    table.insert(match, "Stage: " .. yamlValue(State.stage or "Unknown stage"))
-    local diff = difficultyText()
-    if diff then table.insert(match, "Difficulty: " .. yamlValue(diff)) end
-    table.insert(match, "Result: " .. result)
-    table.insert(match, "Time: " .. clock(runTime))
-    table.insert(match, "Wave: " .. math.max(gameWave, waveNow()))
+    local desc = {
+        Stage.Pretty() or State.stage or "Unknown stage",
+        string.format("⏱ %s   🌊 Wave %d", clock(runTime), math.max(gameWave, waveNow())),
+        "Username: ||" .. tostring(Players.LocalPlayer.Name) .. "||",
+    }
 
-    -- Rewards: totals with what this game added, then items
+    -- Rewards: one line each, what this game added first, the total in brackets
     local rewards = {}
-    local function line(label, a, b)
-        if b then
-            local d = (a and b) and (b - a) or 0
-            table.insert(rewards, string.format("%s: %s (%s%s)", label, commas(b), d >= 0 and "+" or "", commas(d)))
-        end
+    if now.gems and before.gems and now.gems ~= before.gems then
+        table.insert(rewards, string.format("💎 %s%s Gems   (%s)", now.gems > before.gems and "+" or "", commas(now.gems - before.gems), commas(now.gems)))
     end
-    line("Gems", before.gems, now.gems)
-    line("Gold", before.gold, now.gold)
-    if before.level and now.level and now.level > before.level then
-        table.insert(rewards, string.format("Level: %d (+%d)", now.level, now.level - before.level))
-    elseif before.xp and now.xp and now.xp ~= before.xp then
-        table.insert(rewards, string.format("XP: +%s", commas(now.xp - before.xp)))
+    if now.gold and before.gold and now.gold ~= before.gold then
+        table.insert(rewards, string.format("🪙 %s%s Gold   (%s)", now.gold > before.gold and "+" or "", commas(now.gold - before.gold), commas(now.gold)))
+    end
+    if now.level and now.xp then
+        local gain
+        if before.level and before.xp and now.level == before.level then gain = now.xp - before.xp
+        elseif before.level and before.xp and before.xpMax and now.level > before.level then gain = (before.xpMax - before.xp) + now.xp end
+        local where = string.format("Lv %d%s · %s/%s", now.level, (before.level and now.level > before.level) and " ↑" or "",
+            commas(now.xp), commas(now.xpMax or 0))
+        if gain and gain > 0 then table.insert(rewards, string.format("⭐ +%s XP   (%s)", commas(gain), where)) end
     end
     local gotItems = {}
     for id, n in pairs(now.items or {}) do
@@ -5740,60 +5790,26 @@ function Webhook.BuildReport(kind)
         if n > was then table.insert(gotItems, { id = id, n = n, got = n - was }) end
     end
     table.sort(gotItems, function(a, b) return a.got > b.got end)
-    if #gotItems > 0 then table.insert(rewards, "# Items #") end
     for i, it in ipairs(gotItems) do
-        if i > 10 then table.insert(rewards, string.format("# ... and %d more", #gotItems - 10)) break end
-        table.insert(rewards, string.format("%s: %s (+%d)", yamlValue(prettyName(it.id)), commas(it.n), it.got))
+        if i > 10 then table.insert(rewards, string.format("📦 ... and %d more", #gotItems - 10)) break end
+        table.insert(rewards, string.format("📦 +%d %s", it.got, prettyName(it.id)))
     end
     if #rewards == 0 then
-        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "Gained: " .. yamlValue(g)) end
+        for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "🎁 " .. g) end
     end
-    if #rewards == 0 then table.insert(rewards, "# nothing new") end
+    if #rewards == 0 then table.insert(rewards, "nothing new") end
 
-    -- Bag
-    local bag = {}
-    if not now.hasInventory then
-        table.insert(bag, "*not readable*")
-    else
-        local used = (now.bagMax and now.itemTotal <= now.bagMax and now.itemTotal)
-            or (now.bagMax and now.kinds <= now.bagMax and now.kinds) or nil
-        if used then
-            local f = used / now.bagMax
-            local state = (f >= 1 and "⛔ **FULL**") or (f >= 0.9 and "⚠️ **Almost full**") or "✅ space left"
-            table.insert(bag, string.format("**%s** / %s  `%s` %d%%", commas(used), commas(now.bagMax), bar(f), math.floor(f * 100 + 0.5)))
-            table.insert(bag, state)
-        else
-            table.insert(bag, string.format("**%s** items · %d kinds", commas(now.itemTotal), now.kinds))
-        end
-    end
-
-    -- Session
-    local elapsed = os.clock() - session.started
-    local farm = { string.format("✅ **%d**  ·  ❌ **%d**  ·  ⏱ %s", session.wins, session.losses, clock(elapsed)) }
-    local first = firstSnap or before
-    if first.gems and now.gems and elapsed > 60 and now.gems > first.gems then
-        table.insert(farm, string.format("💎 %s / hour", commas((now.gems - first.gems) * 3600 / elapsed)))
-    end
-
-    local who = {}
-    table.insert(who, "Username: ||" .. tostring(Players.LocalPlayer.Name) .. "||")
-    if now.level then
-        table.insert(who, string.format("Level: **%d**%s", now.level,
-            (now.xp and now.xpMax) and string.format(" [%s/%s]", commas(now.xp), commas(now.xpMax)) or ""))
-    end
-
+    local bagText = Webhook.BagLine(now)
     local embed = {
-        author = { name = "MACRO // LAB" },
+        author = { name = "moseeri hub" },
         title = head,
         color = kind == "test" and 5793266 or (win and 5763719 or 15548997),
-        description = table.concat(who, "\n"),
+        description = table.concat(desc, "\n"),
         fields = {
-            { name = "Match Results", value = "```yaml\n" .. table.concat(match, "\n") .. "\n```", inline = false },
-            { name = "Rewards", value = "```yaml\n" .. table.concat(rewards, "\n") .. "\n```", inline = false },
-            { name = "🎒 Bag", value = table.concat(bag, "\n"), inline = true },
-            { name = "📈 Session", value = table.concat(farm, "\n"), inline = true },
+            { name = "🎁 Rewards", value = table.concat(rewards, "\n"), inline = false },
+            { name = "🎒 Bag", value = bagText, inline = false },
         },
-        footer = { text = "MACRO // LAB · Notify" },
+        footer = { text = "moseeri hub · Notify" },
     }
     if kind == "loss" then
         -- what Auto Place was doing when the game was lost, so a defeat can be looked into
@@ -5822,19 +5838,119 @@ function Webhook.BuildReport(kind)
     local avatar = playerAvatar()
     if avatar then embed.thumbnail = { url = avatar } end
     pcall(function() embed.timestamp = DateTime.now():ToIsoDate() end)
-    return { username = "MACRO // LAB", embeds = { embed } }
+    return { username = "moseeri hub", embeds = { embed } }
 end
 
-function Webhook.SendReport(kind)
+-- Discord @ping for important events only (Mythic/Secret drop, bag full, disconnect / kick,
+-- two losses in a row). The mention is "<@ID>" with allowed_mentions limited to that user
+-- (parse = {}: never @everyone / roles). At most one ping per event type per 2 minutes.
+Webhook.lastPing = {}
+function Webhook.PingFor(kind)
+    local id = tostring(Webhook.pingId or ""):match("^%s*(%d+)%s*$")
+    if not id or #id < 5 then return nil end
+    local on = ({ mythic = Webhook.pingMythic, bag = Webhook.pingBagFull, disconnect = Webhook.pingDisconnect, losses = Webhook.pingLosses })[kind]
+    if on == false then return nil end
+    local now = os.clock()
+    if Webhook.lastPing[kind] and now - Webhook.lastPing[kind] < 120 then return nil end
+    Webhook.lastPing[kind] = now
+    return id
+end
+local function withPing(payload, kinds)
+    for _, kind in ipairs(kinds or {}) do
+        local id = Webhook.PingFor(kind)
+        if id then
+            payload.content = "<@" .. id .. ">"
+            payload.allowed_mentions = { parse = {}, users = { id } }
+            return payload
+        end
+    end
+    payload.allowed_mentions = { parse = {} }
+    return payload
+end
+
+function Webhook.SendReport(kind, pings)
     if #Webhook.url < 10 then return false end
     local ok, payload = pcall(Webhook.BuildReport, kind)
     if not ok then return false end
-    return httpPost(Webhook.url, HttpService:JSONEncode(payload))
+    return httpPost(Webhook.url, HttpService:JSONEncode(withPing(payload, pings)))
 end
+
+-- A short alert embed (Mythic drop, bag full, disconnect) with the ping when one is set.
+function Webhook.Alert(kind, title, text, color)
+    if #Webhook.url < 10 then return false end
+    local payload = { username = "moseeri hub", embeds = { {
+        author = { name = "moseeri hub" }, title = title, description = text, color = color or 16766720,
+        footer = { text = "moseeri hub · Notify" } } } }
+    pcall(function() payload.embeds[1].timestamp = DateTime.now():ToIsoDate() end)
+    return httpPost(Webhook.url, HttpService:JSONEncode(withPing(payload, { kind })))
+end
+
+-- Owned units (uuid -> unit id) from the game's tables, like the team read.
+function Webhook.OwnedUnits()
+    local out = {}
+    pcall(function()
+        for _, v in ipairs(type(getgc) == "function" and getgc(true) or {}) do
+            if type(v) == "table" then
+                local uuid, id = rawget(v, "uuid"), rawget(v, "unit_id")
+                if type(uuid) == "string" and type(id) == "string" then out[uuid] = id end
+            end
+        end
+    end)
+    return out
+end
+
+-- Units new since the game started whose rarity is Mythic or Secret; else result-screen
+-- texts that say Mythic / Secret. Returns a list of "Mythic: Name" lines.
+function Webhook.RareDrops(before)
+    local found = {}
+    for uuid, id in pairs(Webhook.OwnedUnits()) do
+        if before and not before[uuid] then
+            local def = AutoPlaceModule.UnitDef(id) or {}
+            local rarity = tostring(def.rarity or "")
+            if rarity:lower() == "mythic" or rarity:lower() == "secret" then
+                table.insert(found, string.format("%s: %s", rarity:sub(1, 1):upper() .. rarity:sub(2):lower(), tostring(def.name or prettyName(id))))
+            end
+        end
+    end
+    if #found == 0 then
+        local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+            pcall(function()
+                if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
+                    local t = tostring(d.Text):gsub("<[^>]->", "")
+                    local l = t:lower()
+                    if (l:find("mythic", 1, true) or l:find("secret", 1, true)) and #t <= 60 and #found < 3 then table.insert(found, t) end
+                end
+            end)
+        end
+    end
+    table.sort(found)
+    return found
+end
+
+-- Disconnect / kick: the error prompt or the local player leaving (once, best effort).
+pcall(function()
+    local gs = game:GetService("GuiService")
+    local function onError(msg)
+        if State.unloaded then return end
+        local text = type(msg) == "string" and msg or ""
+        if text == "" then pcall(function() text = gs:GetErrorMessage() end) end
+        if text == "" or Webhook.disconnectSent then return end
+        Webhook.disconnectSent = true
+        if Webhook.pingDisconnect ~= false then pcall(Webhook.Alert, "disconnect", "⚠️ Disconnected", clip(text, 300), 15105570) end
+    end
+    pcall(function() table.insert(State.connections, gs.ErrorMessageChanged:Connect(onError)) end)
+    pcall(function()
+        table.insert(State.connections, Players.PlayerRemoving:Connect(function(p)
+            if p == Players.LocalPlayer then onError("left the game (kicked or closed)") end
+        end))
+    end)
+end)
 
 -- Snapshot when a game starts, report when its result screen shows (once per game).
 task.spawn(function()
     local wasStarted, wasResults = false, false
+    local unitsBefore
     while not State.unloaded do
         task.wait(1)
         local data = workspace:FindFirstChild("_DATA")
@@ -5843,6 +5959,7 @@ task.spawn(function()
         if isStarted and not wasStarted then
             startSnap, gameWave = playerSnapshot(), 0
             firstSnap = firstSnap or startSnap
+            unitsBefore = Webhook.OwnedUnits()
         end
         if isStarted then gameWave = math.max(gameWave, waveNow()) end
         wasStarted = isStarted
@@ -5850,10 +5967,29 @@ task.spawn(function()
         if results and not wasResults and startSnap then
             local win = resultIsVictory()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
+            session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
-            if (win and Webhook.notifyComplete) or (not win and Webhook.notifyFail) then
-                task.wait(1.5) -- let the game add the rewards first
-                Webhook.SendReport(win and "win" or "loss")
+            task.wait(1.5) -- let the game add the rewards first
+            local pings = {}
+            -- bag turned full (once until it has room again)
+            local okBag, frac = pcall(function() return select(2, Webhook.BagLine(playerSnapshot())) end)
+            local bagFull = okBag and frac ~= nil and frac >= 1
+            local bagTurnedFull = bagFull and not Webhook.bagFullNoted
+            Webhook.bagFullNoted = bagFull
+            if bagTurnedFull and Webhook.pingBagFull ~= false then table.insert(pings, "bag") end
+            local lossAlarm = not win and session.lossStreak >= 2 and Webhook.pingLosses ~= false
+            if lossAlarm then table.insert(pings, "losses") end
+            local report = (win and Webhook.notifyComplete) or (not win and Webhook.notifyFail) or lossAlarm
+            if report then
+                Webhook.SendReport(win and "win" or "loss", pings)
+            elseif bagTurnedFull and Webhook.pingBagFull ~= false then
+                Webhook.Alert("bag", "⛔ Bag full", "Your bag is full: new drops are lost until you make room.", 15548997)
+            end
+            if Webhook.pingMythic ~= false then
+                local okR, drops = pcall(Webhook.RareDrops, unitsBefore)
+                if okR and #drops > 0 then
+                    Webhook.Alert("mythic", "🌟 " .. drops[1], table.concat(drops, "\n"), 16766720)
+                end
             end
         end
         wasResults = results
@@ -5861,185 +5997,391 @@ task.spawn(function()
 end)
 end
 
+do
+local Catalog = AutoPlaceModule.Catalog
 --------------------------------------------------------------------------------
--- MODULE: Dungeon Bot
+-- MODULE: Dungeon Run (data first; acts only on room / item ids read from the game)
 --------------------------------------------------------------------------------
-local DungeonBotModule = {}
+-- A run costs a Dungeon Key: 20 depths, a boss at the end, room choices at each step
+-- (SHOP, HOARD, CHEST, SHRINE, BATTLE), 5 lost rooms end the run, QUIT loses everything.
+-- The client_to_server remotes are known by name (dungeon_enter_room, dungeon_buy_shop ...)
+-- but not their arguments, so the bot reads the run from the game's own tables (getgc) and
+-- the screen, shows it, and only calls a remote with an argument it found there: a room /
+-- item id when the entries have one, else its position in the game's own list. Each call
+-- is checked (the run must change within 5 s); a call that changes nothing stops the bot
+-- until the owner sends a dungeon report. It never clicks screen buttons, never starts or
+-- quits a run, and buys only wish-list items.
+DungeonRun.WORDS = { "depth", "floor", "room", "heart", "lives", "death", "shop", "curse", "blessing", "hoard",
+    "chest", "coin", "dungeon", "shrine", "key" }
+DungeonRun.TYPES = { "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE", "BOSS" }
+DungeonRun.WAITING = "waiting for dungeon data - press Copy dungeon report in a run and send it"
 
-local function refreshDungeonStatus()
-    if not UIRef.dungeonStatusParagraph then return end
-    local parts = { "Status: " .. DungeonBot.statusText }
-    if DungeonBot.currentDepth > 0 then table.insert(parts, "Depth: " .. DungeonBot.currentDepth) end
-    table.insert(parts, "Shrine: " .. (DungeonBot.shrineEnabled and "ON" or "OFF"))
-    table.insert(parts, "Auto buy buffs: " .. (DungeonBot.autoBuyBuffs and "ON" or "OFF"))
-    if next(DungeonBot.remoteMap) then
-        table.insert(parts, "Known remotes: " .. #(DungeonBot.remoteMap or {}))
+function DungeonRun.priority()
+    local list = {}
+    for w in tostring(DungeonRun.roomPriority or ""):upper():gmatch("%a+") do
+        for _, t in ipairs(DungeonRun.TYPES) do if w == t then table.insert(list, t) end end
+    end
+    if #list == 0 then list = { "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE" } end
+    return list
+end
+
+function DungeonRun.wishes()
+    local list = {}
+    for w in tostring(DungeonRun.wishList or ""):gmatch("[^,;\n]+") do
+        local s = w:match("^%s*(.-)%s*$")
+        if s ~= "" then table.insert(list, string.lower(s)) end
+    end
+    return list
+end
+
+-- key of t whose lowercased name matches one of the patterns (in order), and its value
+local function findKey(t, patterns, kind)
+    for _, p in ipairs(patterns) do
+        for k, v in pairs(t) do
+            if type(k) == "string" and string.lower(k):find(p) and (not kind or type(v) == kind) then return k, v end
+        end
+    end
+end
+DungeonRun.findKey = findKey
+
+-- How many dungeon words a table's keys contain (0 = not about the dungeon).
+function DungeonRun.score(t)
+    local n = 0
+    local ok = pcall(function()
+        for k in pairs(t) do
+            if type(k) == "string" then
+                local l = string.lower(k)
+                for _, w in ipairs(DungeonRun.WORDS) do
+                    if l:find(w, 1, true) then n = n + 1 break end
+                end
+            end
+        end
+    end)
+    return ok and n or 0
+end
+
+-- A list entry (room / shop item): its type or name, its id and its position.
+local function entryOf(e, index)
+    if type(e) == "string" then return { label = e, index = index } end
+    if type(e) ~= "table" then return nil end
+    local _, label = findKey(e, { "^type$", "^room_type$", "^kind$", "^name$", "^item$", "^id$", "type", "name" }, "string")
+    local idKey, id = findKey(e, { "^id$", "^uuid$", "^room_id$", "^item_id$", "_id$", "uuid" })
+    if type(id) ~= "string" and type(id) ~= "number" then idKey, id = nil, nil end
+    local _, price = findKey(e, { "^price$", "^cost$", "price", "cost" }, "number")
+    return { label = label, id = id, idKey = idKey, index = index, price = price, raw = e }
+end
+
+local function listOf(v)
+    local out = {}
+    if type(v) ~= "table" then return out end
+    local n = #v
+    if n > 0 then
+        for i = 1, n do
+            local e = entryOf(v[i], i)
+            if e then table.insert(out, e) end
+        end
     else
-        table.insert(parts, "No remotes discovered yet (run Scan or Discovery)")
-    end
-    UIRef.dungeonStatusParagraph:UpdateBody(table.concat(parts, "\n"))
-end
-
-function DungeonBotModule.DiscoverRemotes()
-    DungeonBot.statusText = "Discovering..."
-    refreshDungeonStatus()
-    notify("Discovery mode: scanning ReplicatedStorage for dungeon remotes.")
-    local found = {}
-    for _, child in ipairs(ReplicatedStorage:GetDescendants()) do
-        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
-            local lower = string.lower(child.Name)
-            if lower:find("dungeon") or lower:find("room") or lower:find("shop") or lower:find("depth")
-                or lower:find("chest") or lower:find("shrine") or lower:find("hoard") then
-                found[child.Name] = child:GetFullName()
+        for k, x in pairs(v) do
+            local e = entryOf(x, nil)
+            if e then
+                e.key = k
+                if not e.id and (type(k) == "string" or type(k) == "number") then e.id, e.idKey = k, "key" end
+                table.insert(out, e)
             end
         end
+        table.sort(out, function(a, b) return tostring(a.id) < tostring(b.id) end)
     end
-    DungeonBot.remoteMap = found
-    saveConfig()
-    local count = 0
-    for _ in pairs(found) do count = count + 1 end
-    DungeonBot.statusText = "Idle"
-    refreshDungeonStatus()
-    notify(string.format("Discovery found %d dungeon-related remotes. Saved to config.", count))
+    return out
 end
 
-function DungeonBotModule.ReadRoomChoices()
-    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not gui then return {} end
-    local rooms = {}
-    for _, d in ipairs(gui:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("TextLabel") or d:IsA("Frame")) and d.Visible then
-            local name = string.lower(d.Name)
-            local text = d:IsA("TextButton") and string.lower(d.Text) or name
-            for _, roomType in ipairs({ "shop", "hoard", "battle", "boss", "shrine", "chest" }) do
-                if text:find(roomType, 1, true) or name:find(roomType, 1, true) then
-                    table.insert(rooms, { type = string.upper(roomType), button = d:IsA("TextButton") and d or nil, name = d.Name })
+-- The run as the game holds it: the getgc table with a depth and room choices (or a shop).
+function DungeonRun.Read()
+    local best, bestScore
+    if type(getgc) == "function" then
+        pcall(function()
+            for _, t in ipairs(getgc(true)) do
+                if type(t) == "table" then
+                    local s = DungeonRun.score(t)
+                    if s >= 2 and (not bestScore or s > bestScore) then
+                        local ok, has = pcall(function()
+                            return findKey(t, { "depth", "floor" }, "number") ~= nil
+                                or findKey(t, { "room", "choice", "option" }, "table") ~= nil
+                        end)
+                        if ok and has then best, bestScore = t, s end
+                    end
                 end
             end
+        end)
+    end
+    if not best then return nil end
+    local st = { table = best }
+    pcall(function()
+        st.depth = select(2, findKey(best, { "^depth$", "current_depth", "^floor$", "depth", "floor" }, "number"))
+        st.maxDepth = select(2, findKey(best, { "max_depth", "total_depth", "max_floor" }, "number"))
+        st.hearts = select(2, findKey(best, { "^hearts$", "^lives$", "heart", "lives" }, "number"))
+        st.maxHearts = select(2, findKey(best, { "max_heart", "max_lives" }, "number"))
+        st.deaths = select(2, findKey(best, { "death", "loss", "fail" }, "number"))
+        st.coins = select(2, findKey(best, { "^coins$", "hoard", "coin", "gold" }, "number"))
+        st.silverKeys = select(2, findKey(best, { "silver" }, "number"))
+        st.goldKeys = select(2, findKey(best, { "gold_key", "golden" }, "number"))
+        local _, rooms = findKey(best, { "^rooms$", "room_choices", "choices", "options", "next_rooms", "rooms", "room" }, "table")
+        st.rooms = listOf(rooms)
+        local _, shop = findKey(best, { "^shop$", "shop_items", "shop" }, "table")
+        if type(shop) == "table" then
+            local _, items = findKey(shop, { "items", "stock", "offers" }, "table")
+            st.shop = listOf(items or shop)
+        end
+        local _, inv = findKey(best, { "inventory", "blessing", "items", "owned" }, "table")
+        st.inventory = inv
+        local _, dead = findKey(best, { "dead", "died", "defeated" }, "boolean")
+        st.dead = dead
+        local _, curse = findKey(best, { "curse" })
+        st.curse = curse
+    end)
+    for _, r in ipairs(st.rooms or {}) do
+        local l = string.upper(tostring(r.label or ""))
+        for _, t in ipairs(DungeonRun.TYPES) do
+            if l:find(t, 1, true) then r.type = t break end
         end
     end
-    return rooms
+    return st
 end
 
-function DungeonBotModule.PickRoom(rooms)
-    if #rooms == 0 then return nil end
-    local priority = DungeonBot.roomPriority
-    for _, pType in ipairs(priority) do
-        if not (pType == "SHRINE" and not DungeonBot.shrineEnabled) then
-            for _, room in ipairs(rooms) do
-                if room.type == pType then return room end
-            end
-        end
-    end
-    return rooms[1]
-end
-
-function DungeonBotModule.HandleShop()
-    if not DungeonBot.autoBuyBuffs then return end
-    task.wait(1)
+-- Room cards / hearts text on screen, for the status only (never clicked).
+function DungeonRun.ScreenText()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not gui then return end
-    for _, d in ipairs(gui:GetDescendants()) do
-        if d:IsA("TextButton") and d.Visible then
-            local lower = string.lower(d.Text)
-            for _, buff in ipairs(DungeonBot.buffPriority) do
-                if lower:find(string.lower(buff), 1, true) or lower:find("buy", 1, true) or lower:find("purchase", 1, true) then
-                    clickButton(d)
-                    task.wait(0.5)
+    local seen, out = {}, {}
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        pcall(function()
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and not isOwnGui(d) and isOnScreen(d) then
+                local text = tostring(d.Text):gsub("<[^>]->", "")
+                local up = text:upper()
+                for _, t in ipairs(DungeonRun.TYPES) do
+                    if up:find(t, 1, true) and not seen[t] and #text <= 20 then seen[t] = true table.insert(out, t) end
                 end
+                if text:match("^%s*%d+%s*/%s*5%s*$") and not seen.hearts then seen.hearts = true table.insert(out, "hearts " .. text) end
+            end
+        end)
+    end
+    return out
+end
+
+function DungeonRun.StatusText(st)
+    local lines = { "Auto: " .. (DungeonRun.enabled and "ON" or "off") .. " | " .. tostring(DungeonRun.status) }
+    if st then
+        table.insert(lines, string.format("Depth %s%s | hearts %s%s | coins %s | keys silver %s gold %s",
+            tostring(st.depth or "?"), st.maxDepth and ("/" .. st.maxDepth) or "/20", tostring(st.hearts or "?"),
+            st.maxHearts and ("/" .. st.maxHearts) or "", tostring(st.coins or "?"), tostring(st.silverKeys or "?"), tostring(st.goldKeys or "?")))
+        local rooms = {}
+        for _, r in ipairs(st.rooms or {}) do
+            table.insert(rooms, string.format("%s%s", tostring(r.type or r.label or "?"), r.id ~= nil and ("[" .. tostring(r.id) .. "]") or ("#" .. tostring(r.index))))
+        end
+        table.insert(lines, "Rooms offered: " .. (#rooms > 0 and table.concat(rooms, ", ") or "none"))
+        if st.shop and #st.shop > 0 then
+            local items = {}
+            for _, it in ipairs(st.shop) do table.insert(items, tostring(it.label or it.id or "?") .. (it.price and (" " .. it.price) or "")) end
+            table.insert(lines, "Shop: " .. table.concat(items, ", "))
+        end
+    else
+        table.insert(lines, st == false and "Run data: not read yet (press Refresh dungeon data)"
+            or "Run data: not found (not in a dungeon, or its table is unknown)")
+    end
+    local screen = DungeonRun.ScreenText()
+    if #screen > 0 then table.insert(lines, "On screen: " .. table.concat(screen, ", ")) end
+    table.insert(lines, "Rooms: " .. table.concat(DungeonRun.priority(), " > ") .. " | shrines " .. (DungeonRun.acceptShrines and "on" or "off")
+        .. " | wish-list: " .. (#DungeonRun.wishes() > 0 and table.concat(DungeonRun.wishes(), ", ") or "empty (buys nothing)"))
+    return table.concat(lines, "\n")
+end
+
+function DungeonRun.Refresh(st)
+    if not UIRef.dungeonStatus then return end
+    if st == nil then st = DungeonRun.Read() end
+    pcall(function() UIRef.dungeonStatus:UpdateBody(DungeonRun.StatusText(st)) end)
+end
+
+-- Everything that looks like dungeon data, for the owner to send (clipboard + file).
+function DungeonRun.Report()
+    local out = { "[moseeri hub · Dungeon report] " .. os.date("%H:%M:%S") .. " stage " .. tostring(State.stage) }
+    local remotes = {}
+    pcall(function()
+        for _, d in ipairs(ReplicatedStorage.endpoints:GetDescendants()) do
+            local l = string.lower(d.Name)
+            if l:find("dungeon", 1, true) or l:find("room", 1, true) or l:find("shrine", 1, true) or l:find("chest", 1, true) then
+                table.insert(remotes, d:GetFullName() .. " (" .. d.ClassName .. ")")
+            end
+        end
+    end)
+    table.sort(remotes)
+    table.insert(out, "remotes: " .. (#remotes > 0 and table.concat(remotes, ", ") or "none"))
+    local st = DungeonRun.Read()
+    table.insert(out, "read: " .. DungeonRun.StatusText(st):gsub("\n", " | "))
+    local n = 0
+    pcall(function()
+        for _, t in ipairs(type(getgc) == "function" and getgc(true) or {}) do
+            if n >= 15 then break end
+            if type(t) == "table" and DungeonRun.score(t) >= 1 then
+                n = n + 1
+                local ok, body = pcall(Catalog.dump, t, 4000, 3)
+                table.insert(out, string.format("== table %d (dungeon words %d)%s ==\n%s", n, DungeonRun.score(t),
+                    t == (st and st.table) and " [used as the run]" or "", ok and body or "?"))
+            end
+        end
+    end)
+    if n == 0 then table.insert(out, "no getgc table with dungeon keys") end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, g in ipairs(gui and gui:GetChildren() or {}) do
+        pcall(function()
+            local l = string.lower(g.Name)
+            if not isOwnGui(g) and (l:find("dungeon", 1, true) or l:find("room", 1, true) or l:find("shop", 1, true)
+                or l:find("shrine", 1, true) or l:find("chest", 1, true) or l:find("hoard", 1, true)) then
+                local lines = {}
+                Catalog.guiTree(g, 6, lines, "  ")
+                table.insert(out, "== screen " .. g:GetFullName() .. " ==\n" .. table.concat(lines, "\n"))
+            end
+        end)
+    end
+    local text = table.concat(out, "\n")
+    local where = Catalog.save("dungeon_report.txt", text)
+    if type(setclipboard) == "function" then pcall(setclipboard, text) end
+    notify(string.format("Dungeon report copied (%d KB)%s", math.ceil(#text / 1024), where and where ~= "clipboard" and (", saved to " .. where) or ""))
+    return text
+end
+
+-- Calls a client_to_server dungeon remote with one argument; true when the run changed.
+function DungeonRun.Call(name, arg, before)
+    local remote = getAARemote(name)
+    if not remote then DungeonRun.status = name .. " remote not found" return false end
+    DungeonRun.calls = (DungeonRun.calls or 0) + 1
+    local ok, res = pcall(function()
+        if remote:IsA("RemoteFunction") then return remote:InvokeServer(arg) end
+        remote:FireServer(arg)
+        return true
+    end)
+    local deadline = os.clock() + 5
+    while os.clock() < deadline do
+        local now = DungeonRun.Read()
+        if now and before and DungeonRun.Changed(before, now) then return true, res end
+        task.wait(0.25)
+    end
+    return false, ok and res or "error"
+end
+
+function DungeonRun.Changed(a, b)
+    if a.depth ~= b.depth or a.coins ~= b.coins or a.hearts ~= b.hearts then return true end
+    local function sig(list)
+        local parts = {}
+        for _, e in ipairs(list or {}) do table.insert(parts, tostring(e.label) .. ":" .. tostring(e.id)) end
+        return table.concat(parts, ",")
+    end
+    return sig(a.rooms) ~= sig(b.rooms) or sig(a.shop) ~= sig(b.shop)
+end
+
+-- The room to enter: the first type in the priority list that is offered (shrines only
+-- when allowed; a boss room when it is the only way on). nil = nothing fits.
+function DungeonRun.PickRoom(rooms)
+    local order = DungeonRun.priority()
+    table.insert(order, "BOSS")
+    for _, want in ipairs(order) do
+        if want ~= "SHRINE" or DungeonRun.acceptShrines then
+            for _, r in ipairs(rooms or {}) do
+                if r.type == want then return r end
             end
         end
     end
 end
 
-function DungeonBotModule.HandleBattle()
-    if #State.actions > 0 then
-        PlaybackModule.Play(true)
-        while State.replaying do task.wait(1) end
+-- One step of the auto run. Returns seconds to wait.
+function DungeonRun.Step()
+    local st = DungeonRun.Read()
+    if not st or ((not st.rooms or #st.rooms == 0) and not (st.shop and #st.shop > 0) and not st.dead) then
+        DungeonRun.status = DungeonRun.WAITING
+        DungeonRun.Refresh(st)
+        return 2
     end
-    local deadline = os.clock() + 600
-    while os.clock() < deadline and DungeonBot.enabled do
-        if isGameOver() then break end
-        task.wait(2)
+    if DungeonRun.blocked then
+        DungeonRun.status = DungeonRun.blocked
+        DungeonRun.Refresh(st)
+        return 2
     end
-end
-
-function DungeonBotModule.RunLoop()
-    DungeonBot.dungeonActive = true
-    DungeonBot.currentDepth = 0
-    DungeonBot.statusText = "Running"
-    refreshDungeonStatus()
-
-    while DungeonBot.enabled and DungeonBot.dungeonActive do
-        task.wait(2)
-        local rooms = DungeonBotModule.ReadRoomChoices()
-        if #rooms == 0 then
-            if isGameOver() then
-                DungeonBot.statusText = "Run ended"
-                DungeonBot.dungeonActive = false
-                refreshDungeonStatus()
-                notify("Dungeon run ended.")
-                if Webhook.notifyComplete then sendWebhook("Dungeon Complete", "Reached depth " .. DungeonBot.currentDepth) end
-                break
+    -- shop: wish-list items only (empty list = buy nothing), never more than the coins
+    if st.shop and #st.shop > 0 then
+        local wishes = DungeonRun.wishes()
+        for _, it in ipairs(st.shop) do
+            local name = string.lower(tostring(it.label or it.id or ""))
+            local wanted = false
+            for _, w in ipairs(wishes) do if name:find(w, 1, true) then wanted = true break end end
+            DungeonRun.bought = DungeonRun.bought or {}
+            local key = tostring(st.depth) .. ":" .. tostring(it.id or it.index)
+            if wanted and not DungeonRun.bought[key] and (not it.price or not st.coins or st.coins >= it.price) then
+                DungeonRun.bought[key] = true
+                local arg = it.id ~= nil and it.id or it.index
+                if arg == nil then break end
+                DungeonRun.status = "buying " .. tostring(it.label or arg)
+                local changed = DungeonRun.Call("dungeon_buy_shop", arg, st)
+                if not changed then
+                    DungeonRun.blocked = "dungeon_buy_shop(" .. tostring(arg) .. ") changed nothing - " .. DungeonRun.WAITING
+                end
+                return 1
             end
-            task.wait(2)
+        end
+    end
+    if st.dead then
+        if DungeonRun.autoContinueDeath and not DungeonRun.deathTried then
+            DungeonRun.deathTried = true
+            DungeonRun.status = "lost a room: continuing"
+            DungeonRun.Call("dungeon_continue_death", nil, st)
         else
-            DungeonBot.currentDepth = DungeonBot.currentDepth + 1
-            local pick = DungeonBotModule.PickRoom(rooms)
-            if not pick then
-                DungeonBot.statusText = "No room to pick"
-                refreshDungeonStatus()
-                task.wait(3)
-            else
-                DungeonBot.statusText = "Entering " .. pick.type .. " (depth " .. DungeonBot.currentDepth .. ")"
-                refreshDungeonStatus()
-                notify("Dungeon depth " .. DungeonBot.currentDepth .. ": picking " .. pick.type)
-
-                if pick.button then
-                    clickButton(pick.button)
-                end
-                task.wait(2)
-
-                if pick.type == "SHOP" then
-                    DungeonBotModule.HandleShop()
-                elseif pick.type == "BATTLE" or pick.type == "BOSS" then
-                    DungeonBotModule.HandleBattle()
-                elseif pick.type == "HOARD" or pick.type == "CHEST" then
-                    task.wait(5)
-                    local collectBtn = findScreenButton({ "collect", "claim", "open", "take" })
-                    if collectBtn then clickButton(collectBtn) end
-                    task.wait(2)
-                elseif pick.type == "SHRINE" then
-                    local acceptBtn = findScreenButton({ "accept", "yes", "confirm" })
-                    if acceptBtn then clickButton(acceptBtn) end
-                    task.wait(2)
-                end
-
-                local continueBtn = findScreenButton({ "continue", "next", "proceed" })
-                if continueBtn then
-                    clickButton(continueBtn)
-                    task.wait(1)
-                end
-            end
+            DungeonRun.status = "lost a room: auto continue after death is off"
         end
+        DungeonRun.Refresh(st)
+        return 2
     end
-
-    DungeonBot.dungeonActive = false
-    DungeonBot.statusText = "Idle"
-    refreshDungeonStatus()
+    DungeonRun.deathTried = nil
+    local room = DungeonRun.PickRoom(st.rooms)
+    if not room then
+        DungeonRun.status = "no room fits the settings (shrines off?) - pick one yourself"
+        DungeonRun.Refresh(st)
+        return 2
+    end
+    local arg = room.id ~= nil and room.id or room.index
+    if arg == nil then
+        DungeonRun.status = DungeonRun.WAITING
+        DungeonRun.Refresh(st)
+        return 2
+    end
+    DungeonRun.status = string.format("entering %s (%s %s)", tostring(room.type), room.id ~= nil and "id" or "position", tostring(arg))
+    DungeonRun.Refresh(st)
+    local changed = DungeonRun.Call("dungeon_enter_room", arg, st)
+    if changed then
+        DungeonRun.picks = DungeonRun.picks or {}
+        table.insert(DungeonRun.picks, room.type)
+        DungeonRun.status = "entered " .. tostring(room.type)
+    else
+        DungeonRun.blocked = string.format("dungeon_enter_room(%s) changed nothing - %s", tostring(arg), DungeonRun.WAITING)
+    end
+    DungeonRun.Refresh()
+    return 1
 end
 
-function DungeonBotModule.Start()
-    if DungeonBot.dungeonActive then return end
-    DungeonBot.enabled = true
-    task.spawn(DungeonBotModule.RunLoop)
+function DungeonRun.Start()
+    DungeonRun.gen = (DungeonRun.gen or 0) + 1
+    local gen = DungeonRun.gen
+    DungeonRun.enabled, DungeonRun.blocked = true, nil
+    task.spawn(function()
+        while DungeonRun.enabled and gen == DungeonRun.gen and not State.unloaded do
+            local ok, wait = pcall(DungeonRun.Step)
+            if not ok then DungeonRun.status = "error: " .. clip(tostring(wait), 80) wait = 3 end
+            task.wait(wait or 2)
+        end
+    end)
 end
 
-function DungeonBotModule.Stop()
-    DungeonBot.enabled = false
-    DungeonBot.dungeonActive = false
-    DungeonBot.statusText = "Stopped"
-    refreshDungeonStatus()
+function DungeonRun.Stop()
+    DungeonRun.enabled = false
+    DungeonRun.gen = (DungeonRun.gen or 0) + 1
+    DungeonRun.status = "Off"
+    DungeonRun.Refresh(false)
+end
 end
 
 --------------------------------------------------------------------------------
@@ -6082,8 +6424,8 @@ end
 -- UI
 --------------------------------------------------------------------------------
 Window = MacLib:Window({
-    Title = "MACRO // LAB",
-    Subtitle = "AA macro + auto farm",
+    Title = "moseeri hub",
+    Subtitle = "Anime Adventures auto farm",
     Size = UDim2.fromOffset(868, 650),
     DragStyle = 1,
     DisabledWindowControls = {},
@@ -6114,13 +6456,19 @@ watchCamera()
 table.insert(State.connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchCamera))
 
 local tabGroup = Window:TabGroup()
+-- Menu order: Home, Lobby, Dungeon, Event, Macro, Advanced, Settings (made here, filled below)
+UIRef.tabs = {}
+for _, t in ipairs({ { "home", "Home" }, { "lobby", "Lobby" }, { "dungeon", "Dungeon" }, { "event", "Event" },
+    { "macro", "Macro" }, { "advanced", "Advanced" }, { "settings", "Settings" } }) do
+    UIRef.tabs[t[1]] = tabGroup:Tab({ Name = t[2], Image = "rbxassetid://10734950309" })
+end
 -- Each tab is built inside its own do-block: Lua 5.1 allows only 200 active locals per
 -- function, and the section variables are not needed once a tab is built.
 local macroTab, refreshProfileUI
 
 -- TAB 1: Macro (record / play / files)
 do
-macroTab = tabGroup:Tab({ Name = "Macro", Image = "rbxassetid://10734950309" })
+macroTab = UIRef.tabs.macro
 
 local controlSection = macroTab:Section({ Side = "Left" })
 local fileSection = macroTab:Section({ Side = "Right" })
@@ -6192,9 +6540,9 @@ UIRef.pasteInput = fileSection:Input({
 
 end
 
--- TAB 2: Auto Farm (replay automation)
+-- Advanced tab: stage automation (was the Auto Farm tab)
 do
-local autoTab = tabGroup:Tab({ Name = "Auto Farm", Image = "rbxassetid://10734950309" })
+local autoTab = UIRef.tabs.advanced
 AutoPlaceModule.farmTab = autoTab -- Auto Place sections are added to this tab further down
 
 local autoReplaySection = autoTab:Section({ Side = "Left" })
@@ -6269,15 +6617,24 @@ Controls.speedMultiplier = autoExtraSection:Slider({
 
 end
 
--- TAB 3: Units (AI)
+-- Advanced tab: unit abilities and buff rotation (was the Units tab)
 do
-local unitsTab = tabGroup:Tab({ Name = "Units", Image = "rbxassetid://10734950309" })
+local unitsTab = UIRef.tabs.advanced
 
 local abilitySection = unitsTab:Section({ Side = "Left" })
-local buffSection = unitsTab:Section({ Side = "Right" })
 
-abilitySection:Header({ Text = "Auto abilities" })
-UIRef.unitStatusParagraph = abilitySection:Paragraph({ Header = "Status", Body = "All off" })
+-- (check interval, buff gap, buff length and min units keep their saved / default values;
+-- they are no longer on screen)
+abilitySection:Header({ Text = "Buffs and abilities" })
+UIRef.autoBuffToggle = abilitySection:Toggle({
+    Name = "Auto use buffs",
+    Default = false,
+    Callback = function(on)
+        UnitAI.autoBuff = on
+        if on then UnitAIModule.StartBuff() else UnitAIModule.StopBuff() end
+        refreshUnitStatus(); saveConfig()
+    end,
+}, "AutoBuff")
 UIRef.autoAbilitiesToggle = abilitySection:Toggle({
     Name = "Auto use unit abilities",
     Default = false,
@@ -6287,65 +6644,21 @@ UIRef.autoAbilitiesToggle = abilitySection:Toggle({
         refreshUnitStatus(); saveConfig()
     end,
 }, "AutoAbilities")
-Controls.abilityCooldown = abilitySection:Slider({
-    Name = "Check every (seconds)",
-    Minimum = 1,
-    Maximum = 30,
-    Default = UnitAI.abilityCooldown,
-    Callback = function(v) UnitAI.abilityCooldown = v; refreshUnitStatus(); saveConfig() end,
-}, "AbilityCooldown")
-abilitySection:Paragraph({ Header = "", Body = "Damage abilities: fired only while the unit\nis attacking." })
-
-buffSection:Header({ Text = "Buff rotation" })
-UIRef.autoBuffToggle = buffSection:Toggle({
-    Name = "Auto use buffs",
-    Default = false,
-    Callback = function(on)
-        UnitAI.autoBuff = on
-        if on then UnitAIModule.StartBuff() else UnitAIModule.StopBuff() end
-        refreshUnitStatus(); saveConfig()
-    end,
-}, "AutoBuff")
-Controls.buffGap = buffSection:Slider({
-    Name = "Gap between casts (0 = auto)",
-    Minimum = 0,
-    Maximum = 60,
-    Default = UnitAI.buffGap,
-    Callback = function(v) UnitAI.buffGap = v; refreshUnitStatus(); saveConfig() end,
-}, "BuffGap")
-Controls.buffDuration = buffSection:Slider({
-    Name = "Buff lasts (s, 0 = measure)",
-    Minimum = 0,
-    Maximum = 60,
-    Default = UnitAI.buffDuration,
-    Callback = function(v) UnitAI.buffDuration = v; refreshUnitStatus(); saveConfig() end,
-}, "BuffDuration")
-Controls.minUnitsForBuff = buffSection:Slider({
-    Name = "Min units before buff starts",
-    Minimum = 1,
-    Maximum = 10,
-    Default = UnitAI.minUnitsForBuff,
-    Callback = function(v) UnitAI.minUnitsForBuff = v; refreshUnitStatus(); saveConfig() end,
-}, "MinUnitsForBuff")
-buffSection:Paragraph({ Header = "", Body = "Buff units of the same type cast one at a\ntime, a gap apart, so one buff is always on.\nAuto gap = cooldown / number of that unit\n(4 Wendy, 64 s cooldown -> every 16 s).\nSet the in-game Auto skill button to Off\nfor buff units, or they all cast together." })
-
-buffSection:Header({ Text = "Learn buff (if the loop does nothing)" })
-local learnedParagraph = buffSection:Paragraph({ Header = "Learned", Body = "" })
-local function refreshLearnedUI()
-    local kinds = {}
-    for kind, e in pairs(UnitAI.learned) do table.insert(kinds, kind .. "  (" .. e.name .. ")") end
-    table.sort(kinds)
-    pcall(function()
-        learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, "\n")
-            or "Nothing yet - the loop uses use_active_attack.")
-    end)
+UIRef.unitStatusParagraph = abilitySection:Paragraph({ Header = "Status", Body = "Buffs off · abilities off" })
+AutoPlaceModule.buffTroubleshoot = function(section)
+    section:Header({ Text = "Troubleshooting" })
+    local learnedParagraph = section:Paragraph({ Header = "Learned", Body = "" })
+    UnitAIModule.refreshLearnedUI = function()
+        local kinds = {}
+        for kind, e in pairs(UnitAI.learned) do table.insert(kinds, kind .. " (" .. e.name .. ")") end
+        table.sort(kinds)
+        pcall(function() learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, ", ") or "nothing learned (uses use_active_attack)") end)
+    end
+    UnitAIModule.refreshLearnedUI()
+    section:Button({ Name = "Learn buff (then click the skill)", Callback = UnitAIModule.StartLearn })
+    section:Button({ Name = "Forget learned buffs", Callback = UnitAIModule.ForgetLearned })
+    section:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport })
 end
-UnitAIModule.refreshLearnedUI = refreshLearnedUI
-refreshLearnedUI()
-buffSection:Button({ Name = "Learn buff (then click the skill)", Callback = UnitAIModule.StartLearn })
-buffSection:Paragraph({ Header = "", Body = "1. Click a buff unit (e.g. Windsong) in game.\n2. Press Learn buff.\n3. Click its skill (e.g. Sky Enchantment).\nRepeat for each buff unit type." })
-buffSection:Button({ Name = "Forget learned buffs", Callback = UnitAIModule.ForgetLearned })
-buffSection:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport })
 
 end
 
@@ -6355,7 +6668,6 @@ local placeTab = AutoPlaceModule.farmTab
 -- left: what is used every game; right: options, then how many of each slot
 local placeMain = placeTab:Section({ Side = "Left" })
 local placeOptions = placeTab:Section({ Side = "Right" })
-local placeSlots = placeTab:Section({ Side = "Right" })
 
 placeMain:Header({ Text = "Auto Place" })
 local placeStatus = placeMain:Paragraph({ Header = "Status", Body = "Off" })
@@ -6377,6 +6689,7 @@ local PRESETS = {
     ["Fast farm"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
     ["Safe"] = { placeMode = "Safe", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = false },
 }
+AutoPlaceModule.PRESETS = PRESETS
 function AutoPlaceModule.ApplyPreset(name)
     local p = PRESETS[name]
     AutoPlace.preset = name
@@ -6389,6 +6702,7 @@ function AutoPlaceModule.ApplyPreset(name)
             pcall(function() setToggle(c, v) end)
         end
         pcall(function() Controls.placeMode:UpdateSelection(p.placeMode) end)
+        pcall(function() if Controls.homeMode then Controls.homeMode:UpdateSelection(name) end end)
         pcall(refreshAutoStatus)
         notify("Preset " .. name .. ": " .. p.placeMode .. " placement, skip waves " .. (p.autoSkip and "on" or "off"))
     end
@@ -6445,57 +6759,211 @@ Controls.showDetails = placeOptions:Toggle({
     Callback = function(on) AutoPlace.showDetails = on; saveConfig(); AutoPlaceModule.refreshUI() end,
 }, "AutoPlaceDetails")
 
-placeSlots:Header({ Text = "Units per slot" })
-Controls.placeSlots = {}
-for s = 1, 6 do
-    Controls.placeSlots[s] = placeSlots:Slider({
-        Name = "Slot " .. s,
-        Minimum = 0,
-        Maximum = 8,
-        Default = AutoPlace.slots[s] or 0,
-        Callback = function(v) AutoPlace.slots[s] = v; saveConfig() end,
-    }, "PlaceSlot" .. s)
+-- "Don't place": the team's units by name; a picked unit's slot gets 0 (never placed), the
+-- others 8 (up to the game limit). Saved as AutoPlace.slots like the old per-slot sliders,
+-- so a saved 0 shows as picked. The names follow the team each time it is read.
+function AutoPlaceModule.TeamNames()
+    local names, bySlot = {}, {}
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s] or (AutoPlace.lastTeam or {})[tostring(s)]
+        local name = t and t.name and tostring(t.name)
+        if name and name ~= "" then
+            bySlot[s] = name
+            if not table.find(names, name) then table.insert(names, name) end
+        end
+    end
+    return names, bySlot
 end
-placeSlots:Paragraph({ Header = "", Body = "Team order, slot 1 first; 8 = game limit." })
+function AutoPlaceModule.refreshSkipUI()
+    if not Controls.dontPlace then return end
+    local names, bySlot = AutoPlaceModule.TeamNames()
+    local picked = {}
+    for s, name in pairs(bySlot) do
+        if (tonumber(AutoPlace.slots[s]) or 8) <= 0 then picked[name] = true end
+    end
+    local was = syncing
+    syncing = true
+    pcall(function()
+        local key = table.concat(names, ",")
+        if key ~= AutoPlaceModule.skipNames then
+            AutoPlaceModule.skipNames = key
+            Controls.dontPlace:ClearOptions()
+            Controls.dontPlace:InsertOptions(names)
+        end
+        Controls.dontPlace:UpdateSelection(picked)
+    end)
+    syncing = was
+end
+Controls.dontPlace = placeOptions:Dropdown({
+    Name = "Don't place",
+    Multi = true,
+    Required = false,
+    Options = (AutoPlaceModule.TeamNames()),
+    Default = {},
+    Callback = function(value)
+        if syncing then return end
+        -- MacLib gives { [name] = true }; a plain list of names works too
+        local picked = {}
+        for k, v in pairs(type(value) == "table" and value or {}) do
+            if v == true then picked[tostring(k)] = true elseif type(v) == "string" then picked[v] = true end
+        end
+        local _, bySlot = AutoPlaceModule.TeamNames()
+        for s = 1, 6 do
+            if bySlot[s] then AutoPlace.slots[s] = picked[bySlot[s]] and 0 or 8 end
+        end
+        saveConfig()
+    end,
+}, "AutoPlaceDontPlace")
 end
 
--- TAB 4: Dungeon
+-- Advanced tab, last: buff troubleshooting (learn a buff skill, buff report)
+AutoPlaceModule.buffTroubleshoot(UIRef.tabs.advanced:Section({ Side = "Left" }))
+
+-- TAB: Home - one AUTO switch for the whole farming set, the mode, and one status line
 do
-local dungeonTab = tabGroup:Tab({ Name = "Dungeon", Image = "rbxassetid://10734950309" })
-
-local dungeonMainSection = dungeonTab:Section({ Side = "Left" })
-local dungeonConfigSection = dungeonTab:Section({ Side = "Right" })
-
-dungeonMainSection:Header({ Text = "Auto dungeon run" })
-UIRef.dungeonStatusParagraph = dungeonMainSection:Paragraph({ Header = "Status", Body = "Idle" })
-dungeonMainSection:Toggle({
-    Name = "Enable dungeon bot",
+local home = UIRef.tabs.home:Section({ Side = "Left" })
+home:Header({ Text = "Auto farm" })
+-- AUTO on: Auto Place + Auto upgrade + buff rotation + unit abilities + smart time stop +
+-- auto target + auto vote start + auto skip (per mode); Auto replay / next stage come back
+-- as they were when AUTO was last turned off. AUTO off: all of them stop.
+function AutoPlaceModule.HomeAuto(on)
+    local mode = AutoPlace.preset == "Safe" and "Safe" or "Fast farm"
+    local p = AutoPlaceModule.PRESETS[mode] or {}
+    if on then
+        AutoPlace.upgrade, AutoPlace.smartFreeze, AutoPlace.autoTarget = true, true, true
+        AutoFarm.autoStart, AutoFarm.autoSkip = true, p.autoSkip == true
+        local keep = AutoPlaceModule.homeKeep
+        if keep then AutoFarm.autoReplay, AutoFarm.autoNextStage = keep.replay, keep.next end
+        UnitAI.autoBuff, UnitAI.autoAbilities, AutoPlace.enabled = true, true, true
+        UnitAIModule.StartBuff()
+        UnitAIModule.StartAbilities()
+        AutoPlaceModule.Start()
+    else
+        AutoPlaceModule.homeKeep = { replay = AutoFarm.autoReplay, next = AutoFarm.autoNextStage }
+        AutoFarm.autoReplay, AutoFarm.autoNextStage = false, false
+        AutoFarm.autoStart, AutoFarm.autoSkip = false, false
+        UnitAI.autoBuff, UnitAI.autoAbilities = false, false
+        UnitAIModule.StopBuff()
+        UnitAIModule.StopAbilities()
+        AutoPlaceModule.Stop()
+    end
+    -- the other tabs' switches show the same state (their callbacks only repeat it)
+    local wasReady = configReady
+    configReady = false
+    for c, v in pairs({ [Controls.autoPlace] = AutoPlace.enabled, [Controls.autoPlaceUpgrade] = AutoPlace.upgrade,
+        [Controls.smartFreeze] = AutoPlace.smartFreeze, [Controls.autoTarget] = AutoPlace.autoTarget,
+        [Controls.autoStart] = AutoFarm.autoStart, [Controls.autoSkip] = AutoFarm.autoSkip,
+        [UIRef.autoReplayToggle] = AutoFarm.autoReplay, [UIRef.autoNextToggle] = AutoFarm.autoNextStage,
+        [UIRef.autoBuffToggle] = UnitAI.autoBuff, [UIRef.autoAbilitiesToggle] = UnitAI.autoAbilities }) do
+        pcall(function() setToggle(c, v) end)
+    end
+    configReady = wasReady
+    pcall(refreshAutoStatus)
+    pcall(refreshUnitStatus)
+    saveConfig()
+    notify(on and ("AUTO on (" .. mode .. ")") or "AUTO off: farming stopped")
+end
+Controls.homeAuto = home:Toggle({
+    Name = "AUTO",
     Default = false,
     Callback = function(on)
-        if on then DungeonBotModule.Start() else DungeonBotModule.Stop() end
+        if syncing or not configReady then return end
+        AutoPlaceModule.HomeAuto(on)
+    end,
+}, "HomeAuto")
+Controls.homeMode = home:Dropdown({
+    Name = "Mode",
+    Multi = false,
+    Required = true,
+    Options = { "Fast farm", "Safe" },
+    Default = AutoPlace.preset == "Safe" and "Safe" or "Fast farm",
+    Callback = function(v)
+        if syncing or not configReady or type(v) ~= "string" or v == AutoPlace.preset then return end
+        AutoPlaceModule.ApplyPreset(v)
+    end,
+}, "HomeMode")
+UIRef.homeStatus = home:Paragraph({ Header = "Now", Body = "Waiting for a game" })
+function AutoPlaceModule.StageLine()
+    local stage = Stage.Pretty()
+    if not stage then return "Lobby" end
+    local wave = getCurrentWave and getCurrentWave() or 0
+    return stage .. (wave and wave > 0 and (" · Wave " .. wave) or "")
+end
+function AutoPlaceModule.HomeLine()
+    local first = (AutoPlaceModule.StatusText and select(2, pcall(AutoPlaceModule.StatusText)) or ""):match("Status: ([^\n]*)")
+    local where = AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage or "lobby")
+    return where .. " | " .. (first or AutoPlaceModule.status or "Off")
+end
+AutoPlaceModule.refreshHome = function()
+    pcall(function() UIRef.homeStatus:UpdateBody(AutoPlaceModule.HomeLine()) end)
+end
+end
+
+-- TAB: Lobby and Event - planned, waiting for game data
+do
+local lobby = UIRef.tabs.lobby:Section({ Side = "Left" })
+lobby:Header({ Text = "Lobby (planned)" })
+lobby:Paragraph({ Header = "Coming", Body = "Auto Join a stage, Bag view, Auto Open eggs\nand Portals. Needs remotes_and_hud.txt\n(Settings > Save unit catalog) and a game data\nreport taken on the stage-select screen." })
+local event = UIRef.tabs.event:Section({ Side = "Left" })
+event:Header({ Text = "Event (planned)" })
+event:Paragraph({ Header = "Coming", Body = "Fool's Hunt: random temporary units and\nspells, and card votes. Needs remotes_and_hud.txt\nand event_data.txt saved during the event with\nunits in the hotbar, and again while a card\nvote (Choose a card!) is on screen." })
+end
+
+-- TAB: Dungeon (data first; see MODULE: Dungeon Run)
+do
+local dungeonTab = UIRef.tabs.dungeon
+local dataSection = dungeonTab:Section({ Side = "Left" })
+local setSection = dungeonTab:Section({ Side = "Right" })
+
+dataSection:Header({ Text = "Dungeon data" })
+UIRef.dungeonStatus = dataSection:Paragraph({ Header = "Run", Body = DungeonRun.WAITING })
+dataSection:Button({ Name = "Refresh dungeon data", Callback = function() DungeonRun.Refresh() end })
+dataSection:Button({ Name = "Copy dungeon report", Callback = function() pcall(DungeonRun.Report) end })
+dataSection:Paragraph({ Header = "", Body = "In a run, on the room choice (and in a shop):\npress Copy dungeon report and send it.\nThe bot acts only on room / item ids it finds\nin the game's data; it never quits a run." })
+Controls.dungeonAuto = dataSection:Toggle({
+    Name = "Auto dungeon",
+    Default = false,
+    Callback = function(on)
+        if on then DungeonRun.Start() else DungeonRun.Stop() end
     end,
 }, "DungeonBot")
-dungeonMainSection:Button({ Name = "Discover remotes", Callback = DungeonBotModule.DiscoverRemotes })
-dungeonMainSection:Paragraph({ Header = "", Body = "Enter a dungeon first, then press Discover\nto find dungeon-specific remotes.\nThe bot reads room choices from the GUI\nand picks rooms by priority order." })
 
-dungeonConfigSection:Header({ Text = "Room priority" })
-dungeonConfigSection:Paragraph({ Header = "", Body = "Order: SHOP > HOARD > CHEST > SHRINE > BATTLE\nShop first = stack buffs before fights.\nBoss rooms are entered when forced." })
-Controls.shrineEnabled = dungeonConfigSection:Toggle({
-    Name = "Allow shrine rooms",
-    Default = DungeonBot.shrineEnabled,
-    Callback = function(on) DungeonBot.shrineEnabled = on; refreshDungeonStatus(); saveConfig() end,
+setSection:Header({ Text = "Choices" })
+Controls.dungeonPriority = setSection:Input({
+    Name = "Room priority",
+    Placeholder = "HOARD > CHEST > SHOP > BATTLE > SHRINE",
+    Default = DungeonRun.roomPriority,
+    AcceptedCharacters = "All",
+    Callback = function(text) DungeonRun.roomPriority = text or ""; DungeonRun.Refresh(false); saveConfig() end,
+}, "DungeonPriority")
+Controls.dungeonWish = setSection:Input({
+    Name = "Shop wish-list (names, comma separated)",
+    Placeholder = "empty = buy nothing",
+    Default = DungeonRun.wishList,
+    AcceptedCharacters = "All",
+    Callback = function(text) DungeonRun.wishList = text or ""; DungeonRun.Refresh(false); saveConfig() end,
+}, "DungeonWishList")
+Controls.shrineEnabled = setSection:Toggle({
+    Name = "Accept shrines (curse for more reward)",
+    Default = DungeonRun.acceptShrines,
+    Callback = function(on) DungeonRun.acceptShrines = on; DungeonRun.Refresh(false); saveConfig() end,
 }, "Shrine")
-Controls.autoBuyBuffs = dungeonConfigSection:Toggle({
-    Name = "Auto buy buffs in shop",
-    Default = DungeonBot.autoBuyBuffs,
-    Callback = function(on) DungeonBot.autoBuyBuffs = on; refreshDungeonStatus(); saveConfig() end,
-}, "AutoBuyBuffs")
-
+Controls.dungeonRareEnd = setSection:Toggle({
+    Name = "Open rare chests at the end",
+    Default = DungeonRun.openRareAtEnd,
+    Callback = function(on) DungeonRun.openRareAtEnd = on; saveConfig() end,
+}, "DungeonRareAtEnd")
+Controls.dungeonContinueDeath = setSection:Toggle({
+    Name = "Auto continue after a lost room",
+    Default = DungeonRun.autoContinueDeath,
+    Callback = function(on) DungeonRun.autoContinueDeath = on; saveConfig() end,
+}, "DungeonContinueDeath")
+setSection:Paragraph({ Header = "", Body = "Battles are normal games: Auto Place plays\nthem with your team. Chests are not opened\nautomatically yet (their data is unknown)." })
 end
 
 -- TAB 5: Settings
 do
-local settingsTab = tabGroup:Tab({ Name = "Settings", Image = "rbxassetid://10734950309" })
+local settingsTab = UIRef.tabs.settings
 
 local profileSection = settingsTab:Section({ Side = "Left" })
 local optionsSection = settingsTab:Section({ Side = "Left" })
@@ -6603,6 +7071,21 @@ Controls.notifyFail = webhookSection:Toggle({
     Default = Webhook.notifyFail,
     Callback = function(on) Webhook.notifyFail = on; saveConfig() end,
 }, "WebhookFail")
+Controls.pingId = webhookSection:Input({
+    Name = "Discord user ID to ping",
+    Placeholder = "digits only, empty = no ping",
+    Default = Webhook.pingId,
+    AcceptedCharacters = "Numeric",
+    Callback = function(text) Webhook.pingId = (tostring(text or ""):gsub("%D", "")); saveConfig() end,
+}, "PingUserId")
+for _, p in ipairs({ { "pingMythic", "Ping on Mythic / Secret drop", "PingMythic" }, { "pingBagFull", "Ping when the bag is full", "PingBagFull" },
+    { "pingDisconnect", "Ping on disconnect / kick", "PingDisconnect" }, { "pingLosses", "Ping after 2 losses in a row", "PingLosses" } }) do
+    Controls[p[1]] = webhookSection:Toggle({
+        Name = p[2],
+        Default = Webhook[p[1]] ~= false,
+        Callback = function(on) Webhook[p[1]] = on; saveConfig() end,
+    }, p[3])
+end
 webhookSection:Button({
     Name = "Send test report",
     Callback = function()
@@ -6696,6 +7179,7 @@ table.insert(State.connections, RunService.Heartbeat:Connect(function()
         refreshStatus()
         if UnitAI.autoBuff or UnitAI.autoAbilities then refreshUnitStatus() end
         if AutoPlace.enabled and AutoPlaceModule.refreshUI then AutoPlaceModule.refreshUI() end
+        if AutoPlaceModule.refreshHome then AutoPlaceModule.refreshHome() end
         if #State.actions ~= lastListedCount then
             lastListedCount = #State.actions
             refreshActionList()
@@ -6737,8 +7221,7 @@ local function shutdown()
     UnitAI.autoBuff = false
     Tools.antiAfk = false
     AutoPlace.enabled = false
-    DungeonBot.enabled = false
-    DungeonBot.dungeonActive = false
+    DungeonRun.enabled = false
     for _, connection in ipairs(State.connections) do connection:Disconnect() end
     if viewportConnection then viewportConnection:Disconnect() end
     if recordUnitConnection then recordUnitConnection:Disconnect() end
@@ -6799,8 +7282,13 @@ applyRuntimeFeatures = function()
     setControl(Controls.webhookUrl, Webhook.url)
     setControl(Controls.notifyComplete, Webhook.notifyComplete)
     setControl(Controls.notifyFail, Webhook.notifyFail)
-    setControl(Controls.shrineEnabled, DungeonBot.shrineEnabled)
-    setControl(Controls.autoBuyBuffs, DungeonBot.autoBuyBuffs)
+    setControl(Controls.pingId, Webhook.pingId)
+    for _, k in ipairs({ "pingMythic", "pingBagFull", "pingDisconnect", "pingLosses" }) do setControl(Controls[k], Webhook[k] ~= false) end
+    setControl(Controls.shrineEnabled, DungeonRun.acceptShrines)
+    setControl(Controls.dungeonRareEnd, DungeonRun.openRareAtEnd)
+    setControl(Controls.dungeonContinueDeath, DungeonRun.autoContinueDeath)
+    setControl(Controls.dungeonPriority, DungeonRun.roomPriority)
+    setControl(Controls.dungeonWish, DungeonRun.wishList)
     setControl(Controls.profileName, Profile.name)
 
     UnitAI.autoAbilities = pendingToggles.autoAbilities == true
@@ -6819,14 +7307,16 @@ applyRuntimeFeatures = function()
     setControl(Controls.autoTarget, AutoPlace.autoTarget)
     setControl(Controls.showDetails, AutoPlace.showDetails)
     pcall(function() Controls.preset:UpdateSelection(AutoPlace.preset) end)
-    for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
+    pcall(AutoPlaceModule.refreshSkipUI)
     AutoPlace.enabled = pendingToggles.autoPlace == true
     setControl(Controls.autoPlace, AutoPlace.enabled)
     if AutoPlace.enabled then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
+    setControl(Controls.homeAuto, AutoPlace.enabled)
+    pcall(function() Controls.homeMode:UpdateSelection(AutoPlace.preset == "Safe" and "Safe" or "Fast farm") end)
 
     refreshUnitStatus()
     refreshAutoStatus()
-    refreshDungeonStatus()
+    DungeonRun.Refresh(false)
     refreshProfileUI()
     configReady = wasReady
 end
@@ -6857,10 +7347,10 @@ end)
 refreshStatus()
 refreshAutoStatus()
 refreshUnitStatus()
-refreshDungeonStatus()
+DungeonRun.Refresh(false)
 ToolsModule.RefreshStats()
-macroTab:Select()
-notify("Macro UI v3 loaded — 5 tabs.")
+UIRef.tabs.home:Select()
+notify("moseeri hub loaded — 7 tabs.")
 return {
     Recording = RecordingModule,
     Playback = PlaybackModule,
@@ -6869,6 +7359,6 @@ return {
     Stage = Stage,
     AutoFarm = AutoFarmModule,
     UnitAI = UnitAIModule,
-    DungeonBot = DungeonBotModule,
+    DungeonRun = DungeonRun,
     Tools = ToolsModule,
 }
