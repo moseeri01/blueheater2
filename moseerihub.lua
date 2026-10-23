@@ -7356,6 +7356,90 @@ function Lobby.Worlds(mode)
     return out
 end
 
+-- The level id to lock for a world picked by name: Infinite = the world's infinite id, else
+-- the world's own levels in order (act 1 = first). From the game's Worlds and Levels data.
+function Lobby.LevelId(mode, worldName, act)
+    local found
+    pcall(function()
+        local worlds = require(ReplicatedStorage.src.Data.Worlds)
+        local levels = require(ReplicatedStorage.src.Data.Levels)
+        for id, w in pairs(worlds) do
+            if type(w) == "table" and w.name == worldName then
+                local kind = (w.legend_stage and "Legend") or (w.raid_world and "Raid") or "Story"
+                if mode == "Infinite" and kind == "Story" and type(w.infinite) == "table" and w.infinite.id then
+                    found = w.infinite.id
+                elseif kind == mode then
+                    local list = {}
+                    for lid, l in pairs(levels) do
+                        if type(l) == "table" and l.world == id and not l.infinite then table.insert(list, lid) end
+                    end
+                    table.sort(list, function(a, b)
+                        local ra = tonumber(levels[a].story_level_rank) or tonumber(tostring(a):match("(%d+)$")) or 0
+                        local rb = tonumber(levels[b].story_level_rank) or tonumber(tostring(b):match("(%d+)$")) or 0
+                        if ra ~= rb then return ra < rb end
+                        return tostring(a) < tostring(b)
+                    end)
+                    found = list[math.min(#list, math.max(1, act))] or found
+                end
+            end
+        end
+    end)
+    return found
+end
+
+-- Lobby rooms ("_lobbytemplategreen1" ...): models named _lobbytemplate* in the lobby.
+function Lobby.Rooms()
+    local out = {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Model") and d.Name:find("^_lobbytemplate") then table.insert(out, d.Name) end
+    end
+    table.sort(out)
+    return out
+end
+
+function Lobby.Status(text)
+    Lobby.statusText = text
+    pcall(function() UIRef.lobbyStatus:UpdateBody(text) end)
+end
+
+-- Auto join, as watched in the game: walk into a room, lock the level (room, level id,
+-- friends only, difficulty), start. A room that refuses is skipped for the next one.
+function Lobby.Join()
+    local c = Lobby.cfg
+    local level = Lobby.LevelId(c.mode, c.world, tonumber(c.act) or 1)
+    if not level then Lobby.Status("Auto join: pick a Stage for " .. c.mode) return false end
+    local join, lock, start = getAARemote("request_join_lobby"), getAARemote("request_lock_level"), getAARemote("request_start_game")
+    if not (join and lock and start) then Lobby.Status("Auto join: the game's join calls were not found") return false end
+    for _, room in ipairs(Lobby.Rooms()) do
+        local ok, reply = pcall(function() return join:InvokeServer(room) end)
+        if ok and reply ~= false then
+            task.wait(0.5)
+            pcall(function() lock:InvokeServer(room, level, c.joinFriends == true, c.difficulty) end)
+            task.wait(0.5)
+            pcall(function() start:InvokeServer(room) end)
+            Lobby.Status(string.format("Auto join: starting %s (%s) in %s", level, c.difficulty, room))
+            return true
+        end
+    end
+    Lobby.Status("Auto join: no free room")
+    return false
+end
+
+-- Every 5 s in the lobby (not while Watch is teaching): join again 20 s after a try.
+function Lobby.Loop()
+    while not State.unloaded do
+        local c = Lobby.cfg
+        local cfg = workspace:FindFirstChild("_MAP_CONFIG")
+        local isLobby = cfg and cfg:FindFirstChild("IsLobby")
+        if c.autoJoin and not State.watching and isLobby and isLobby.Value == true and c.mode ~= "Infinity Mansion"
+            and os.clock() - (Lobby.lastJoin or -1e9) > 20 then
+            Lobby.lastJoin = os.clock()
+            pcall(Lobby.Join)
+        end
+        task.wait(5)
+    end
+end
+
 -- Portal and item ids in the bag (pretty names), for the Portals and Bag cleaner lists.
 function Lobby.BagNames()
     local portals, items = {}, {}
@@ -7418,7 +7502,7 @@ local function picked(list) local m = {} for _, n in ipairs(list) do m[n] = true
 
 local join = UIRef.tabs.lobby:Section({ Side = "Left" })
 join:Header({ Text = "Auto join" })
-UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "Phase 1: settings are saved. Press Watch, then do each lobby action yourself once (join a stage, use a portal, delete an item, open an egg, claim a reward) so the next update can do them for you." })
+UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "Auto join works for Story, Infinite, Legend and Raid. Infinity Mansion, portals, cleaning, eggs and rewards wait for Watch: press it and do each of them yourself once." })
 join:Toggle({ Name = "Auto join", Default = Lobby.cfg.autoJoin, Callback = set("autoJoin") }, "LobbyAutoJoin")
 local worldDropdown
 join:Dropdown({ Name = "Join mode", Multi = false, Required = true,
@@ -7894,6 +7978,7 @@ task.spawn(function()
     applyRuntimeFeatures()
     configReady = true
     saveConfig()
+    task.spawn(Lobby.Loop)
     local restored = {}
     if UnitAI.autoAbilities then table.insert(restored, "Abilities") end
     if UnitAI.autoBuff then table.insert(restored, "Buff") end
