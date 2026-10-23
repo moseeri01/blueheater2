@@ -2665,11 +2665,60 @@ local failsInRow = 0
 local recentBad = {}
 local unknownTries = 0
 
-local function stageKey() return State.stage or "unknown" end
+-- Map fingerprint: event and Infinity Mansion stages keep one name while the map rotates
+-- (Fool's Hunt changes map every ~45 min), so the map itself is part of the key: where
+-- _BASES.player.base and _BASES.pve.base stand (or the player LANES bends), rounded to
+-- whole studs and hashed to 6 hex digits. Read again every 3 s and at each game start.
+function AutoPlaceModule.MapFingerprint(fresh)
+    local now = os.clock()
+    if not fresh and AutoPlaceModule.fpAt and now - AutoPlaceModule.fpAt < 3 then return AutoPlaceModule.fp end
+    local coords = {}
+    pcall(function()
+        local bases = workspace:FindFirstChild("_BASES")
+        local function add(inst)
+            local ok, p = pcall(function() return inst:IsA("BasePart") and inst.Position or inst:GetPivot().Position end)
+            if ok and p then
+                table.insert(coords, string.format("%d,%d,%d", math.floor(p.X + 0.5), math.floor(p.Y + 0.5), math.floor(p.Z + 0.5)))
+            end
+        end
+        for _, side in ipairs({ "player", "pve" }) do
+            local b = bases and bases:FindFirstChild(side)
+            local base = b and b:FindFirstChild("base")
+            if base then add(base) end
+        end
+        if #coords < 2 then
+            coords = {}
+            local pb = bases and bases:FindFirstChild("player")
+            local lanes = pb and pb:FindFirstChild("LANES")
+            for _, lane in ipairs(lanes and lanes:GetChildren() or {}) do
+                for _, bend in ipairs(lane:GetChildren()) do add(bend) end
+            end
+            table.sort(coords)
+        end
+    end)
+    local fp
+    if #coords > 0 then
+        local h = 5381
+        for c in table.concat(coords, "|"):gmatch(".") do h = (h * 33 + c:byte()) % 16777216 end
+        fp = string.format("%06x", h)
+    end
+    AutoPlaceModule.fp, AutoPlaceModule.fpAt, AutoPlaceModule.fpFrom = fp, now, table.concat(coords, " ")
+    return fp
+end
+
+-- Plain stage name (stage losses stay on it: the waves are the stage's, whatever the map).
+function AutoPlaceModule.StageName() return State.stage or "unknown" end
+
+-- Key for everything learned about the map (enemy path, hill trust): stage # fingerprint.
+local function stageKey()
+    local fp = AutoPlaceModule.MapFingerprint()
+    return fp and (AutoPlaceModule.StageName() .. "#" .. fp) or AutoPlaceModule.StageName()
+end
+AutoPlaceModule.StageKey = stageKey
 
 -- Losses remembered for this stage (see AutoPlace.stageLosses).
 function AutoPlaceModule.Losses()
-    return (AutoPlace.stageLosses or {})[stageKey()] or 0
+    return (AutoPlace.stageLosses or {})[AutoPlaceModule.StageName()] or 0
 end
 
 -- Placement mode in use: the chosen one, but Balanced turns Safe on a stage lost before.
@@ -2681,7 +2730,7 @@ end
 -- Called once per finished game.
 function AutoPlaceModule.OnResult(win)
     AutoPlace.stageLosses = AutoPlace.stageLosses or {}
-    local key, n = stageKey(), AutoPlaceModule.Losses()
+    local key, n = AutoPlaceModule.StageName(), AutoPlaceModule.Losses()
     if win then
         AutoPlace.stageLosses[key] = n > 1 and n - 1 or nil
     else
@@ -2691,9 +2740,36 @@ function AutoPlaceModule.OnResult(win)
     saveConfig()
 end
 
+-- A path saved before fingerprints (under the plain stage name) is taken over by this map
+-- only when it runs from this map's enemy base (a point within 15 studs of _BASES.pve.base);
+-- otherwise it is left alone for the map it came from and this map learns its own.
+function AutoPlaceModule.AdoptOldPath(key)
+    local name = AutoPlaceModule.StageName()
+    local old = AutoPlace.paths[name]
+    if key == name or type(old) ~= "table" or #old == 0 then return nil end
+    local spawn = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve")
+    if not spawn then return nil end
+    local fits = false
+    for _, q in ipairs(old) do
+        if type(q) == "table" and tonumber(q[1]) and tonumber(q[3]) then
+            local dx, dz = q[1] - spawn.X, q[3] - spawn.Z
+            if dx * dx + dz * dz < 225 then fits = true break end
+        end
+    end
+    if not fits then return nil end
+    AutoPlace.paths[name] = nil
+    if AutoPlace.hillBy[name] then AutoPlace.hillBy[key], AutoPlace.hillBy[name] = AutoPlace.hillBy[name], nil end
+    AutoPlace.paths[key] = old
+    saveConfig()
+    AutoPlaceModule.Note("old saved path matches this map: kept as " .. key)
+    return old
+end
+
 local function pathPoints()
     local key = stageKey()
-    AutoPlace.paths[key] = AutoPlace.paths[key] or {}
+    if not AutoPlace.paths[key] then
+        AutoPlace.paths[key] = AutoPlaceModule.AdoptOldPath(key) or {}
+    end
     return AutoPlace.paths[key]
 end
 
@@ -2973,8 +3049,10 @@ local function bestSpot(skip, role, range, kind, aoe)
     skip = skip or 0
     kind = kind or "ground"
     local pts = pathPoints()
-    if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor then
+    if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor
+        or AutoPlaceModule.candidatesKey ~= stageKey() then
         candidates, candidatesFor = buildCandidates(pts), #pts
+        AutoPlaceModule.candidatesKey = stageKey()
     end
     local mine, helpers, farms, buffers = {}, {}, {}, {}
     for _, u in ipairs(ownedUnits()) do
@@ -3347,17 +3425,43 @@ function AutoPlaceModule.AirCapable(name, level)
     return from ~= nil and (level or 0) >= from
 end
 
--- Number of flying enemies on the map (_stats.Flying 1 / true).
+-- Number of flying enemies on the map (_stats.Flying 1 / true). Also counts every enemy seen
+-- this game once (seen / seenFly), so the share of flyers is steady while a wave thins out.
+AutoPlaceModule.seen, AutoPlaceModule.seenN, AutoPlaceModule.seenFly = setmetatable({}, { __mode = "k" }), 0, 0
 function AutoPlaceModule.Flying()
     local folder = unitsFolder()
     local n = 0
     for _, u in ipairs(folder and folder:GetChildren() or {}) do
-        local st = u:FindFirstChild("_stats")
-        local fl = st and st:FindFirstChild("Flying")
-        if fl and (fl.Value == true or (tonumber(fl.Value) or 0) > 0) and isEnemy(u) then n = n + 1 end
+        if isEnemy(u) then
+            local st = u:FindFirstChild("_stats")
+            local fl = st and st:FindFirstChild("Flying")
+            local flies = fl ~= nil and (fl.Value == true or (tonumber(fl.Value) or 0) > 0)
+            if flies then n = n + 1 end
+            if AutoPlaceModule.seen[u] == nil then
+                AutoPlaceModule.seen[u] = flies
+                AutoPlaceModule.seenN = AutoPlaceModule.seenN + 1
+                if flies then AutoPlaceModule.seenFly = AutoPlaceModule.seenFly + 1 end
+            end
+        end
     end
     return n
 end
+
+-- Road trap units (Usopp: path_ability / max_path_units) hit flyers only as they pass a trap:
+-- not a full answer to them when the team has another air unit.
+function AutoPlaceModule.IsTrap(name)
+    local def = AutoPlaceModule.UnitDef(name)
+    if not def then return false end
+    if def.max_path_units ~= nil then return true end
+    local id = def.primary_attack_no_upgrades or def.primary_attack
+    local ok, entry = pcall(function()
+        local m = ReplicatedStorage.src.Data:FindFirstChild("Attacks")
+        local mod = m and require(m)
+        return type(mod) == "table" and mod[id] or nil
+    end)
+    return ok and type(entry) == "table" and entry.path_ability ~= nil
+end
+
 
 local function normUuid(u) return (tostring(u):gsub("[{}%s]", "")) end
 
@@ -3370,6 +3474,44 @@ local function placedOf(uuid)
         if v and normUuid(v.Value) == want then table.insert(list, u) end
     end
     return list
+end
+
+-- Air focus is a quota, not a lock: while flyers are about, the air-capable share of the
+-- placed damage (damage / s) should reach max(40%, share of flyers among enemies seen).
+-- Below it, the next damage unit placed / upgraded is an air-capable one; above it the
+-- normal order goes on. Traps count half when the team has another air unit.
+function AutoPlaceModule.AirNeed()
+    if not AutoPlaceModule.flying then AutoPlaceModule.airShare = nil return false end
+    -- another air unit that is on the map or can go down now (a hill unit with no hill spot
+    -- does not count: then the trap unit is the whole answer)
+    local realAir = false
+    for _, tm in pairs(AutoPlaceModule.team) do
+        if (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" and AutoPlaceModule.AirCapable(tm.name, math.huge)
+            and not AutoPlaceModule.IsTrap(tm.name) then
+            local placedNow = #placedOf(tm.uuid) > 0
+            local blocked = AutoPlaceModule.full[tm.uuid] or (AutoPlaceModule.noSpot[tm.uuid] or 0) > os.clock()
+            if placedNow or not blocked then realAir = true end
+        end
+    end
+    AutoPlaceModule.airRealInTeam = realAir
+    local air, total = 0, 0
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" then
+            local name = unitType(u)
+            local lvl = u:FindFirstChild("_stats") and u._stats:FindFirstChild("upgrade")
+            local s = AutoPlaceModule.Stats({ name = name, placedSample = u })
+            -- (a placed copy's own _stats.damage already includes its upgrades)
+            local grown = u._stats:FindFirstChild("damage") and 1 or (1 + 0.5 * (lvl and tonumber(lvl.Value) or 0))
+            local d = s.damage / math.max(0.1, s.cooldown) * grown
+            total = total + d
+            if AutoPlaceModule.AirCapable(name, lvl and tonumber(lvl.Value) or 0) then
+                air = air + d * ((realAir and AutoPlaceModule.IsTrap(name)) and 0.5 or 1)
+            end
+        end
+    end
+    local target = math.max(0.4, AutoPlaceModule.seenFly / math.max(1, AutoPlaceModule.seenN))
+    AutoPlaceModule.airShare, AutoPlaceModule.airTarget = total > 0 and air / total or 0, target
+    return air <= 0 or air / total < target
 end
 
 local function numbersOnPlayer()
@@ -3582,14 +3724,15 @@ end
 -- Farms go lowest level first; damage units go by the most damage gained per ¥, so the
 -- strongest unit (best trait / rolls / upgrade path) is pushed up first instead of spreading
 -- thin. Control units (time stop) upgrade one copy to max before the next (ControlUp.focus).
--- onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
-local function upgradeStep(money, onlyRole)
+-- onlyRole limits it to one role, airOnly to units that hit flyers. Returns seconds to wait,
+-- or nil when nothing is left.
+local function upgradeStep(money, onlyRole, airOnly)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
     local RANK = { farm = 1, dps = 2, support = 2 }
     local pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir
     -- flying enemies on the map: damage units that can hit them (after this upgrade) go first
-    local air = AutoPlaceModule.flying ~= nil
+    local air = AutoPlaceModule.airNeed == true
     local now = os.clock()
     local units = ownedUnits()
     local focus = ControlUp.focus(units, now)
@@ -3604,7 +3747,10 @@ local function upgradeStep(money, onlyRole)
                 local rank = RANK[role] or 2
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
-                if not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
+                    and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
+                if airOnly and not isAir then
+                    -- skip: only units that hit flyers this time
+                elseif not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
                     or (rank == pickRank and isAir == pickAir and score > pickScore) then
                     pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir = u, level, rank, cost, score, role, isAir
                 end
@@ -3841,7 +3987,7 @@ end
 -- In danger, the best-value damage unit first and nothing else (returns "upgrade" when none
 -- is left). 5th result: the team's strongest damage unit (best damage per ¥) is on the map.
 local function chooseNext(prices, danger)
-    local list, dpsPlaced, airPlaced = {}, 0, 0
+    local list, dpsPlaced = {}, 0
     local strongest, strongestDown
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
@@ -3851,7 +3997,6 @@ local function chooseNext(prices, danger)
             t.placedSample = copies[1]
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
-            if role == "dps" and AutoPlaceModule.AirCapable(t.name, math.huge) then airPlaced = airPlaced + placed end
             local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99,
                 AutoPlaceModule.TraitMods(t.traits).cap or 99)
             -- slots set to 0 or found full with none down do not count as the strongest
@@ -3878,12 +4023,14 @@ local function chooseNext(prices, danger)
     -- (flying enemies on the map: the best one that can hit them, when one is left to place)
     local function bestDps()
         local best
-        local air = AutoPlaceModule.flying ~= nil
+        local air = AutoPlaceModule.airNeed == true
         for _, e in ipairs(list) do
             if e.role == "dps" then
                 e.value = AutoPlaceModule.Value(e.t, e.cost ~= math.huge and e.cost or nil)
-                e.air = air and AutoPlaceModule.AirCapable(e.t.name, 0)
-                if not best or (e.air and not best.air) or (e.air == best.air
+                -- 2 = air unit, 1 = road trap (when the team has another air unit), 0 = ground
+                e.air = (air and AutoPlaceModule.AirCapable(e.t.name, 0)) and
+                    ((AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(e.t.name)) and 1 or 2) or 0
+                if not best or e.air > best.air or (e.air == best.air
                     and (e.value > best.value or (e.value == best.value and e.cost < best.cost))) then best = e end
             end
         end
@@ -3891,10 +4038,6 @@ local function chooseNext(prices, danger)
     end
     if danger then
         local best = bestDps()
-        -- flying enemies and every unit that can hit them is down: upgrade those, not more ground units
-        if best and AutoPlaceModule.flying and not best.air and airPlaced > 0 then
-            return nil, nil, "upgrade", dpsPlaced, strongestDown
-        end
         if best then return best.slot, best.t, best.role, dpsPlaced, strongestDown end
         return nil, nil, "upgrade", dpsPlaced, strongestDown
     end
@@ -3907,6 +4050,11 @@ local function chooseNext(prices, danger)
     end
     -- the best-value damage unit, then the farms, then support (cheaper upgrades before upgrading)
     local pick = (dpsPlaced == 0 and bestDps()) or cheapest("farm") or cheapest("support")
+    -- air share below its quota: the next damage unit is an air-capable one (if one is left)
+    if not pick and AutoPlaceModule.airNeed then
+        local best = bestDps()
+        if best and best.air > 0 then pick = best end
+    end
     if not pick then
         for _, e in ipairs(list) do e.value = AutoPlaceModule.Value(e.t, e.cost ~= math.huge and e.cost or nil) end
         table.sort(list, function(a, b)
@@ -3995,15 +4143,31 @@ local function tick()
         end
     end
     AutoPlaceModule.flying = flying
+    AutoPlaceModule.airNeed = AutoPlaceModule.AirNeed()
     if flying and AutoPlaceModule.flyWarned then AutoPlaceModule.problem = "flying enemies: no hill or hybrid unit in the team" end
     if not danger then
         -- strong enemies on the map: put the money into damage now, before they reach the base
-        local threat = AutoPlaceModule.Threat() or flying
-        if threat and threat ~= AutoPlaceModule.threat and threat ~= flying then AutoPlaceModule.Note(threat .. ": damage units first") end
+        -- (flyers alone are not a threat: they only steer which damage unit comes next, AirNeed)
+        local threat = AutoPlaceModule.Threat()
+        if threat and threat ~= AutoPlaceModule.threat then AutoPlaceModule.Note(threat .. ": damage units first") end
         AutoPlaceModule.threat = threat
         danger = threat ~= nil
     end
     local slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, danger)
+    -- air quota not met but no air unit can go down now (no hill spot, at its limit): say so
+    -- once and go on in the normal order, never stall
+    if AutoPlaceModule.airNeed and t and role == "dps" and not AutoPlaceModule.AirCapable(t.name, 0) and not AutoPlaceModule.airFallbackNoted then
+        AutoPlaceModule.airFallbackNoted = true
+        AutoPlaceModule.Note("flying enemies: no air unit can be placed now (no spot / limit) - normal order")
+    end
+    -- most enemies fly (or they get through) and every air copy is down: their upgrades come
+    -- before more ground copies; when none can be upgraded the normal order goes on
+    local flyShare = AutoPlaceModule.seenFly / math.max(1, AutoPlaceModule.seenN)
+    if AutoPlaceModule.airNeed and (flyShare >= 0.5 or danger) and AutoPlace.upgrade and t and role == "dps"
+        and not AutoPlaceModule.AirCapable(t.name, 0) then
+        local wait = upgradeStep(money, "dps", true)
+        if wait then return wait end
+    end
     if danger and not t then
         -- enemies are getting through and no damage unit is left to place: upgrade damage
         local wait = upgradeStep(money, "dps")
@@ -4304,8 +4468,11 @@ function AutoPlaceModule.Start()
             local started = data and data:FindFirstChild("GameStarted")
             local gameNow = started and started.Value
             if gameNow and not lastGame then
+                AutoPlaceModule.MapFingerprint(true)
                 AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
                 AutoPlaceModule.flyWarned, AutoPlaceModule.flying = nil, nil
+                AutoPlaceModule.seenN, AutoPlaceModule.seenFly, AutoPlaceModule.airFallbackNoted = 0, 0, nil
+                AutoPlaceModule.seen = setmetatable({}, { __mode = "k" })
                 AutoPlaceModule.noSpot = {}
                 AutoPlaceModule.RefreshTeam()
             end
@@ -4396,6 +4563,7 @@ function AutoPlaceModule.StatusText()
         table.insert(lines, "Strongest (traits + rolls): " .. table.concat(parts, ", "))
     end
     table.insert(lines, string.format("Path: %d points for %s", #pathPoints(), stageKey()))
+    table.insert(lines, "Map fingerprint: " .. (AutoPlaceModule.MapFingerprint() or "none (no _BASES)") .. " from " .. (AutoPlaceModule.fpFrom ~= "" and AutoPlaceModule.fpFrom or "-"))
     if AutoPlaceModule.Losses() > 0 then
         table.insert(lines, string.format("Lost here %d time(s) lately: playing safer (%s placement)", AutoPlaceModule.Losses(), AutoPlaceModule.Mode()))
     end
@@ -4412,6 +4580,7 @@ end
 
 function AutoPlaceModule.MapReport()
     local lines = { "[Map report] " .. os.date("%H:%M:%S") .. " stage " .. stageKey() }
+    table.insert(lines, "map fingerprint: " .. (AutoPlaceModule.MapFingerprint(true) or "none (no _BASES)") .. " from " .. (AutoPlaceModule.fpFrom ~= "" and AutoPlaceModule.fpFrom or "-"))
     table.insert(lines, "getgc: " .. tostring(type(getgc) == "function") .. ", Raycast: " .. tostring(pcall(function() return RaycastParams.new() end)))
     AutoPlaceModule.RefreshTeam()
     for s = 1, 6 do
@@ -4755,8 +4924,22 @@ function AutoPlaceModule.MapReport()
                 table.insert(all, string.format("%s.%s(%s)", d.Parent and d.Parent.Name or "?", d.Name, d.ClassName))
             end
         end
-        table.sort(all)
-        table.insert(lines, clip(string.format("all remotes (%d): %s", #all, #all > 0 and table.concat(all, ", ") or "none"), 3000))
+        -- remotes for later features first (join / portals / eggs / event spells and cards), then the rest
+        local function wanted(r)
+            local l = string.lower(r)
+            for _, w in ipairs({ "place", "spawn", "spell", "card", "vote", "temporary", "fool", "april", "portal", "egg",
+                "capsule", "open", "use_item", "lobby", "join", "lock", "teleport" }) do
+                if l:find(w, 1, true) then return true end
+            end
+            return false
+        end
+        table.sort(all, function(a, b)
+            local wa, wb = wanted(a), wanted(b)
+            if wa ~= wb then return wa end
+            return a < b
+        end)
+        table.insert(lines, clip(string.format("all remotes (%d, wanted ones first; full list: Save unit catalog -> remotes_and_hud.txt): %s", #all,
+            #all > 0 and table.concat(all, ", ") or "none"), 6000))
     end)
     pcall(function()
         local cfg = workspace:FindFirstChild("_MAP_CONFIG")
@@ -4989,7 +5172,7 @@ end
 -- Depth-limited dump of one data module: numbers/strings/booleans printed, tables recursed,
 -- functions and instances skipped, cut at maxLen characters. Top-level keys (a stage, a
 -- level) are separated by a blank line.
-function Catalog.dump(value, maxLen)
+function Catalog.dump(value, maxLen, depth)
     local out, size, cut, seen = {}, 0, false, {}
     local function add(s)
         if cut then return end
@@ -5023,7 +5206,7 @@ function Catalog.dump(value, maxLen)
             end
         end
     end
-    if type(value) == "table" then walk(value, 3, "") else add(Catalog.text(value, 120)) end
+    if type(value) == "table" then walk(value, depth or 3, "") else add(Catalog.text(value, 120)) end
     return table.concat(out, "\n")
 end
 
@@ -5038,6 +5221,211 @@ function Catalog.save(file, text)
     end
     if type(setclipboard) == "function" and pcall(setclipboard, text) then return "clipboard" end
     return nil
+end
+
+-- "Save unit catalog" also writes AAMacro/remotes_and_hud.txt (data only, nothing is called):
+-- every remote under ReplicatedStorage.endpoints, the bottom hotbar slots (price "text" +
+-- "¥" symbol, or "LevelText" Lvl) with texts, images, attributes and values, a visible
+-- "Choose a card!" vote, and game tables (getgc) about temporary units / spells / cards.
+Catalog.EVENT_WORDS = { "temporary", "spell", "fool", "card", "april", "vote", "modifier" }
+function Catalog.guiNode(d, indent, out)
+    local bits = { indent .. d.Name .. " (" .. d.ClassName .. ")" }
+    pcall(function()
+        if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+            table.insert(bits, "text=" .. Catalog.text((tostring(d.Text):gsub("\n", " ")), 80))
+        end
+    end)
+    pcall(function()
+        if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+            local img = d.Image
+            if img ~= nil and img ~= "" then table.insert(bits, "image=" .. tostring(img)) end
+        end
+    end)
+    pcall(function()
+        if d:IsA("ValueBase") then table.insert(bits, "value=" .. Catalog.text(d.Value, 80)) end
+    end)
+    pcall(function()
+        local attrs, keys = d:GetAttributes(), {}
+        for k in pairs(attrs) do table.insert(keys, tostring(k)) end
+        table.sort(keys)
+        for _, k in ipairs(keys) do table.insert(bits, "@" .. k .. "=" .. Catalog.text(attrs[k], 60)) end
+    end)
+    table.insert(out, table.concat(bits, " "))
+end
+function Catalog.guiTree(root, depth, out, indent)
+    indent = indent or "  "
+    if #out > 4000 then return end
+    for _, c in ipairs(root:GetChildren()) do
+        Catalog.guiNode(c, indent, out)
+        if depth > 1 then Catalog.guiTree(c, depth - 1, out, indent .. "  ") end
+    end
+end
+function Catalog.remotesAndHud()
+    local out = { "# remotes_and_hud " .. os.date("%Y-%m-%d %H:%M:%S") .. " | stage " .. tostring(State.stage) }
+    -- (a) remotes, full path + class, no clipping
+    local remotes = {}
+    pcall(function()
+        local ep = ReplicatedStorage:FindFirstChild("endpoints")
+        for _, d in ipairs(ep and ep:GetDescendants() or {}) do
+            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("BindableEvent") or d:IsA("BindableFunction")
+                or d.ClassName == "UnreliableRemoteEvent" then
+                table.insert(remotes, d:GetFullName() .. " (" .. d.ClassName .. ")")
+            end
+        end
+    end)
+    table.sort(remotes)
+    table.insert(out, string.format("== remotes (%d) ==", #remotes))
+    for _, r in ipairs(remotes) do table.insert(out, r) end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    -- (b) hotbar slots: the frame that is one of several sibling slots holding a price / Lvl label
+    local markers = {}
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        pcall(function()
+            if not d:IsA("TextLabel") or isOwnGui(d) then return end
+            local hit = false
+            if d.Name == "text" then
+                local sym = d.Parent and d.Parent:FindFirstChild("symbol")
+                hit = sym ~= nil and sym:IsA("TextLabel") and tostring(sym.Text):find("¥", 1, true) ~= nil
+            elseif d.Name == "LevelText" then
+                hit = tostring(d.Text):find("Lvl", 1, true) ~= nil
+            end
+            if hit then table.insert(markers, d) end
+        end)
+    end
+    local function holdsMarker(node)
+        for _, m in ipairs(markers) do if m == node or m:IsDescendantOf(node) then return true end end
+        return false
+    end
+    local slots, seenSlot = {}, {}
+    for _, m in ipairs(markers) do
+        local node, slot = m.Parent, m.Parent
+        for _ = 1, 5 do
+            local p = node and node.Parent
+            if not p or p == gui then break end
+            local n = 0
+            for _, sib in ipairs(p:GetChildren()) do if holdsMarker(sib) then n = n + 1 end end
+            if n >= 2 then slot = node break end
+            node = p
+        end
+        if slot and not seenSlot[slot] then seenSlot[slot] = true table.insert(slots, slot) end
+    end
+    table.insert(out, "")
+    table.insert(out, string.format("== hotbar slots (%d) ==", #slots))
+    for i, slot in ipairs(slots) do
+        local names = {}
+        for _, c in ipairs(slot:GetChildren()) do table.insert(names, c.Name) end
+        table.insert(out, string.format("slot %d: %s | children: %s", i, slot:GetFullName(), table.concat(names, ", ")))
+        Catalog.guiNode(slot, "  self: ", out)
+        Catalog.guiTree(slot, 3, out, "  ")
+    end
+    -- (c) a visible "Choose a card!" vote: the screen it sits on
+    table.insert(out, "")
+    table.insert(out, "== card vote ==")
+    local cards = 0
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        local ok, hit = pcall(function()
+            return (d:IsA("TextLabel") or d:IsA("TextButton")) and not isOwnGui(d) and isOnScreen(d)
+                and string.lower(tostring(d.Text)):find("choose a card", 1, true) ~= nil
+        end)
+        if ok and hit and cards < 2 then
+            cards = cards + 1
+            local root = d:FindFirstAncestorWhichIsA("LayerCollector") or d.Parent
+            table.insert(out, "vote screen: " .. root:GetFullName() .. " (title " .. d:GetFullName() .. ")")
+            Catalog.guiTree(root, 6, out, "  ")
+        end
+    end
+    if cards == 0 then table.insert(out, "no 'Choose a card!' on screen") end
+    -- (d) game tables about temporary units / spells / cards / votes (shallow, max 20)
+    table.insert(out, "")
+    table.insert(out, "== getgc tables (event words: " .. table.concat(Catalog.EVENT_WORDS, ", ") .. ") ==")
+    local found = 0
+    pcall(function()
+        if type(getgc) ~= "function" then table.insert(out, "getgc not available") return end
+        for _, v in ipairs(getgc(true)) do
+            if found >= 20 then break end
+            if type(v) == "table" then
+                local hitKey
+                pcall(function()
+                    for k in pairs(v) do
+                        if type(k) == "string" then
+                            local lk = string.lower(k)
+                            for _, w in ipairs(Catalog.EVENT_WORDS) do
+                                if lk:find(w, 1, true) then hitKey = k break end
+                            end
+                        end
+                        if hitKey then break end
+                    end
+                end)
+                if hitKey then
+                    found = found + 1
+                    local parts, n = {}, 0
+                    pcall(function()
+                        for k, x in pairs(v) do
+                            n = n + 1
+                            if n > 40 then table.insert(parts, "...") break end
+                            table.insert(parts, tostring(k) .. "=" .. Catalog.text(x, 60))
+                        end
+                    end)
+                    table.insert(out, string.format("table %d (key %s): %s", found, hitKey, table.concat(parts, " ")))
+                end
+            end
+        end
+    end)
+    if found == 0 then table.insert(out, "none found") end
+    return table.concat(out, "\n")
+end
+
+-- AAMacro/event_data.txt: every ModuleScript under ReplicatedStorage whose table mentions an
+-- event word (Fool's Hunt cards / spells: Spellproof, Enemy Health, Refund, Astral ...) in a
+-- key or a string value, with its full path and a depth-4 dump (60 KB per module at most).
+-- Modules that error or are huge (over 200000 table entries) are skipped.
+Catalog.MODULE_WORDS = { "spellproof", "enemy health", "enemy speed", "aprilcoins", "april", "fool", "curse",
+    "blessing", "modifier", "refund", "astral", "ritual", "merge", "clone" }
+function Catalog.findWord(value)
+    local seen, count, hit = {}, 0, nil
+    local function str(s)
+        local l = string.lower(s)
+        for _, w in ipairs(Catalog.MODULE_WORDS) do
+            if l:find(w, 1, true) then return w end
+        end
+    end
+    local function walk(v, depth)
+        if hit or count > 200000 or depth > 8 or seen[v] then return end
+        seen[v] = true
+        for k, x in pairs(v) do
+            count = count + 1
+            if hit or count > 200000 then return end
+            if type(k) == "string" then hit = hit or (str(k) and (str(k) .. " in key " .. Catalog.text(k, 40))) end
+            if type(x) == "string" then hit = hit or (str(x) and (str(x) .. " in " .. Catalog.text(k, 30) .. "=" .. Catalog.text(x, 40)))
+            elseif type(x) == "table" then walk(x, depth + 1) end
+        end
+    end
+    if type(value) == "table" then walk(value, 1) end
+    if count > 200000 then return nil, "huge" end
+    return hit
+end
+function Catalog.eventData()
+    local blocks, scanned, skipped = {}, 0, 0
+    for _, m in ipairs(ReplicatedStorage:GetDescendants()) do
+        if m:IsA("ModuleScript") then
+            scanned = scanned + 1
+            local ok, value = pcall(require, m)
+            if ok and type(value) == "table" then
+                local okFind, hit, why = pcall(Catalog.findWord, value)
+                if okFind and hit then
+                    local okDump, body = pcall(Catalog.dump, value, 60000, 4)
+                    table.insert(blocks, "== " .. m:GetFullName() .. " (" .. hit .. ") ==\n" .. (okDump and body or "(dump failed)"))
+                elseif not okFind or why == "huge" then
+                    skipped = skipped + 1
+                end
+            elseif not ok then
+                skipped = skipped + 1
+            end
+        end
+    end
+    table.insert(blocks, 1, string.format("# event_data %s | %d modules scanned, %d with event words, %d skipped (error / huge) | words: %s",
+        os.date("%Y-%m-%d %H:%M:%S"), scanned, #blocks, skipped, table.concat(Catalog.MODULE_WORDS, ", ")))
+    return table.concat(blocks, "\n\n"), #blocks - 1
 end
 
 function AutoPlaceModule.SaveCatalog()
@@ -5108,6 +5496,25 @@ function AutoPlaceModule.SaveCatalog()
             end
         end)
     end
+    if where ~= "clipboard" then
+        local ok, text = pcall(Catalog.remotesAndHud)
+        if not ok then text = "remotes_and_hud failed: " .. tostring(text) end
+        local whereHud = Catalog.save("remotes_and_hud.txt", text)
+        notify(whereHud and string.format("Remotes + hotbar saved: %s (%d KB)", whereHud, math.ceil(#text / 1024))
+            or "Remotes + hotbar: not saved (no writefile here).")
+        local okEv, evText, hits = pcall(Catalog.eventData)
+        if not okEv then evText, hits = "event_data failed: " .. tostring(evText), 0 end
+        local whereEv = Catalog.save("event_data.txt", evText)
+        notify(whereEv and string.format("Event data saved: %s (%d KB, %d modules with event words)", whereEv, math.ceil(#evText / 1024), hits or 0)
+            or "Event data: not saved (no writefile here).")
+    end
+    -- every child of src.Data by full name, so modules not dumped here are known by name
+    pcall(function()
+        local names = {}
+        for _, c in ipairs(data and data:GetChildren() or {}) do table.insert(names, c:GetFullName() .. " (" .. c.ClassName .. ")") end
+        table.sort(names)
+        table.insert(blocks, 1, "== src.Data children (" .. #names .. ") ==\n" .. table.concat(names, "\n"))
+    end)
     if #blocks > 0 then
         local text = table.concat(blocks, "\n\n")
         local whereData = where == "clipboard" and nil or Catalog.save("game_data.txt", text)
