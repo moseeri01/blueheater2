@@ -99,6 +99,8 @@ local AutoPlace = {
     roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
     unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
     stageLosses = {},             -- [stage] = recent losses there (each win takes one off): play safer
+    preset = "Custom",            -- last preset picked ("Fast farm" / "Safe"); Custom = set by hand
+    showDetails = false,          -- full Auto Place status (team, ranking, 6 actions) instead of the short one
     placeMode = "Balanced",       -- damage units: "Safe" near our base, "Fast clear" near the enemy spawn
     lastTeam = {},                -- [slot] = { uuid, name } last read from game data (used when it is not readable)
     smartFreeze = true,           -- freeze skills (Shadowgirl timestop) only at the best moment
@@ -235,6 +237,7 @@ local function buildConfigData()
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
             unitInfo = next(AutoPlace.unitInfo or {}) and AutoPlace.unitInfo or nil,
             stageLosses = next(AutoPlace.stageLosses or {}) and AutoPlace.stageLosses or nil,
+            preset = AutoPlace.preset, showDetails = AutoPlace.showDetails,
             placeMode = AutoPlace.placeMode,
             lastTeam = next(AutoPlace.lastTeam or {}) and AutoPlace.lastTeam or nil,
             smartFreeze = AutoPlace.smartFreeze,
@@ -301,6 +304,8 @@ local function applyConfigData(data)
     end
     AutoPlace.placeMode = pick(ap.placeMode, "string", AutoPlace.placeMode)
     AutoPlace.smartFreeze = pick(ap.smartFreeze, "boolean", AutoPlace.smartFreeze)
+    AutoPlace.preset = pick(ap.preset, "string", AutoPlace.preset)
+    AutoPlace.showDetails = pick(ap.showDetails, "boolean", AutoPlace.showDetails)
     AutoPlace.sellFarmsLast = pick(ap.sellFarmsLast, "boolean", AutoPlace.sellFarmsLast)
     if type(ap.lastTeam) == "table" then
         AutoPlace.lastTeam = {}
@@ -3391,9 +3396,95 @@ local function nextUpgrade(u, level)
     return true, type(step) == "table" and tonumber(step.cost) or nil
 end
 
+-- Control skills (Shadowgirl's time stop, freeze, stun): each upgrade of a copy brings its
+-- skill back sooner / wider ("+ Temporal Grenade [-14s Timestop Cooldown]"), so one copy
+-- of the type is pushed to max before the next copy gets any upgrade.
+local ControlUp = {
+    -- a control skill counts as worth this share of the unit's own damage per second at its
+    -- base cooldown; a level that cuts the cooldown from 40 s to 30 s adds a third of that
+    WORTH = 1,
+    -- STAND-IN until the real skill-upgrade fields are known (the game data report lists
+    -- every upgrade level): when no level carries a skill field, each upgrade of a control
+    -- unit counts this share of its own damage per second on top of the damage it gains
+    BONUS = 0.5,
+    BASE_CD = 45, -- skill cooldown when neither the definition nor the unit says (Shadowgirl ~44 s)
+}
+
+-- Skill fields of one upgrade level: new skill cooldown, seconds cut off it, new skill
+-- reach (range / aoe / radius of the active), and whether any skill field was there.
+-- Field names are not known for sure: any key naming the active/skill/ability and a
+-- cooldown or reach counts, plus a "-14s Timestop Cooldown" style note text.
+function ControlUp.fields(step)
+    local cd, cut, reach, any, noteCut
+    for k, v in pairs(step) do
+        local key, n = string.lower(tostring(k)), tonumber(v)
+        local skill = key:find("active", 1, true) or key:find("skill", 1, true) or key:find("ability", 1, true)
+        if n and (key:find("cooldown", 1, true) or key:find("_cd", 1, true)) and (skill or (key:find("reduc", 1, true) and not key:find("attack", 1, true))) then
+            if key:find("reduc", 1, true) or key:find("cut", 1, true) then cut = (cut or 0) + math.abs(n) else cd = n end
+            any = true
+        elseif n and skill and (key:find("range", 1, true) or key:find("aoe", 1, true) or key:find("radius", 1, true) or key:find("size", 1, true)) then
+            reach, any = n, true
+        elseif type(v) == "string" and (key:find("note", 1, true) or key:find("desc", 1, true) or key == "text") then
+            for num, words in string.lower(v):gmatch("%-%s*([%d%.]+)%s*s%s+([%a ]-)%s*cooldown") do
+                if words ~= "attack" and words ~= "spa" and tonumber(num) then
+                    noteCut, any = (noteCut or 0) + tonumber(num), true
+                end
+            end
+        end
+    end
+    -- the note only counts when no number field says it already (no double cut)
+    if not cd and not cut then cut = noteCut end
+    return cd, cut, reach, any
+end
+
+-- Skill value of a control unit's next upgrade as a share of its own damage per second.
+function ControlUp.share(def, up, level)
+    local any = false
+    for _, step in ipairs(up) do
+        if type(step) == "table" and select(4, ControlUp.fields(step)) then any = true break end
+    end
+    if not any then return ControlUp.BONUS end
+    local cd = tonumber(def.active_attack_cooldown) or tonumber(def.active_cooldown) or ControlUp.BASE_CD
+    local reach = tonumber(def.active_attack_range) or tonumber(def.active_range)
+    local oldCd, oldReach = cd, reach
+    for i = 1, level + 1 do
+        if i == level + 1 then oldCd, oldReach = cd, reach end
+        local step = up[i]
+        if type(step) == "table" then
+            local c, cut, r = ControlUp.fields(step)
+            cd = math.max(1, (c or cd) - (cut or 0))
+            reach = r or reach
+        end
+    end
+    local gain = math.max(0, oldCd / cd - 1)
+    if oldReach and reach and oldReach > 0 then gain = gain + math.max(0, reach / oldReach - 1) end
+    return gain * ControlUp.WORTH
+end
+
+-- Copies of a control unit that may be upgraded now: per unit type only the copy with the
+-- highest level (tie: the first placed) until it is maxed. Other units are not in the set.
+function ControlUp.focus(units, now)
+    local best, out = {}, {}
+    for _, u in ipairs(units) do
+        if BuffRot.isControlSkill(u) and (ControlUp.fails[u] or 0) < now then
+            local level = AutoPlaceModule.StatNum(u, "upgrade") or 0
+            local key = unitType(u)
+            if nextUpgrade(u, level) and (not best[key] or level > best[key].level) then best[key] = { u = u, level = level } end
+        end
+    end
+    for _, b in pairs(best) do out[b.u] = true end
+    return out
+end
+-- allowed(u) is false only for a control copy that is not its type's focus copy
+function ControlUp.allowed(u, focus)
+    return focus[u] == true or not BuffRot.isControlSkill(u)
+end
+
 -- Damage per second a placed unit gains from its next upgrade, scaled by the copy's own
--- trait and rolls (a Golden / high-roll carry gains more from the same upgrade).
+-- trait and rolls (a Golden / high-roll carry gains more from the same upgrade); control
+-- units add the skill's worth (ControlUp.share).
 local upgradeFails = setmetatable({}, { __mode = "k" })
+ControlUp.fails = upgradeFails
 local function upgradeGain(u, level)
     local def = AutoPlaceModule.UnitDef(unitType(u))
     local up = def and (def.upgrade or def.upgrades)
@@ -3419,14 +3510,17 @@ local function upgradeGain(u, level)
     end
     -- same area-attack weight as Value, so "upgrade it or place another copy" compares like with like
     if AutoPlaceModule.IsAoe(unitType(u)) then mult = mult * AOE_VALUE end
-    return math.max(0, statsAt(level + 1) - statsAt(level)) * mult
+    local skill = BuffRot.isControlSkill(u) and ControlUp.share(def, up, level) * statsAt(level + 1) or 0
+    return (math.max(0, statsAt(level + 1) - statsAt(level)) + skill) * mult
 end
 
 -- Best damage gained per ¥ from upgrading any placed damage unit (0 when none can be upgraded).
 function AutoPlaceModule.BestUpgradeScore()
     local best, now = 0, os.clock()
-    for _, u in ipairs(ownedUnits()) do
-        if unitRole(u) == "dps" and (upgradeFails[u] or 0) < now then
+    local units = ownedUnits()
+    local focus = ControlUp.focus(units, now)
+    for _, u in ipairs(units) do
+        if unitRole(u) == "dps" and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus) then
             local lvl = u:FindFirstChild("_stats") and u._stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
             local can, cost = nextUpgrade(u, level)
@@ -3440,16 +3534,19 @@ end
 -- (Erwin, Wendy ...) are never upgraded: their buff does not grow with it, money wasted.
 -- Farms go lowest level first; damage units go by the most damage gained per ¥, so the
 -- strongest unit (best trait / rolls / upgrade path) is pushed up first instead of spreading
--- thin. onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
+-- thin. Control units (time stop) upgrade one copy to max before the next (ControlUp.focus).
+-- onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
 local function upgradeStep(money, onlyRole)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
     local RANK = { farm = 1, dps = 2, support = 2 }
     local pick, pickLevel, pickRank, pickCost, pickScore, pickRole
     local now = os.clock()
-    for _, u in ipairs(ownedUnits()) do
+    local units = ownedUnits()
+    local focus = ControlUp.focus(units, now)
+    for _, u in ipairs(units) do
         local role = unitRole(u)
-        if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now then
+        if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus) then
             local stats = u:FindFirstChild("_stats")
             local lvl = stats and stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
@@ -3477,7 +3574,7 @@ local function upgradeStep(money, onlyRole)
     end
     if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
         AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
-            pickRank == 2 and ", most damage per ¥" or ""))
+            BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
     elseif not (pickCost and money and money < pickCost) then
         -- refused with the money in hand: leave this unit for 30 s instead of retrying forever
         upgradeFails[pick] = now + 30
@@ -4041,7 +4138,32 @@ function AutoPlaceModule.ForgetPath()
     notify("Saved enemy path for " .. stageKey() .. " and unit limits cleared.")
 end
 
+-- Short status: what it is doing, the two strongest units and the last two actions.
+local function shortStatus()
+    local lines = { "Status: " .. AutoPlaceModule.status }
+    if AutoPlaceModule.danger then table.insert(lines, "DANGER: damage units first") end
+    if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
+    local rank = {}
+    for _, t in pairs(AutoPlaceModule.team) do
+        if AutoPlaceModule.RoleOf(t) == "dps" then
+            local st = AutoPlaceModule.Stats(t)
+            local aoe = AutoPlaceModule.IsAoe(t.name)
+            table.insert(rank, { name = t.name, dps = st.damage / math.max(0.1, st.cooldown) * (aoe and AOE_VALUE or 1) })
+        end
+    end
+    table.sort(rank, function(a, b) return a.dps > b.dps end)
+    if #rank > 0 then
+        table.insert(lines, "Strongest: " .. rank[1].name .. (rank[2] and (", then " .. rank[2].name) or ""))
+    end
+    local log = AutoPlaceModule.log
+    for i = #log, math.max(1, #log - 1), -1 do
+        table.insert(lines, string.format("%ds ago - %s", math.floor(os.clock() - log[i].at), log[i].text))
+    end
+    return table.concat(lines, "\n")
+end
+
 function AutoPlaceModule.StatusText()
+    if not AutoPlace.showDetails then return shortStatus() end
     local lines = { "Status: " .. AutoPlaceModule.status }
     if AutoPlaceModule.danger then table.insert(lines, "DANGER: enemies getting through - damage units first") end
     local team = {}
@@ -4390,6 +4512,57 @@ function AutoPlaceModule.MapReport()
     end
     table.insert(lines, "buttons on screen: " .. table.concat(shown, ", "))
 
+    -- data only, for a future Auto Join: every remote the game has (any sub-folder of
+    -- endpoints), and in the lobby the teleporters / rooms and the stage-selection UI
+    pcall(function()
+        local ep = ReplicatedStorage:FindFirstChild("endpoints")
+        local all = {}
+        for _, d in ipairs(ep and ep:GetDescendants() or {}) do
+            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("BindableEvent") or d:IsA("BindableFunction") then
+                table.insert(all, string.format("%s.%s(%s)", d.Parent and d.Parent.Name or "?", d.Name, d.ClassName))
+            end
+        end
+        table.sort(all)
+        table.insert(lines, clip(string.format("all remotes (%d): %s", #all, #all > 0 and table.concat(all, ", ") or "none"), 3000))
+    end)
+    pcall(function()
+        local cfg = workspace:FindFirstChild("_MAP_CONFIG")
+        local lobby = cfg and cfg:FindFirstChild("IsLobby")
+        if not (lobby and lobby.Value == true) then return end
+        local words = { "teleport", "elevator", "room", "lobby", "portal", "story", "raid", "infinite", "challenge" }
+        local rooms = 0
+        for _, obj in ipairs(workspace:GetChildren()) do
+            local n = string.lower(obj.Name)
+            for _, w in ipairs(words) do
+                if n:find(w, 1, true) and rooms < 12 then
+                    rooms = rooms + 1
+                    local kids, vals = {}, {}
+                    for _, c in ipairs(obj:GetChildren()) do
+                        if #kids < 15 then table.insert(kids, c.Name .. "(" .. c.ClassName .. ")") end
+                    end
+                    for _, d in ipairs(obj:GetDescendants()) do
+                        if d:IsA("ValueBase") and #vals < 15 then
+                            local ok, v = pcall(function() return d.Value end)
+                            table.insert(vals, d.Name .. "=" .. (ok and clip(tostring(v), 24) or "?"))
+                        end
+                    end
+                    table.insert(lines, clip(string.format("lobby %s (%s): children %s | values %s", obj.Name, obj.ClassName,
+                        #kids > 0 and table.concat(kids, ", ") or "none", #vals > 0 and table.concat(vals, " ") or "none"), 600))
+                    break
+                end
+            end
+        end
+        if rooms == 0 then table.insert(lines, "lobby: no teleporter / room / elevator objects found in workspace") end
+        local gui, texts = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui"), {}
+        for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+            if #texts >= 40 then break end
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and #d.Text > 0 and isOnScreen(d) and not isOwnGui(d) then
+                table.insert(texts, d.Name .. "=" .. clip(d.Text, 24))
+            end
+        end
+        table.insert(lines, clip("lobby screen texts: " .. (#texts > 0 and table.concat(texts, ", ") or "none"), 2000))
+    end)
+
     -- The game's own unit definitions: price, limit, farm, hill/ground, buff numbers.
     local src = ReplicatedStorage:FindFirstChild("src")
     local data = src and src:FindFirstChild("Data")
@@ -4430,6 +4603,21 @@ function AutoPlaceModule.MapReport()
                                 table.insert(parts, "upgrade[1]: " .. table.concat(first, " "))
                             end
                             table.insert(lines, string.format("data slot %d %s (%s): %s", wanted[id], id, m.Name, clip(table.concat(parts, " "), 1200)))
+                            -- every upgrade level, to learn the real skill-upgrade field names
+                            -- (time stop cooldown / reach) that ControlUp now only guesses
+                            if type(up) == "table" and #up > 0 then
+                                local levels = {}
+                                for n, step in ipairs(up) do
+                                    local kv = {}
+                                    if type(step) == "table" then
+                                        for k, v in pairs(step) do table.insert(kv, tostring(k) .. "=" .. short(v)) end
+                                        table.sort(kv)
+                                    end
+                                    table.insert(levels, n .. ": " .. table.concat(kv, " "))
+                                end
+                                table.insert(lines, string.format("upgrades slot %d %s (%d, active %s): %s", wanted[id], id, #up,
+                                    tostring(def.active_attack), clip(table.concat(levels, " | "), 1500)))
+                            end
                             wanted[id] = nil
                         end
                     end
@@ -4465,6 +4653,233 @@ function AutoPlaceModule.MapReport()
         notify("Game data report copied to clipboard - paste it to me.")
     else
         notify("Game data report printed to the console (F9).")
+    end
+end
+
+-- "Save unit catalog": one line per unit the game defines (src.Data.Units, every module
+-- and id) to AAMacro/unit_catalog.txt, plus a depth-limited dump of the other data modules
+-- (traits, waves, levels ...) to AAMacro/game_data.txt, so the real field names are known.
+local Catalog = {}
+function Catalog.text(v, n)
+    if type(v) == "table" then
+        local c = 0
+        for _ in pairs(v) do c = c + 1 end
+        return "{" .. c .. "}"
+    end
+    local s = tostring(v)
+    if #s > n then s = s:sub(1, n - 1) .. "~" end
+    return s
+end
+
+-- Flags of an Attacks entry (freeze, aoe, buff, path_ability ...) as "[a,b]", "" when none.
+function Catalog.flags(entry)
+    local flags = {}
+    if type(entry) == "table" then
+        for _, k in ipairs({ "freeze", "stun", "slow", "aoe", "aoe_dot", "cone", "line", "full", "circle", "buff", "heal", "spawn_unit", "path_ability" }) do
+            if entry[k] ~= nil then table.insert(flags, k) end
+        end
+    end
+    return #flags > 0 and (" [" .. table.concat(flags, ",") .. "]") or ""
+end
+
+-- A table's values (array) or keys (set), joined: _secondary_damage_types may be either.
+function Catalog.list(v)
+    if type(v) ~= "table" then return v ~= nil and Catalog.text(v, 30) or "-" end
+    local out = {}
+    for k, x in pairs(v) do
+        table.insert(out, type(k) == "number" and Catalog.text(x, 20) or tostring(k))
+    end
+    table.sort(out)
+    return #out > 0 and table.concat(out, ",") or "-"
+end
+
+-- One catalog line for unit id. tags = { [unit id] = "Farm,Timestop" } from src.Data.UnitTags.
+function Catalog.line(id, def, attacks, tags)
+    local function num(v) return tonumber(v) and tostring(tonumber(v)) or "-" end
+    local main = def.primary_attack_no_upgrades or def.primary_attack
+    local entry = type(main) == "string" and type(attacks[main]) == "table" and attacks[main] or nil
+    local shape = "?"
+    if entry and entry.path_ability ~= nil then
+        shape = "path"
+    elseif def.spawn_unit == true or (entry and entry.spawn_unit ~= nil) then
+        shape = "summoner"
+    elseif entry then
+        shape = "single"
+        for _, k in ipairs({ "aoe_dot", "aoe", "cone", "line", "full", "circle" }) do
+            if entry[k] ~= nil then shape = k break end
+        end
+    end
+    if type(main) == "string" then shape = shape .. " " .. Catalog.text(main, 40) .. Catalog.flags(entry) end
+    if def.max_path_units then shape = shape .. " max_path_units " .. num(def.max_path_units) end
+    local act = def.active_attack
+    local actText = "-"
+    if act ~= nil and tostring(act) ~= "nil" and tostring(act) ~= "" then
+        local a = attacks[tostring(act)]
+        actText = Catalog.text(act, 40) .. Catalog.flags(a)
+            .. (def.active_attack_cooldown and " cd " .. num(def.active_attack_cooldown) or "")
+        if type(a) == "table" and a.path_ability ~= nil then actText = actText .. " (path)" end
+    end
+    local place = {}
+    if def.hill_unit then table.insert(place, "hill") end
+    if def.hybrid_placement then table.insert(place, "hybrid") end
+    local up = def.upgrade or def.upgrades
+    local upText = "0"
+    if type(up) == "table" and #up > 0 then
+        local last = up[#up]
+        upText = tostring(#up)
+        if type(last) == "table" then
+            upText = upText .. string.format(" last dmg %s cd %s range %s cost %s", num(last.damage), num(last.attack_cooldown), num(last.range), num(last.cost))
+            -- skill fields anywhere in the levels (the names ControlUp looks for)
+            local skill = {}
+            for n, step in ipairs(up) do
+                if type(step) == "table" then
+                    for k, v in pairs(step) do
+                        local key = string.lower(tostring(k))
+                        if key:find("active", 1, true) or key:find("skill", 1, true) or key:find("ability", 1, true) or key:find("note", 1, true) or key:find("reduc", 1, true) then
+                            table.insert(skill, n .. ":" .. tostring(k) .. "=" .. Catalog.text(v, 30))
+                        end
+                    end
+                end
+            end
+            if #skill > 0 then upText = upText .. " skill " .. table.concat(skill, " ") end
+        end
+    end
+    local line = table.concat({ tostring(id), Catalog.text(def.name or def.display_name or "-", 30), Catalog.text(def.rarity or def.Rarity or "-", 14),
+        num(def.cost), num(def.spawn_cap), AutoPlaceModule.RoleFromDef(tostring(id)) or "?",
+        string.format("%s/%s/%s", num(def.damage), num(def.attack_cooldown), num(def.range)),
+        Catalog.text(def._base_damage_type or "-", 20) .. " +" .. Catalog.list(def._secondary_damage_types), shape, actText,
+        #place > 0 and table.concat(place, ",") or "-", num(def.farm_amount), tags[tostring(id)] or "-", upText }, " | ")
+    if #line > 400 then line = line:sub(1, 399) .. "~" end
+    return line
+end
+
+-- Depth-limited dump of one data module: numbers/strings/booleans printed, tables recursed,
+-- functions and instances skipped, cut at maxLen characters. Top-level keys (a stage, a
+-- level) are separated by a blank line.
+function Catalog.dump(value, maxLen)
+    local out, size, cut, seen = {}, 0, false, {}
+    local function add(s)
+        if cut then return end
+        if size + #s > maxLen then
+            table.insert(out, "...cut")
+            cut = true
+            return
+        end
+        table.insert(out, s)
+        size = size + #s + 1
+    end
+    local function walk(v, depth, indent)
+        local keys = {}
+        for k in pairs(v) do table.insert(keys, k) end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        for _, k in ipairs(keys) do
+            if cut then return end
+            local x = v[k]
+            local t = typeof and typeof(x) or type(x)
+            if indent == "" and #out > 0 then add("") end
+            if type(x) == "table" then
+                if depth <= 1 or seen[x] then
+                    add(indent .. tostring(k) .. " = " .. Catalog.text(x, 10))
+                else
+                    seen[x] = true
+                    add(indent .. tostring(k) .. ":")
+                    walk(x, depth - 1, indent .. "  ")
+                end
+            elseif t ~= "function" and t ~= "Instance" then
+                add(indent .. tostring(k) .. " = " .. Catalog.text(x, 120))
+            end
+        end
+    end
+    if type(value) == "table" then walk(value, 3, "") else add(Catalog.text(value, 120)) end
+    return table.concat(out, "\n")
+end
+
+-- Writes AAMacro/<file>; falls back to the clipboard. Returns where it went, or nil.
+function Catalog.save(file, text)
+    if hasFileApi() then
+        local ok = pcall(function()
+            ensureFolder(Config.Folder)
+            writefile(Config.Folder .. "/" .. file, text)
+        end)
+        if ok then return Config.Folder .. "/" .. file end
+    end
+    if type(setclipboard) == "function" and pcall(setclipboard, text) then return "clipboard" end
+    return nil
+end
+
+function AutoPlaceModule.SaveCatalog()
+    local src = ReplicatedStorage:FindFirstChild("src")
+    local data = src and src:FindFirstChild("Data")
+    local attacks, tags = {}, {}
+    pcall(function()
+        local ok, mod = pcall(require, data:FindFirstChild("Attacks"))
+        if ok and type(mod) == "table" then attacks = mod end
+    end)
+    -- UnitTags: { Farm = { "speedcart", ... } or { speedcart = true }, Timestop = ... }
+    pcall(function()
+        local ok, mod = pcall(require, data:FindFirstChild("UnitTags"))
+        if not (ok and type(mod) == "table") then return end
+        local names = {}
+        for tag in pairs(mod) do table.insert(names, tostring(tag)) end
+        table.sort(names)
+        for _, tag in ipairs(names) do
+            local members = mod[tag]
+            if type(members) == "table" then
+                for k, v in pairs(members) do
+                    local id = type(k) == "number" and tostring(v) or tostring(k)
+                    tags[id] = tags[id] and (tags[id] .. "," .. tag) or tag
+                end
+            end
+        end
+    end)
+    local lines, ids = {}, {}
+    local units = data and data:FindFirstChild("Units")
+    for _, m in ipairs(units and units:GetDescendants() or {}) do
+        if m:IsA("ModuleScript") then
+            pcall(function()
+                local ok, defs = pcall(require, m)
+                if not (ok and type(defs) == "table") then return end
+                for id, def in pairs(defs) do
+                    if type(def) == "table" and not ids[tostring(id)] then
+                        local ok2, line = pcall(Catalog.line, id, def, attacks, tags)
+                        ids[tostring(id)] = true
+                        table.insert(lines, ok2 and line or (tostring(id) .. " | error reading this unit"))
+                    end
+                end
+            end)
+        end
+    end
+    table.sort(lines)
+    table.insert(lines, 1, string.format("# %d units | id | name | rarity | cost | spawn_cap | role | damage/attack_cooldown/range"
+        .. " | damage type +secondary | attack shape, primary attack [flags] | active_attack [flags] | placement | farm_amount"
+        .. " | UnitTags | upgrade levels, last level, skill fields", #lines))
+    local where = Catalog.save("unit_catalog.txt", table.concat(lines, "\n"))
+    notify(where and string.format("Unit catalog saved: %s (%d units)", where, #lines - 1) or "Unit catalog: no writefile or setclipboard here.")
+
+    -- the other data modules, one "== Name ==" block each (a Folder of modules is walked too)
+    local blocks = {}
+    for _, name in ipairs({ "Traits", "TraitStats", "Buffs", "Boosts", "Waves", "Levels", "Maps", "Worlds", "ChallengeAndRewards" }) do
+        pcall(function()
+            local obj = data and data:FindFirstChild(name)
+            if not obj then return end
+            local mods = obj:IsA("ModuleScript") and { obj } or {}
+            if not obj:IsA("ModuleScript") then
+                for _, d in ipairs(obj:GetDescendants()) do
+                    if d:IsA("ModuleScript") then table.insert(mods, d) end
+                end
+            end
+            for _, m in ipairs(mods) do
+                local ok, value = pcall(require, m)
+                local body = ok and Catalog.dump(value, 40000) or "(could not be read)"
+                table.insert(blocks, "== " .. (m == obj and name or (name .. "/" .. m.Name)) .. " ==\n" .. body)
+            end
+        end)
+    end
+    if #blocks > 0 then
+        local text = table.concat(blocks, "\n\n")
+        local whereData = where == "clipboard" and nil or Catalog.save("game_data.txt", text)
+        notify(whereData and string.format("Game data saved: %s (%d KB, %d modules)", whereData, math.ceil(#text / 1024), #blocks)
+            or "Game data: not saved (no writefile here).")
     end
 end
 end
@@ -5305,6 +5720,44 @@ local placeStatus = placeMain:Paragraph({ Header = "Status", Body = "Off" })
 AutoPlaceModule.refreshUI = function()
     pcall(function() placeStatus:UpdateBody(AutoPlaceModule.StatusText()) end)
 end
+Controls.showDetails = placeMain:Toggle({
+    Name = "Show full status",
+    Default = AutoPlace.showDetails,
+    Callback = function(on) AutoPlace.showDetails = on; saveConfig(); AutoPlaceModule.refreshUI() end,
+}, "AutoPlaceDetails")
+-- One click sets every Auto Place / wave option for a way of playing.
+local PRESETS = {
+    ["Fast farm"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
+    ["Safe"] = { placeMode = "Safe", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = false },
+}
+function AutoPlaceModule.ApplyPreset(name)
+    local p = PRESETS[name]
+    AutoPlace.preset = name
+    if p then
+        AutoPlace.placeMode, AutoPlace.upgrade = p.placeMode, p.upgrade
+        AutoPlace.sellFarmsLast, AutoPlace.smartFreeze = p.sellFarmsLast, p.smartFreeze
+        AutoFarm.autoStart, AutoFarm.autoSkip = p.autoStart, p.autoSkip
+        for c, v in pairs({ [Controls.autoPlaceUpgrade] = p.upgrade, [Controls.sellFarmsLast] = p.sellFarmsLast,
+            [Controls.smartFreeze] = p.smartFreeze, [Controls.autoStart] = p.autoStart, [Controls.autoSkip] = p.autoSkip }) do
+            pcall(function() setToggle(c, v) end)
+        end
+        pcall(function() Controls.placeMode:UpdateSelection(p.placeMode) end)
+        pcall(refreshAutoStatus)
+        notify("Preset " .. name .. ": " .. p.placeMode .. " placement, skip waves " .. (p.autoSkip and "on" or "off"))
+    end
+    saveConfig()
+end
+Controls.preset = placeMain:Dropdown({
+    Name = "Preset",
+    Multi = false,
+    Required = true,
+    Options = { "Custom", "Fast farm", "Safe" },
+    Default = AutoPlace.preset,
+    Callback = function(v)
+        if type(v) ~= "string" or v == AutoPlace.preset then return end
+        AutoPlaceModule.ApplyPreset(v)
+    end,
+}, "AutoPlacePreset")
 Controls.autoPlace = placeMain:Toggle({
     Name = "Auto place units",
     Default = false,
@@ -5344,6 +5797,7 @@ Controls.sellFarmsLast = placeMain:Toggle({
 placeMain:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
+placeMain:Button({ Name = "Save unit catalog", Callback = function() pcall(AutoPlaceModule.SaveCatalog) end })
 placeMain:Paragraph({ Header = "", Body = "Watches where enemies walk (saved per stage),\nthen places your team beside the path where\nit covers the most road, as soon as money\nallows. Uses whatever team you have equipped." })
 
 placeSlots:Header({ Text = "How many per team slot (0 = none)" })
@@ -5710,6 +6164,8 @@ applyRuntimeFeatures = function()
     pcall(function() Controls.placeMode:UpdateSelection(AutoPlace.placeMode) end)
     setControl(Controls.smartFreeze, AutoPlace.smartFreeze)
     setControl(Controls.sellFarmsLast, AutoPlace.sellFarmsLast)
+    setControl(Controls.showDetails, AutoPlace.showDetails)
+    pcall(function() Controls.preset:UpdateSelection(AutoPlace.preset) end)
     for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
     AutoPlace.enabled = pendingToggles.autoPlace == true
     setControl(Controls.autoPlace, AutoPlace.enabled)
