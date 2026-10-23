@@ -3469,6 +3469,7 @@ AutoPlaceModule.loadUnix = os.time()
 -- unit_id, _creation_time, ... }) every 10 s; unit_removed_temporary when one goes);
 -- badTemp: copies the game refused to place
 AutoPlaceModule.liveTemp, AutoPlaceModule.goneTemp, AutoPlaceModule.badTemp, AutoPlaceModule.tempVersion = {}, {}, {}, 0
+AutoPlaceModule.usedModel = setmetatable({}, { __mode = "v" })
 task.spawn(pcall, function()
     local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
     local function uuidOf(v) return type(v) == "table" and v.uuid and tostring(v.uuid) or (type(v) == "string" and v or nil) end
@@ -3511,8 +3512,12 @@ function AutoPlaceModule.HotbarTeam()
         local model = world and world:FindFirstChildOfClass("Model")
         if model then
             local priceLabel = slot:FindFirstChild("Cost") and slot.Cost:FindFirstChild("text")
-            slots[s] = { id = (model.Name:gsub(":.*$", "")), price = priceLabel and tonumber((tostring(priceLabel.Text):gsub("[^%d]", ""))) }
-            sig[#sig + 1] = s .. "=" .. slots[s].id
+            -- (a slot whose copy was placed shows the same model until a new copy replaces it)
+            if AutoPlaceModule.usedModel[s] ~= model then
+                slots[s] = { id = (model.Name:gsub(":.*$", "")), model = model,
+                    price = priceLabel and tonumber((tostring(priceLabel.Text):gsub("[^%d]", ""))) }
+                sig[#sig + 1] = s .. "=" .. slots[s].id
+            end
         end
     end
     -- getgc walks all of memory: only when the units on the bar changed (or the game said a
@@ -3529,7 +3534,8 @@ function AutoPlaceModule.HotbarTeam()
     for uuid, info in pairs(AutoPlaceModule.liveTemp) do
         table.insert(found, { id = info.id, uuid = uuid, made = info.made + 1e9 })
     end
-    if type(getgc) == "function" then
+    -- (once the game announced copies this run, only those count: memory also holds old ones)
+    if #found == 0 and type(getgc) == "function" then
         pcall(function()
             for _, v in ipairs(getgc(true)) do
                 if type(v) == "table" and rawget(v, "uuid") and rawget(v, "unit_id") and rawget(v, "equipped_slot") == nil then
@@ -3557,7 +3563,7 @@ function AutoPlaceModule.HotbarTeam()
             for _, uuid in ipairs(pool[sl.id] or {}) do
                 if not used[uuid] then
                     used[uuid] = true
-                    team[s] = { uuid = uuid, name = sl.id, cost = sl.price, temp = true, traits = {}, rolls = {} }
+                    team[s] = { uuid = uuid, name = sl.id, cost = sl.price, temp = true, traits = {}, rolls = {}, model = sl.model, slot = s }
                     break
                 end
             end
@@ -4730,6 +4736,7 @@ local function tick()
         -- counted from the map; the bar is read again on the next tick)
         if t.temp then
             AutoPlaceModule.full[t.uuid], AutoPlaceModule.badTemp[t.uuid] = true, true
+            if t.slot then AutoPlaceModule.usedModel[t.slot] = t.model end
             AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
         end
         AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
