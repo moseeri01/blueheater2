@@ -3937,8 +3937,8 @@ function ControlUp.fusionPairs(units)
     return out
 end
 
--- Copies still on the way to their fusion level: u -> level (they upgrade before other damage
--- units, lowest level first so both halves arrive together).
+-- Copies still on the way to their fusion level: u -> level (a level with no damage gain
+-- still counts a little for them, so they keep moving once better upgrades are done).
 function ControlUp.fusionFocus(units)
     local out = {}
     for _, list in pairs(ControlUp.fusionPairs(units)) do
@@ -4044,7 +4044,10 @@ local function upgradeStep(money, onlyRole, airOnly)
             if can then
                 local rank = RANK[role] or 2
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
-                if rank == 2 and fuse[u] then score = 1e6 - level end
+                -- fusion halves go by value like everything else (Vegito is only ~16% more than
+                -- the two at level 7, a forced push starved better upgrades: near loss in Hard
+                -- Room 45); a level that adds no damage (Vego 6) still moves on toward the fusion
+                if rank == 2 and fuse[u] then score = math.max(score, 1e-6) end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
