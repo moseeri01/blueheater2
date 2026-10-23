@@ -3461,8 +3461,95 @@ end
 -- any unit of ours already on the map (its _stats.uuid), so it works without getgc too.
 -- Traits and rolls found once are remembered per unit (AutoPlace.unitInfo, saved), so a
 -- game where the game data cannot be read still knows them.
+-- Random-equipped events (Fool's Hunt: LevelData._randomequippedmode): the hotbar holds random
+-- level-100 copies of the player's units made when the game started, not the equipped team.
+AutoPlaceModule.loadUnix = os.time()
+function AutoPlaceModule.EventMode()
+    local d = Stage.levelData()
+    return type(d) == "table" and rawget(d, "_randomequippedmode") ~= nil
+end
+
+-- The event hotbar: slot -> unit id (the model shown in PlayerGui.spawn_units...Units.<slot>)
+-- and price; the uuid is the game's table for a unit made this session (_creation_time) with
+-- that unit_id and no equipped_slot (the real collection was made long ago).
+function AutoPlaceModule.HotbarTeam()
+    local team, pool, used = {}, {}, {}
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local bar = gui and gui:FindFirstChild("spawn_units")
+    bar = bar and bar:FindFirstChild("Lives")
+    bar = bar and bar:FindFirstChild("Frame")
+    bar = bar and bar:FindFirstChild("Units")
+    local slots, sig = {}, {}
+    for s = 1, 6 do
+        local slot = bar and bar:FindFirstChild(tostring(s))
+        local view = slot and slot:FindFirstChild("Main") and slot.Main:FindFirstChild("View")
+        local world = view and view:FindFirstChildOfClass("WorldModel")
+        local model = world and world:FindFirstChildOfClass("Model")
+        if model then
+            local priceLabel = slot:FindFirstChild("Cost") and slot.Cost:FindFirstChild("text")
+            slots[s] = { id = (model.Name:gsub(":.*$", "")), price = priceLabel and tonumber((tostring(priceLabel.Text):gsub("[^%d]", ""))) }
+            sig[#sig + 1] = s .. "=" .. slots[s].id
+        end
+    end
+    -- getgc walks all of memory: only when the units on the bar changed
+    sig = table.concat(sig, ",")
+    if sig == AutoPlaceModule.hotbarSig and AutoPlaceModule.hotbarTeam
+        and (AutoPlaceModule.hotbarComplete or os.clock() < (AutoPlaceModule.hotbarRetry or 0)) then
+        return AutoPlaceModule.hotbarTeam
+    end
+    if type(getgc) == "function" then
+        pcall(function()
+            for _, v in ipairs(getgc(true)) do
+                if type(v) == "table" and rawget(v, "uuid") and rawget(v, "unit_id") and rawget(v, "equipped_slot") == nil then
+                    local made = tonumber(rawget(v, "_creation_time"))
+                    if made and made >= AutoPlaceModule.loadUnix - 1800 then
+                        local id = tostring(rawget(v, "unit_id"))
+                        pool[id] = pool[id] or {}
+                        local uuid = tostring(rawget(v, "uuid"))
+                        local dup = false
+                        for _, u in ipairs(pool[id]) do if u == uuid then dup = true end end
+                        if not dup then table.insert(pool[id], uuid) end
+                    end
+                end
+            end
+        end)
+    end
+    local complete = true
+    for s = 1, 6 do
+        local sl = slots[s]
+        if sl then
+            for _, uuid in ipairs(pool[sl.id] or {}) do
+                if not used[uuid] then
+                    used[uuid] = true
+                    team[s] = { uuid = uuid, name = sl.id, cost = sl.price, temp = true, traits = {}, rolls = {} }
+                    break
+                end
+            end
+            if not team[s] then complete = false end
+        end
+    end
+    -- (a slot without its uuid yet is looked up again in 30 s, or when the bar changes)
+    AutoPlaceModule.hotbarSig, AutoPlaceModule.hotbarComplete = sig, complete
+    AutoPlaceModule.hotbarRetry = os.clock() + 30
+    AutoPlaceModule.hotbarTeam = team
+    return team
+end
+
 function AutoPlaceModule.RefreshTeam()
     local team = {}
+    if AutoPlaceModule.EventMode() then
+        -- (never saved as lastTeam: these copies vanish when the game ends)
+        local hot = AutoPlaceModule.HotbarTeam()
+        for _, t in pairs(hot) do
+            local def = AutoPlaceModule.UnitDef(t.name)
+            t.cost = t.cost or (def and tonumber(def.cost))
+            t.gameCap = def and tonumber(def.spawn_cap) or nil
+            if t.gameCap then AutoPlace.caps[t.name] = t.gameCap end
+        end
+        AutoPlaceModule.team, AutoPlaceModule.teamReadAt = hot, os.clock()
+        AutoPlaceModule.hotbarAt = os.clock()
+        return hot
+    end
     if type(getgc) == "function" then
         pcall(function()
             for _, v in ipairs(getgc(true)) do
@@ -4436,6 +4523,8 @@ local function tick()
     local grew = samplePath()
     if grew and #pathPoints() % 20 == 0 then saveConfig() end
     if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
+    -- event hotbar: new random units arrive during the game (read again every 5 s)
+    if AutoPlaceModule.hotbarAt and os.clock() - AutoPlaceModule.hotbarAt > 5 then AutoPlaceModule.RefreshTeam() end
     -- part of the team came only from units on the map (no traits/rolls): read again now and then
     -- (once per game: getgc walks every table in memory, and the team often never shows up)
     if os.clock() - (AutoPlaceModule.teamReadAt or 0) > 15 and not AutoPlaceModule.extraTeamRead then
