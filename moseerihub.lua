@@ -94,6 +94,7 @@ local AutoPlace = {
     moneyPath = nil,              -- tracked value that pays for units, found on the first placement
     paths = {},                   -- [stage] = { {x,y,z}, ... } learned from enemy movement
     caps = {},                    -- [unit name] = how many the game lets you place, learned once
+    roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
 }
 
 -- Dungeon Bot state
@@ -224,6 +225,7 @@ local function buildConfigData()
             enabled = AutoPlace.enabled, upgrade = AutoPlace.upgrade, slots = AutoPlace.slots,
             moneyPath = AutoPlace.moneyPath, paths = next(AutoPlace.paths) and AutoPlace.paths or nil,
             caps = next(AutoPlace.caps) and AutoPlace.caps or nil,
+            roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
         },
     }
 end
@@ -277,6 +279,7 @@ local function applyConfigData(data)
     AutoPlace.moneyPath = pick(ap.moneyPath, "string", AutoPlace.moneyPath)
     if type(ap.paths) == "table" then AutoPlace.paths = ap.paths end
     if type(ap.caps) == "table" then AutoPlace.caps = ap.caps end
+    if type(ap.roles) == "table" then AutoPlace.roles = ap.roles end
 end
 
 local function saveConfig()
@@ -2615,32 +2618,74 @@ end
 
 local function spotKey(c) return string.format("%d,%d", math.floor(c.x + 0.5), math.floor(c.z + 0.5)) end
 
--- skip = how many good free spots to pass over (used to rotate while the price is unknown)
-local function bestSpot(skip)
+-- Role of a unit already on the map, from its own stats; remembered by unit name.
+local function unitRole(u)
+    local stats = u:FindFirstChild("_stats")
+    if not stats then return "dps" end
+    local id = stats:FindFirstChild("id")
+    local name = id and tostring(id.Value) or u.Name
+    local farm = stats:FindFirstChild("farm_amount")
+    local act = stats:FindFirstChild("active_attack")
+    local role = "dps"
+    if farm and (tonumber(farm.Value) or 0) > 0 then
+        role = "farm"
+    elseif (act and string.lower(tostring(act.Value)):find("buff", 1, true)) or UnitAI.learned[name] then
+        role = "buff"
+    end
+    if AutoPlace.roles[name] ~= role then
+        AutoPlace.roles[name] = role
+        saveConfig()
+    end
+    return role
+end
+
+local BUFF_REACH = 12
+
+-- skip = how many good free spots to pass over (used to rotate while the price is unknown).
+-- role: "farm" takes the spots that cover the least road (farms earn anywhere), "buff"
+-- the spots next to the most damage units, anything else the spots covering the most road.
+local function bestSpot(skip, role)
     skip = skip or 0
     local pts = pathPoints()
     if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor then
         candidates, candidatesFor = buildCandidates(pts), #pts
     end
-    local mine = {}
+    local mine, helpers = {}, {}
     for _, u in ipairs(ownedUnits()) do
         local p = rootPos(u)
-        if p then table.insert(mine, p) end
-    end
-    for _, c in ipairs(candidates) do
-        if not badSpots[spotKey(c)] then
-            local free = true
-            for _, p in ipairs(mine) do
-                local dx, dz = p.X - c.x, p.Z - c.z
-                if dx * dx + dz * dz < MIN_SPACING * MIN_SPACING then free = false break end
-            end
-            if free then
-                if skip <= 0 then return c end
-                skip = skip - 1
-            end
+        if p then
+            table.insert(mine, p)
+            if unitRole(u) == "dps" then table.insert(helpers, p) end
         end
     end
-    return nil
+    local free = {}
+    for _, c in ipairs(candidates) do
+        if not badSpots[spotKey(c)] then
+            local ok = true
+            for _, p in ipairs(mine) do
+                local dx, dz = p.X - c.x, p.Z - c.z
+                if dx * dx + dz * dz < MIN_SPACING * MIN_SPACING then ok = false break end
+            end
+            if ok then table.insert(free, c) end
+        end
+    end
+    if role == "farm" then
+        return free[#free - skip]
+    end
+    if role == "buff" and #helpers > 0 then
+        local scored = {}
+        for _, c in ipairs(free) do
+            local near = 0
+            for _, p in ipairs(helpers) do
+                local dx, dz = p.X - c.x, p.Z - c.z
+                if dx * dx + dz * dz <= BUFF_REACH * BUFF_REACH then near = near + 1 end
+            end
+            table.insert(scored, { c = c, k = near * 100000 + c.score })
+        end
+        table.sort(scored, function(a, b) return a.k > b.k end)
+        return scored[skip + 1] and scored[skip + 1].c
+    end
+    return free[skip + 1]
 end
 
 -- Team = equipped units { slot -> {uuid, name} }: from the game's own data (getgc), plus
@@ -2796,14 +2841,19 @@ end
 local function upgradeStep()
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return end
-    local pick, pickLevel
+    -- farms first (they pay for the rest), then damage, buffs last; lowest level first
+    local RANK = { farm = 1, dps = 2, buff = 3 }
+    local pick, pickLevel, pickRank
     for _, u in ipairs(ownedUnits()) do
         local stats = u:FindFirstChild("_stats")
         local lvl = stats and stats:FindFirstChild("upgrade")
         local maxLvl = stats and stats:FindFirstChild("max_upgrade")
         local level = lvl and tonumber(lvl.Value) or 0
         if not (maxLvl and tonumber(maxLvl.Value) and level >= tonumber(maxLvl.Value)) then
-            if not pick or level < pickLevel then pick, pickLevel = u, level end
+            local rank = RANK[unitRole(u)] or 2
+            if not pick or rank < pickRank or (rank == pickRank and level < pickLevel) then
+                pick, pickLevel, pickRank = u, level, rank
+            end
         end
     end
     if not pick then
@@ -2879,6 +2929,70 @@ local function refusalReason()
     return nil
 end
 
+-- Role of a team unit before it is placed: remembered from earlier games, else guessed from
+-- the game's unit data (a farm/income number = farm, a buff skill = buff). nil = not known.
+function AutoPlaceModule.RoleOf(t)
+    if AutoPlace.roles[t.name] then return AutoPlace.roles[t.name] end
+    if UnitAI.learned[t.name] then return "buff" end
+    local def = AutoPlaceModule.UnitDef(t.name)
+    if not def then return nil end
+    local function hasFarm(tbl)
+        for k, v in pairs(tbl) do
+            local key = string.lower(tostring(k))
+            if (key:find("farm", 1, true) or key:find("income", 1, true)) and ((type(v) == "number" and v > 0) or v == true) then
+                return true
+            end
+        end
+        return false
+    end
+    local up = def.upgrade or def.upgrades
+    if hasFarm(def) or (type(up) == "table" and type(up[1]) == "table" and hasFarm(up[1])) then return "farm" end
+    for k, v in pairs(def) do
+        if type(v) == "string" and string.lower(tostring(k)):find("active", 1, true) and string.lower(v):find("buff", 1, true) then
+            return "buff"
+        end
+    end
+    return nil
+end
+
+-- Picks the next unit from the WHOLE team: first one cheap damage unit (to hold wave 1),
+-- then every farm, then the rest spread evenly with damage before buffs.
+local function chooseNext(prices)
+    local list, dpsPlaced = {}, 0
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s]
+        if t then
+            local placed = #placedOf(t.uuid)
+            local role = AutoPlaceModule.RoleOf(t) or "dps"
+            if role == "dps" then dpsPlaced = dpsPlaced + placed end
+            local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99)
+            if not AutoPlaceModule.full[t.uuid] and placed < target then
+                table.insert(list, { slot = s, t = t, role = role, placed = placed, target = target,
+                    cost = t.cost or prices[s] or math.huge })
+            end
+        end
+    end
+    if #list == 0 then return nil end
+    local function cheapest(role)
+        local best
+        for _, e in ipairs(list) do
+            if e.role == role and (not best or e.cost < best.cost or (e.cost == best.cost and e.slot < best.slot)) then best = e end
+        end
+        return best
+    end
+    local pick = (dpsPlaced == 0 and cheapest("dps")) or cheapest("farm")
+    if not pick then
+        table.sort(list, function(a, b)
+            local ra, rb = a.placed / math.max(1, a.target), b.placed / math.max(1, b.target)
+            if math.abs(ra - rb) > 1e-6 then return ra < rb end
+            if a.role ~= b.role then return a.role == "dps" end
+            return a.slot < b.slot
+        end)
+        pick = list[1]
+    end
+    return pick.slot, pick.t, pick.role
+end
+
 local function tick()
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
     if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
@@ -2893,20 +3007,6 @@ local function tick()
         AutoPlaceModule.status = string.format("Learning the enemy path (%d points)", #pathPoints())
         return 0.5
     end
-    local slot, t
-    for s = 1, 6 do
-        local entry = AutoPlaceModule.team[s]
-        local target = math.min(AutoPlace.slots[s] or 0, entry and tonumber(AutoPlace.caps[entry.name]) or 99)
-        if entry and not AutoPlaceModule.full[entry.uuid] and #placedOf(entry.uuid) < target then
-            slot, t = s, entry
-            break
-        end
-    end
-    if not t then
-        if AutoPlace.upgrade then upgradeStep() return 1.5 end
-        AutoPlaceModule.status = "Everything placed"
-        return 1
-    end
     if not AutoPlace.moneyPath then
         -- a recorded macro already knows which value is the money
         for _, a in ipairs(State.actions) do
@@ -2914,6 +3014,12 @@ local function tick()
         end
     end
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
+    local slot, t, role = chooseNext(hudPrices)
+    if not t then
+        if AutoPlace.upgrade then upgradeStep() return 1.5 end
+        AutoPlaceModule.status = "Everything placed"
+        return 1
+    end
     local cost = t.cost or hudPrices[slot]
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
     if cost and money and money < cost then
@@ -2921,12 +3027,12 @@ local function tick()
         return 0.1
     end
     local unknown = not (cost and money)
-    local spot = bestSpot(unknown and (unknownTries % 3) or 0) or bestSpot(0)
+    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role) or bestSpot(0, role)
     if not spot then
         AutoPlaceModule.problem = "no free spot beside the path - the path may still be short"
         return 1
     end
-    AutoPlaceModule.status = string.format("Slot %d %s: placing", slot, t.name)
+    AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     if tryPlace(t, spot) then
         failsInRow, recentBad = 0, {}
         AutoPlaceModule.problem = nil
@@ -3016,7 +3122,9 @@ function AutoPlaceModule.StatusText()
             local cap = tonumber(AutoPlace.caps[t.name])
             local target = math.min(AutoPlace.slots[s] or 0, cap or 99)
             local full = (cap and target == cap) and " (limit)" or ""
-            table.insert(team, string.format("%d %s %d/%d%s", s, t.name, #placedOf(t.uuid), target, full))
+            local role = AutoPlaceModule.RoleOf(t)
+            table.insert(team, string.format("%d %s%s %d/%d%s", s, t.name, role and ("[" .. role .. "]") or "",
+                #placedOf(t.uuid), target, full))
         end
     end
     table.insert(lines, "Team: " .. (#team > 0 and table.concat(team, ", ") or "not read yet"))
