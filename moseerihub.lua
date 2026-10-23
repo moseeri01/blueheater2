@@ -7474,6 +7474,10 @@ function Lobby.Loop()
         local busy = false
         -- order in the lobby: clean the bag, open eggs, then a portal, else Auto join
         -- (nothing while Watch is teaching); in a stage only the cleaner, when allowed
+        if inLobbyNow and not Lobby.listsFilled and Lobby.RefreshLists and os.clock() - (Lobby.lastRefresh or -1e9) > 30 then
+            Lobby.lastRefresh = os.clock()
+            pcall(Lobby.RefreshLists, false)
+        end
         if not State.watching then
             if c.clean and (inLobbyNow or c.cleanInStage) and os.clock() - (Lobby.lastClean or -1e9) > 30 then
                 Lobby.lastClean = os.clock()
@@ -7506,6 +7510,16 @@ end
 function Lobby.Bag()
     local bag = { uniques = {}, counts = {} }
     local data = Lobby.inventoryData()
+    -- the service's copy may hold no unique items: then the table the game report reads
+    -- (found in memory by its unique_items list, portals listed there with uuids)
+    local function hasUniques(d) return type(d) == "table" and type(d.unique_items) == "table" and next(d.unique_items) ~= nil end
+    if not hasUniques(data) and type(getgc) == "function" then
+        pcall(function()
+            for _, v in ipairs(getgc(true)) do
+                if type(v) == "table" and hasUniques(v) then data = v break end
+            end
+        end)
+    end
     for k, v in pairs(data and type(data.unique_items) == "table" and data.unique_items or {}) do
         if type(v) == "table" then
             local id, uuid = v.item_id or v.id, v.uuid or (type(k) == "string" and k or nil)
@@ -7731,14 +7745,36 @@ local delItems = bag:Dropdown({ Name = "Delete items", Multi = true, Required = 
 bag:Slider({ Name = "When bag is over (%)", Minimum = 50, Maximum = 100, Default = Lobby.cfg.cleanAt,
     Callback = set("cleanAt") }, "LobbyCleanAt")
 bag:Toggle({ Name = "Also during stages", Default = Lobby.cfg.cleanInStage, Callback = set("cleanInStage") }, "LobbyCleanInStage")
-bag:Button({ Name = "Refresh bag lists", Callback = function()
+-- Fills the bag lists again, keeping what was picked (the bag is often not loaded yet when
+-- the script starts: the lobby loop calls this every 30 s while the lists are empty).
+-- With save, every portal's full data goes to AAMacro/portals.txt (its buffs and tier).
+function Lobby.RefreshLists(save)
     local p, i, e = Lobby.BagNames()
+    Lobby.listsFilled = #p + #i + #e > 0
+    local was = syncing
+    syncing = true
     pcall(function()
         for _, d in ipairs({ portalDropdown, delPortals }) do d:ClearOptions() d:InsertOptions(p) end
         delItems:ClearOptions() delItems:InsertOptions(i)
         if UIRef.lobbyEggs then UIRef.lobbyEggs:ClearOptions() UIRef.lobbyEggs:InsertOptions(e) end
+        if Lobby.cfg.portal ~= "" then portalDropdown:UpdateSelection(Lobby.cfg.portal) end
+        delPortals:UpdateSelection(picked(Lobby.cfg.deletePortals))
+        delItems:UpdateSelection(picked(Lobby.cfg.deleteItems))
+        if UIRef.lobbyEggs then UIRef.lobbyEggs:UpdateSelection(picked(Lobby.cfg.eggs)) end
     end)
-    notify(string.format("Bag: %d portal kinds, %d item kinds", #p, #i))
+    syncing = was
+    if save then
+        local lines = { "# portals " .. os.date("%Y-%m-%d %H:%M:%S") }
+        for _, u in ipairs(Lobby.Bag().uniques) do
+            if u.id:find("^portal") then table.insert(lines, u.id .. " " .. describeValue(u.data, 0, FULL)) end
+        end
+        AutoPlaceModule.Catalog.save("portals.txt", table.concat(lines, "\n"))
+    end
+    return p, i, e
+end
+bag:Button({ Name = "Refresh bag lists", Callback = function()
+    local p, i, e = Lobby.RefreshLists(true)
+    notify(string.format("Bag: %d portal kinds, %d other items, %d eggs (portals.txt saved)", #p, #i, #e))
 end })
 
 local gifts = UIRef.tabs.lobby:Section({ Side = "Left" })
