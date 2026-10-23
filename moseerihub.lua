@@ -7776,9 +7776,10 @@ function Lobby.OnCardOptions(seconds, options)
     local i, why = Lobby.PickCard(options)
     local way = Lobby.cfg.voteWay ~= "" and Lobby.cfg.voteWay or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
     local arg = (way == "index0" and i - 1) or (way == "title" and options[i].title) or (way == "option" and options[i]) or i
-    local ok, reply = pcall(function() return remote:InvokeServer(arg) end)
     Lobby.pendingVote = { title = options[i].title, way = way }
-    AutoPlaceModule.Note(string.format("card: %s (%s, way %s, reply %s)", tostring(options[i].title), why, way, ok and tostring(reply) or "error"))
+    AutoPlaceModule.Note(string.format("card: %s (%s, way %s)", tostring(options[i].title), why, way))
+    -- (sent without waiting: a call with the wrong arguments got no answer in the real game)
+    task.spawn(pcall, function() remote:InvokeServer(arg) end)
 end
 
 function Lobby.OnCardResult(picked, state)
@@ -7846,7 +7847,9 @@ function Lobby.SpellStep(money)
             local key = way:find("^index") and idx or id
             Lobby.spellAt = os.clock()
             Lobby.spellTry = { id = id, way = way }
-            pcall(function()
+            -- sent without waiting: a call in a shape the game does not take got no answer, and
+            -- waiting for it stopped Auto Place for the rest of the game (real game, 2026-10-24)
+            task.spawn(pcall, function()
                 if way:find("_unit$") and target then remote:InvokeServer(key, target) else remote:InvokeServer(key) end
             end)
             AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
@@ -7855,12 +7858,14 @@ function Lobby.SpellStep(money)
     end
 end
 
-task.spawn(pcall, function()
-    local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
-    stc:WaitForChild("show_roguelike_options", 5).OnClientEvent:Connect(function(s, o) pcall(Lobby.OnCardOptions, s, o) end)
-    stc:WaitForChild("show_roguelike_vote_result", 5).OnClientEvent:Connect(function(p, st) pcall(Lobby.OnCardResult, p, st) end)
-    stc:WaitForChild("ingame_spells", 5).OnClientEvent:Connect(function(l) pcall(Lobby.OnSpells, l) end)
-end)
+-- (each connected on its own: one missing event must not leave the others unheard)
+for name, fn in pairs({ show_roguelike_options = function(sec, o) pcall(Lobby.OnCardOptions, sec, o) end,
+    show_roguelike_vote_result = function(p, st) pcall(Lobby.OnCardResult, p, st) end,
+    ingame_spells = function(l) pcall(Lobby.OnSpells, l) end }) do
+    task.spawn(pcall, function()
+        ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5):WaitForChild(name, 5).OnClientEvent:Connect(fn)
+    end)
+end
 
 -- Portal and item ids in the bag (pretty names), for the Portals and Bag cleaner lists.
 -- The bag as the game keeps it: unique items (portals and others, each with a uuid, the
