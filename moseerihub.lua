@@ -2140,6 +2140,10 @@ local function unitType(unit)
     return unit.Name
 end
 
+-- Units another unit summons (Erwin's Scout Corps "aot_generic", cost 1) carry the
+-- summoner's uuid but cannot be upgraded or cast; set once unit data can be read.
+local isSummon = function() return false end
+
 local function ownedUnits()
     local folder = unitsFolder()
     if not folder then return {} end
@@ -2147,9 +2151,9 @@ local function ownedUnits()
     for _, unit in ipairs(folder:GetChildren()) do
         local stats = unit:FindFirstChild("_stats")
         local base = stats and stats:FindFirstChild("base")
-        if not (base and tostring(base.Value) == "pve") then table.insert(all, unit) end
+        if not (base and tostring(base.Value) == "pve") and not isSummon(unit) then table.insert(all, unit) end
         if stats and stats:FindFirstChild("player") then anyOwnerField = true end
-        if isMyUnit(unit) then table.insert(mine, unit) end
+        if isMyUnit(unit) and not isSummon(unit) then table.insert(mine, unit) end
     end
     if #mine == 0 and not anyOwnerField then return all end
     return mine
@@ -3051,6 +3055,29 @@ function AutoPlaceModule.UnitDef(name)
     return unitDefsCache[name]
 end
 
+isSummon = function(unit)
+    local def = AutoPlaceModule.UnitDef(unitType(unit))
+    return def ~= nil and (tonumber(def.cost) or 0) <= 1
+end
+
+-- Decision log shown under Auto Place: what it placed / upgraded and why.
+AutoPlaceModule.log = {}
+function AutoPlaceModule.Note(text)
+    local last = AutoPlaceModule.log[#AutoPlaceModule.log]
+    if last and last.text == text then return end
+    table.insert(AutoPlaceModule.log, { at = os.clock(), text = text })
+    while #AutoPlaceModule.log > 6 do table.remove(AutoPlaceModule.log, 1) end
+end
+
+-- How many buff units of this kind keep the buff on all the time: cooldown / buff length,
+-- once the rotation has measured them; 4 until then (the usual Erwin/Wendy rotation).
+function AutoPlaceModule.BuffNeed(t)
+    local g = BuffRot.groups[t.name]
+    local dur = (UnitAI.buffDuration and UnitAI.buffDuration > 0 and UnitAI.buffDuration) or (g and (g.duration or g.durationAtLeast))
+    if g and g.cd and g.cd > 0 and dur and dur > 0 then return math.max(1, math.ceil(g.cd / dur - 1e-6)) end
+    return 4
+end
+
 local function normUuid(u) return (tostring(u):gsub("[{}%s]", "")) end
 
 local function placedOf(uuid)
@@ -3135,35 +3162,81 @@ local function nextUpgrade(u, level)
     return true, type(step) == "table" and tonumber(step.cost) or nil
 end
 
--- One upgrade: farms first (they pay for the rest), then damage, buffs last; lowest level
--- first. onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
+-- Damage per second a placed unit gains from its next upgrade, scaled by the copy's own
+-- trait and rolls (a Golden / high-roll carry gains more from the same upgrade).
+local upgradeFails = setmetatable({}, { __mode = "k" })
+local function upgradeGain(u, level)
+    local def = AutoPlaceModule.UnitDef(unitType(u))
+    local up = def and (def.upgrade or def.upgrades)
+    if type(up) ~= "table" then return 0 end
+    local function statsAt(n)
+        local dmg, cd = tonumber(def.damage) or 0, tonumber(def.attack_cooldown) or 1
+        for i = 1, n do
+            local step = up[i]
+            if type(step) == "table" then
+                dmg = tonumber(step.damage) or dmg
+                cd = tonumber(step.attack_cooldown) or cd
+            end
+        end
+        return dmg / math.max(0.5, cd)
+    end
+    local mult = 1
+    local uuid = u:FindFirstChild("_stats") and u._stats:FindFirstChild("uuid")
+    for _, t in pairs(AutoPlaceModule.team) do
+        if uuid and normUuid(t.uuid) == normUuid(uuid.Value) then
+            local tm, rolls = AutoPlaceModule.TraitMods(t.traits), t.rolls or {}
+            mult = tm.dmg / tm.spa * (rolls.potency_stat or 1) * (rolls.speed_stat or 1)
+        end
+    end
+    return math.max(0, statsAt(level + 1) - statsAt(level)) * mult
+end
+
+-- One upgrade: farms first (they pay for the rest), then damage, buffs last. Farms and buffs
+-- go lowest level first; damage units go by the most damage gained per ¥, so the strongest
+-- unit (best trait / rolls / upgrade path) is pushed up first instead of spreading thin.
+-- onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
 local function upgradeStep(money, onlyRole)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
     local RANK = { farm = 1, dps = 2, buff = 3, support = 3 }
-    local pick, pickLevel, pickRank, pickCost
+    local pick, pickLevel, pickRank, pickCost, pickScore, pickRole
+    local now = os.clock()
     for _, u in ipairs(ownedUnits()) do
         local role = unitRole(u)
-        if not onlyRole or role == onlyRole then
+        if (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now then
             local stats = u:FindFirstChild("_stats")
             local lvl = stats and stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
             local can, cost = nextUpgrade(u, level)
             if can then
                 local rank = RANK[role] or 2
-                if not pick or rank < pickRank or (rank == pickRank and level < pickLevel) then
-                    pick, pickLevel, pickRank, pickCost = u, level, rank, cost
+                local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
+                if not pick or rank < pickRank or (rank == pickRank and score > pickScore) then
+                    pick, pickLevel, pickRank, pickCost, pickScore, pickRole = u, level, rank, cost, score, role
                 end
             end
         end
     end
     if not pick then return nil end
     if pickCost and money and money < pickCost then
-        AutoPlaceModule.status = string.format("Upgrade %s to %d: waiting for money %d / %d", pick.Name, pickLevel + 1, math.floor(money), math.floor(pickCost))
+        AutoPlaceModule.status = string.format("Upgrade %s to %d: waiting for money %d / %d", unitType(pick), pickLevel + 1, math.floor(money), math.floor(pickCost))
         return 0.2
     end
-    AutoPlaceModule.status = string.format("Upgrading %s (level %d)", pick.Name, pickLevel)
+    AutoPlaceModule.status = string.format("Upgrading %s (level %d)", unitType(pick), pickLevel)
     pcall(function() remote:InvokeServer(pick) end)
+    local lvl = pick:FindFirstChild("_stats") and pick._stats:FindFirstChild("upgrade")
+    for _ = 1, 6 do -- the new level can replicate a moment after the reply
+        if not lvl or (tonumber(lvl.Value) or 0) > pickLevel then break end
+        task.wait(0.1)
+    end
+    if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
+        AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
+            pickRank == 2 and ", most damage per ¥" or ""))
+    elseif not (pickCost and money and money < pickCost) then
+        -- refused with the money in hand: leave this unit for 30 s instead of retrying forever
+        upgradeFails[pick] = now + 30
+        AutoPlaceModule.Note(string.format("could not upgrade %s - skipped for 30 s", unitType(pick)))
+    end
     return pickCost and 0.3 or 1.5
 end
 
@@ -3322,6 +3395,8 @@ local function chooseNext(prices, danger)
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
             local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99,
                 AutoPlaceModule.TraitMods(t.traits).cap or 99)
+            -- buff units: only as many as the rotation needs (6 Erwins = money not spent on damage)
+            if role == "buff" then target = math.min(target, AutoPlaceModule.BuffNeed(t)) end
             local resting = (AutoPlaceModule.noSpot[t.uuid] or 0) > os.clock()
             if not AutoPlaceModule.full[t.uuid] and not resting and placed < target then
                 table.insert(list, { slot = s, t = t, role = role, placed = placed, target = target,
@@ -3389,6 +3464,7 @@ local function tick()
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
         or readCostValue("LP._stats.resource") or hudMoney
     local danger = AutoPlaceModule.Danger()
+    if danger and not AutoPlaceModule.danger then AutoPlaceModule.Note("base took damage: damage units first for 20 s") end
     AutoPlaceModule.danger = danger
     local slot, t, role, dpsPlaced = chooseNext(hudPrices, danger)
     if danger and not t then
@@ -3433,6 +3509,10 @@ local function tick()
     if tryPlace(t, spot) then
         failsInRow, recentBad = 0, {}
         AutoPlaceModule.problem = nil
+        local why = (danger and "danger, best damage per ¥") or (role == "farm" and "farm pays for the rest")
+            or (role == "buff" and string.format("buff rotation needs %d", AutoPlaceModule.BuffNeed(t)))
+            or (role == "support" and "support before upgrades") or "damage"
+        AutoPlaceModule.Note(string.format("placed %s #%d on %s (%s)", t.name, #placedOf(t.uuid), spot.kind or "ground", why))
         return 0.2
     end
     local why = refusalReason()
@@ -3520,9 +3600,10 @@ function AutoPlaceModule.StatusText()
         local t = AutoPlaceModule.team[s]
         if t then
             local cap = tonumber(AutoPlace.caps[t.name])
-            local target = math.min(AutoPlace.slots[s] or 0, cap or 99)
-            local full = (cap and target == cap) and " (limit)" or ""
             local role = AutoPlaceModule.RoleOf(t)
+            local target = math.min(AutoPlace.slots[s] or 0, cap or 99)
+            if role == "buff" then target = math.min(target, AutoPlaceModule.BuffNeed(t)) end
+            local full = (cap and target == cap) and " (limit)" or ""
             table.insert(team, string.format("%d %s%s %d/%d%s", s, t.name, role and ("[" .. role .. "]") or "",
                 #placedOf(t.uuid), target, full))
         end
@@ -3530,6 +3611,13 @@ function AutoPlaceModule.StatusText()
     table.insert(lines, "Team: " .. (#team > 0 and table.concat(team, ", ") or "not read yet"))
     table.insert(lines, string.format("Path: %d points for %s", #pathPoints(), stageKey()))
     if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
+    if #AutoPlaceModule.log > 0 then
+        table.insert(lines, "Last actions:")
+        for i = #AutoPlaceModule.log, 1, -1 do
+            local e = AutoPlaceModule.log[i]
+            table.insert(lines, string.format("  %ds ago - %s", math.floor(os.clock() - e.at), e.text))
+        end
+    end
     return table.concat(lines, "\n")
 end
 
