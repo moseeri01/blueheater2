@@ -129,11 +129,8 @@ local Webhook = {
 }
 
 local Window
-local statusParagraph, actionsParagraph, autoStatusParagraph, unitStatusParagraph
-local dungeonStatusParagraph, statsText
-local recordToggle, playToggle, savedDropdown, nameInput, pasteInput
-local autoReplayToggle, autoNextToggle, autoLeaveToggle, autoSellToggle
-local autoAbilitiesToggle, autoBuffToggle, antiAfkToggle
+-- UI handles created later in the UI section (one table: Lua 5.1 allows only 200 locals)
+local UIRef = {}
 local Controls = {}
 local applyRuntimeFeatures
 local oldNamecall
@@ -538,7 +535,7 @@ local function stageMacroPattern(stage)
 end
 
 local function refreshStatus()
-    if not statusParagraph then return end
+    if not UIRef.statusParagraph then return end
     local stateText
     if State.recording then stateText = "Recording"
     elseif State.finalizing then stateText = "Saving..."
@@ -546,7 +543,7 @@ local function refreshStatus()
     elseif #State.actions > 0 then stateText = "Ready"
     else stateText = "Idle" end
     local elapsed = State.recording and (os.clock() - State.startedAt) or State.duration
-    statusParagraph:UpdateBody(string.format(
+    UIRef.statusParagraph:UpdateBody(string.format(
         "%s   |   %s\nStage: %s\nTime: %s   Actions: %d",
         stateText, cleanName(State.macroName) or "(no macro)", State.stage or "not detected (lobby?)",
         formatDuration(elapsed), #State.actions
@@ -554,17 +551,17 @@ local function refreshStatus()
 end
 
 local function refreshActionList()
-    if not actionsParagraph then return end
+    if not UIRef.actionsParagraph then return end
     local n = #State.actions
     if n == 0 then
-        actionsParagraph:UpdateBody("Nothing recorded yet.")
+        UIRef.actionsParagraph:UpdateBody("Nothing recorded yet.")
         return
     end
     local first = math.max(1, n - Config.ListLines + 1)
     local lines = {}
     if first > 1 then table.insert(lines, string.format("(%d earlier actions hidden)", first - 1)) end
     for i = first, n do table.insert(lines, describeAction(i, State.actions[i], SHORT)) end
-    actionsParagraph:UpdateBody(table.concat(lines, "\n"))
+    UIRef.actionsParagraph:UpdateBody(table.concat(lines, "\n"))
 end
 
 -- Money tracking: numeric values on the local player, read outside the hook.
@@ -878,17 +875,17 @@ function Files.list()
 end
 
 local function refreshSavedList(select)
-    if not savedDropdown then return end
+    if not UIRef.savedDropdown then return end
     syncing = true
-    savedDropdown:ClearOptions()
-    savedDropdown:InsertOptions(Files.list())
-    if select then savedDropdown:UpdateSelection(select) end
+    UIRef.savedDropdown:ClearOptions()
+    UIRef.savedDropdown:InsertOptions(Files.list())
+    if select then UIRef.savedDropdown:UpdateSelection(select) end
     syncing = false
 end
 
 local function setMacroName(name)
     State.macroName = name or ""
-    if nameInput and nameInput:GetInput() ~= State.macroName then nameInput:UpdateText(State.macroName) end
+    if UIRef.nameInput and UIRef.nameInput:GetInput() ~= State.macroName then UIRef.nameInput:UpdateText(State.macroName) end
     refreshStatus()
 end
 
@@ -1056,7 +1053,7 @@ function ProfilesModule.ImportText(text)
         if hasFileApi() then storeImported(profile) end
         return profile
     end)
-    if pasteInput then pasteInput:UpdateText("") end
+    if UIRef.pasteInput then UIRef.pasteInput:UpdateText("") end
     if not ok then
         notify("Import failed: " .. tostring(result))
         return
@@ -1140,7 +1137,7 @@ local function finishRecording(message)
     if not State.recording then return false end
     State.duration = math.min(Config.MaxDuration, os.clock() - State.startedAt)
     State.recording = false
-    setToggle(recordToggle, false)
+    setToggle(UIRef.recordToggle, false)
     refreshStatus()
     if message then notify(message) end
     finalizeRecording()
@@ -1405,7 +1402,7 @@ function PlaybackModule.Play(fromGameStart)
     addReplayLog(string.format("play %s, %d actions, retry %s, speed %.1fx, %s",
         cleanName(State.macroName) or "?", #State.actions, canRetry and "on" or "off", speedMul,
         fromGameStart and "started by game start" or "started by hand"))
-    setToggle(playToggle, true)
+    setToggle(UIRef.playToggle, true)
     refreshStatus()
     notify(string.format("Playing %s (%d actions).", cleanName(State.macroName) or "macro", #State.actions))
 
@@ -1536,7 +1533,7 @@ function PlaybackModule.Play(fromGameStart)
         local finished = State.replaying
         State.replaying = false
         State.replayIndex = 0
-        setToggle(playToggle, false)
+        setToggle(UIRef.playToggle, false)
         refreshStatus()
         addReplayLog(finished and string.format("finished, %d failed", failed) or "stopped")
 
@@ -1838,7 +1835,7 @@ end
 local AutoFarmModule = {}
 
 local function refreshAutoStatus()
-    if not autoStatusParagraph then return end
+    if not UIRef.autoStatusParagraph then return end
     local parts = {}
     if AutoFarm.autoReplay then table.insert(parts, "Replay: ON") end
     if AutoFarm.autoNextStage then table.insert(parts, "Next stage: ON") end
@@ -1847,7 +1844,7 @@ local function refreshAutoStatus()
     if AutoFarm.autoSell and AutoFarm.sellAtWave > 0 then table.insert(parts, "Sell at wave " .. AutoFarm.sellAtWave) end
     if AutoFarm.speedMultiplier ~= 1 then table.insert(parts, string.format("Speed: %.1fx", AutoFarm.speedMultiplier)) end
     if #parts == 0 then table.insert(parts, "All off") end
-    autoStatusParagraph:UpdateBody(table.concat(parts, "\n"))
+    UIRef.autoStatusParagraph:UpdateBody(table.concat(parts, "\n"))
 end
 
 Words.REPLAY = { "replay", "retry", "play again", "restart" }
@@ -2427,7 +2424,7 @@ local function myUnitsWithAbility()
 end
 
 local function refreshUnitStatus()
-    if not unitStatusParagraph then return end
+    if not UIRef.unitStatusParagraph then return end
     local parts = {}
     if UnitAI.autoAbilities then table.insert(parts, "Abilities: ON (every " .. UnitAI.abilityCooldown .. "s)") end
     if UnitAI.autoBuff then
@@ -2461,7 +2458,7 @@ local function refreshUnitStatus()
         if BuffInfo.reply ~= "-" then table.insert(parts, "Last reply: " .. clip(BuffInfo.reply, 30)) end
     end
     table.insert(parts, "My units on map: " .. #ownedUnits())
-    unitStatusParagraph:UpdateBody(table.concat(parts, "\n"))
+    UIRef.unitStatusParagraph:UpdateBody(table.concat(parts, "\n"))
 end
 
 local abilityGen, buffGen = 0, 0
@@ -2618,7 +2615,47 @@ end
 
 local function spotKey(c) return string.format("%d,%d", math.floor(c.x + 0.5), math.floor(c.z + 0.5)) end
 
--- Role of a unit already on the map, from its own stats; remembered by unit name.
+-- Role from the game's own unit definition (src.Data.Units): farm_amount > 0 = farm,
+-- _show_as_buff_unit / _NO_ATTACKS_UNIT = buff or support, else damage. nil = no definition.
+function AutoPlaceModule.RoleFromDef(name)
+    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(name)
+    if not def then return nil end
+    local function hasFarm(tbl)
+        for k, v in pairs(tbl) do
+            local key = string.lower(tostring(k))
+            if (key:find("farm", 1, true) or key:find("income", 1, true)) and ((type(v) == "number" and v > 0) or v == true) then
+                return true
+            end
+        end
+        return false
+    end
+    local up = def.upgrade or def.upgrades
+    if hasFarm(def) or (type(up) == "table" and type(up[1]) == "table" and hasFarm(up[1])) then return "farm" end
+    if def._show_as_buff_unit == true or def._NO_ATTACKS_UNIT == true then return "buff" end
+    for k, v in pairs(def) do
+        if type(v) == "string" and string.lower(tostring(k)):find("active", 1, true) and string.lower(v):find("buff", 1, true) then
+            return "buff"
+        end
+    end
+    return "dps"
+end
+
+-- Damage per second per ¥ from the definition (higher = better value); 0 when unknown.
+function AutoPlaceModule.Value(name, cost)
+    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(name)
+    local dmg = def and tonumber(def.damage)
+    if not dmg or not cost or cost <= 0 then return 0 end
+    return dmg / math.max(0.5, tonumber(def.attack_cooldown) or 1) / cost
+end
+
+function AutoPlaceModule.Range(name)
+    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(name)
+    local r = def and tonumber(def.range)
+    return (r and r > 0) and r or DEFAULT_RANGE
+end
+
+-- Role of a unit already on the map: the game's definition first, else its own stats;
+-- remembered by unit name for games where the definition cannot be read.
 local function unitRole(u)
     local stats = u:FindFirstChild("_stats")
     if not stats then return "dps" end
@@ -2626,11 +2663,14 @@ local function unitRole(u)
     local name = id and tostring(id.Value) or u.Name
     local farm = stats:FindFirstChild("farm_amount")
     local act = stats:FindFirstChild("active_attack")
-    local role = "dps"
-    if farm and (tonumber(farm.Value) or 0) > 0 then
-        role = "farm"
-    elseif (act and string.lower(tostring(act.Value)):find("buff", 1, true)) or UnitAI.learned[name] then
-        role = "buff"
+    local role = AutoPlaceModule.RoleFromDef(name)
+    if not role then
+        role = "dps"
+        if farm and (tonumber(farm.Value) or 0) > 0 then
+            role = "farm"
+        elseif (act and string.lower(tostring(act.Value)):find("buff", 1, true)) or UnitAI.learned[name] then
+            role = "buff"
+        end
     end
     if AutoPlace.roles[name] ~= role then
         AutoPlace.roles[name] = role
@@ -2643,8 +2683,9 @@ local BUFF_REACH = 12
 
 -- skip = how many good free spots to pass over (used to rotate while the price is unknown).
 -- role: "farm" takes the spots that cover the least road (farms earn anywhere), "buff"
--- the spots next to the most damage units, anything else the spots covering the most road.
-local function bestSpot(skip, role)
+-- the spots next to the most damage units, anything else the spots covering the most road
+-- within that unit's own range (a range-9 unit must stand closer than a range-16 one).
+local function bestSpot(skip, role, range)
     skip = skip or 0
     local pts = pathPoints()
     if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor then
@@ -2683,6 +2724,20 @@ local function bestSpot(skip, role)
             table.insert(scored, { c = c, k = near * 100000 + c.score })
         end
         table.sort(scored, function(a, b) return a.k > b.k end)
+        return scored[skip + 1] and scored[skip + 1].c
+    end
+    if range and range ~= DEFAULT_RANGE and role ~= "buff" then
+        local r2 = range * range
+        local scored = {}
+        for _, c in ipairs(free) do
+            local n = 0
+            for _, q in ipairs(pts) do
+                local dx, dz = q[1] - c.x, q[3] - c.z
+                if dx * dx + dz * dz <= r2 then n = n + 1 end
+            end
+            table.insert(scored, { c = c, n = n })
+        end
+        table.sort(scored, function(a, b) return a.n > b.n end)
         return scored[skip + 1] and scored[skip + 1].c
     end
     return free[skip + 1]
@@ -2838,30 +2893,50 @@ local function tryPlace(t, spot)
     return false
 end
 
-local function upgradeStep()
+-- Cost of a placed unit's next upgrade from its definition (upgrade[level+1].cost), and
+-- whether it can still be upgraded.
+local function nextUpgrade(u, level)
+    local stats = u:FindFirstChild("_stats")
+    local id = stats and stats:FindFirstChild("id")
+    local def = AutoPlaceModule.UnitDef(id and tostring(id.Value) or u.Name)
+    local up = def and (def.upgrade or def.upgrades)
+    local maxLvl = stats and stats:FindFirstChild("max_upgrade")
+    local maxN = (maxLvl and tonumber(maxLvl.Value)) or (type(up) == "table" and #up > 0 and #up) or nil
+    if maxN and level >= maxN then return false, nil end
+    local step = type(up) == "table" and up[level + 1]
+    return true, type(step) == "table" and tonumber(step.cost) or nil
+end
+
+-- One upgrade: farms first (they pay for the rest), then damage, buffs last; lowest level
+-- first. onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
+local function upgradeStep(money, onlyRole)
     local remote = getAARemote("upgrade_unit_ingame")
-    if not remote then return end
-    -- farms first (they pay for the rest), then damage, buffs last; lowest level first
+    if not remote then return nil end
     local RANK = { farm = 1, dps = 2, buff = 3 }
-    local pick, pickLevel, pickRank
+    local pick, pickLevel, pickRank, pickCost
     for _, u in ipairs(ownedUnits()) do
-        local stats = u:FindFirstChild("_stats")
-        local lvl = stats and stats:FindFirstChild("upgrade")
-        local maxLvl = stats and stats:FindFirstChild("max_upgrade")
-        local level = lvl and tonumber(lvl.Value) or 0
-        if not (maxLvl and tonumber(maxLvl.Value) and level >= tonumber(maxLvl.Value)) then
-            local rank = RANK[unitRole(u)] or 2
-            if not pick or rank < pickRank or (rank == pickRank and level < pickLevel) then
-                pick, pickLevel, pickRank = u, level, rank
+        local role = unitRole(u)
+        if not onlyRole or role == onlyRole then
+            local stats = u:FindFirstChild("_stats")
+            local lvl = stats and stats:FindFirstChild("upgrade")
+            local level = lvl and tonumber(lvl.Value) or 0
+            local can, cost = nextUpgrade(u, level)
+            if can then
+                local rank = RANK[role] or 2
+                if not pick or rank < pickRank or (rank == pickRank and level < pickLevel) then
+                    pick, pickLevel, pickRank, pickCost = u, level, rank, cost
+                end
             end
         end
     end
-    if not pick then
-        AutoPlaceModule.status = "All units placed and fully upgraded"
-        return
+    if not pick then return nil end
+    if pickCost and money and money < pickCost then
+        AutoPlaceModule.status = string.format("Upgrade %s to %d: waiting for money %d / %d", pick.Name, pickLevel + 1, math.floor(money), math.floor(pickCost))
+        return 0.2
     end
     AutoPlaceModule.status = string.format("Upgrading %s (level %d)", pick.Name, pickLevel)
     pcall(function() remote:InvokeServer(pick) end)
+    return pickCost and 0.3 or 1.5
 end
 
 -- The game shows each team slot's price on the hotbar ("800 ¥") and the cash just above it
@@ -2932,26 +3007,10 @@ end
 -- Role of a team unit before it is placed: remembered from earlier games, else guessed from
 -- the game's unit data (a farm/income number = farm, a buff skill = buff). nil = not known.
 function AutoPlaceModule.RoleOf(t)
+    local fromDef = AutoPlaceModule.RoleFromDef(t.name)
+    if fromDef then return fromDef end
     if AutoPlace.roles[t.name] then return AutoPlace.roles[t.name] end
     if UnitAI.learned[t.name] then return "buff" end
-    local def = AutoPlaceModule.UnitDef(t.name)
-    if not def then return nil end
-    local function hasFarm(tbl)
-        for k, v in pairs(tbl) do
-            local key = string.lower(tostring(k))
-            if (key:find("farm", 1, true) or key:find("income", 1, true)) and ((type(v) == "number" and v > 0) or v == true) then
-                return true
-            end
-        end
-        return false
-    end
-    local up = def.upgrade or def.upgrades
-    if hasFarm(def) or (type(up) == "table" and type(up[1]) == "table" and hasFarm(up[1])) then return "farm" end
-    for k, v in pairs(def) do
-        if type(v) == "string" and string.lower(tostring(k)):find("active", 1, true) and string.lower(v):find("buff", 1, true) then
-            return "buff"
-        end
-    end
     return nil
 end
 
@@ -2982,15 +3041,17 @@ local function chooseNext(prices)
     end
     local pick = (dpsPlaced == 0 and cheapest("dps")) or cheapest("farm")
     if not pick then
+        for _, e in ipairs(list) do e.value = AutoPlaceModule.Value(e.t.name, e.cost ~= math.huge and e.cost or nil) end
         table.sort(list, function(a, b)
             local ra, rb = a.placed / math.max(1, a.target), b.placed / math.max(1, b.target)
             if math.abs(ra - rb) > 1e-6 then return ra < rb end
             if a.role ~= b.role then return a.role == "dps" end
+            if math.abs(a.value - b.value) > 1e-9 then return a.value > b.value end
             return a.slot < b.slot
         end)
         pick = list[1]
     end
-    return pick.slot, pick.t, pick.role
+    return pick.slot, pick.t, pick.role, dpsPlaced
 end
 
 local function tick()
@@ -3014,20 +3075,32 @@ local function tick()
         end
     end
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
-    local slot, t, role = chooseNext(hudPrices)
+    local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
+    local slot, t, role, dpsPlaced = chooseNext(hudPrices)
+    if AutoPlace.upgrade and (dpsPlaced or 0) > 0 and (not t or role ~= "farm") then
+        -- once one damage unit and every farm are down, farm upgrades pay for themselves
+        -- quickly (speedwagon 200 -> 500 per wave), so they come before spreading more units
+        local wait = upgradeStep(money, "farm")
+        if wait then return wait end
+    end
     if not t then
-        if AutoPlace.upgrade then upgradeStep() return 1.5 end
+        if AutoPlace.upgrade then
+            local wait = upgradeStep(money)
+            if wait then return wait end
+            AutoPlaceModule.status = "All units placed and fully upgraded"
+            return 1
+        end
         AutoPlaceModule.status = "Everything placed"
         return 1
     end
     local cost = t.cost or hudPrices[slot]
-    local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
     if cost and money and money < cost then
         AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(cost))
         return 0.1
     end
     local unknown = not (cost and money)
-    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role) or bestSpot(0, role)
+    local range = AutoPlaceModule.Range(t.name)
+    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range) or bestSpot(0, role, range)
     if not spot then
         AutoPlaceModule.problem = "no free spot beside the path - the path may still be short"
         return 1
@@ -3262,7 +3335,7 @@ end
 local DungeonBotModule = {}
 
 local function refreshDungeonStatus()
-    if not dungeonStatusParagraph then return end
+    if not UIRef.dungeonStatusParagraph then return end
     local parts = { "Status: " .. DungeonBot.statusText }
     if DungeonBot.currentDepth > 0 then table.insert(parts, "Depth: " .. DungeonBot.currentDepth) end
     table.insert(parts, "Shrine: " .. (DungeonBot.shrineEnabled and "ON" or "OFF"))
@@ -3272,7 +3345,7 @@ local function refreshDungeonStatus()
     else
         table.insert(parts, "No remotes discovered yet (run Scan or Discovery)")
     end
-    dungeonStatusParagraph:UpdateBody(table.concat(parts, "\n"))
+    UIRef.dungeonStatusParagraph:UpdateBody(table.concat(parts, "\n"))
 end
 
 function DungeonBotModule.DiscoverRemotes()
@@ -3465,9 +3538,9 @@ function ToolsModule.StopAntiAfk()
 end
 
 function ToolsModule.RefreshStats()
-    if not statsText then return end
+    if not UIRef.statsText then return end
     local elapsed = os.clock() - Tools.sessionStartedAt
-    statsText:UpdateBody(string.format(
+    UIRef.statsText:UpdateBody(string.format(
         "Session time: %s\nTotal replays: %d\nFailed replays: %d\nTotal actions fired: %d",
         formatDuration(elapsed), Tools.totalReplays, Tools.totalFails, Tools.totalActions
     ))
@@ -3521,26 +3594,26 @@ local controlSection = macroTab:Section({ Side = "Left" })
 local fileSection = macroTab:Section({ Side = "Right" })
 
 controlSection:Header({ Text = "Record & Play" })
-statusParagraph = controlSection:Paragraph({ Header = "Status", Body = "" })
-recordToggle = controlSection:Toggle({
+UIRef.statusParagraph = controlSection:Paragraph({ Header = "Status", Body = "" })
+UIRef.recordToggle = controlSection:Toggle({
     Name = "Record",
     Default = false,
     Callback = function(on)
         if syncing then return end
         if on then
-            if not RecordingModule.Start() then setToggle(recordToggle, false) end
+            if not RecordingModule.Start() then setToggle(UIRef.recordToggle, false) end
         else
             RecordingModule.Stop()
         end
     end,
 }, "RecordToggle")
-playToggle = controlSection:Toggle({
+UIRef.playToggle = controlSection:Toggle({
     Name = "Play",
     Default = false,
     Callback = function(on)
         if syncing then return end
         if on then
-            if not PlaybackModule.Play(false) then setToggle(playToggle, false) end
+            if not PlaybackModule.Play(false) then setToggle(UIRef.playToggle, false) end
         else
             PlaybackModule.Stop()
         end
@@ -3553,7 +3626,7 @@ Controls.autoPlay = controlSection:Toggle({
 }, "AutoPlay")
 
 fileSection:Header({ Text = "Macro file" })
-savedDropdown = fileSection:Dropdown({
+UIRef.savedDropdown = fileSection:Dropdown({
     Name = "Saved",
     Multi = false,
     Required = false,
@@ -3563,7 +3636,7 @@ savedDropdown = fileSection:Dropdown({
         ProfilesModule.Load(selected)
     end,
 }, "SavedMacros")
-nameInput = fileSection:Input({
+UIRef.nameInput = fileSection:Input({
     Name = "Name",
     Placeholder = "auto from stage",
     AcceptedCharacters = "All",
@@ -3578,7 +3651,7 @@ fileSection:Button({ Name = "Save", Callback = ProfilesModule.Save })
 fileSection:Button({ Name = "Delete", Callback = ProfilesModule.DeleteCurrent })
 fileSection:Button({ Name = "Export", Callback = ProfilesModule.Export })
 fileSection:Button({ Name = "Import folder", Callback = ProfilesModule.ImportFolder })
-pasteInput = fileSection:Input({
+UIRef.pasteInput = fileSection:Input({
     Name = "Paste JSON",
     Placeholder = "paste here",
     AcceptedCharacters = "All",
@@ -3596,19 +3669,19 @@ local autoReplaySection = autoTab:Section({ Side = "Left" })
 local autoExtraSection = autoTab:Section({ Side = "Right" })
 
 autoReplaySection:Header({ Text = "Stage automation" })
-autoStatusParagraph = autoReplaySection:Paragraph({ Header = "Status", Body = "All off" })
+UIRef.autoStatusParagraph = autoReplaySection:Paragraph({ Header = "Status", Body = "All off" })
 
-autoReplayToggle = autoReplaySection:Toggle({
+UIRef.autoReplayToggle = autoReplaySection:Toggle({
     Name = "Auto replay (same stage)",
     Default = AutoFarm.autoReplay,
     Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoReplay")
-autoNextToggle = autoReplaySection:Toggle({
+UIRef.autoNextToggle = autoReplaySection:Toggle({
     Name = "Auto next stage (on victory)",
     Default = AutoFarm.autoNextStage,
     Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
 }, "AutoNext")
-autoLeaveToggle = autoReplaySection:Toggle({
+UIRef.autoLeaveToggle = autoReplaySection:Toggle({
     Name = "Auto leave (when you lose)",
     Default = AutoFarm.autoLeave,
     Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
@@ -3622,7 +3695,7 @@ Controls.leaveAtWave = autoExtraSection:Slider({
     Default = AutoFarm.leaveAtWave,
     Callback = function(v) AutoFarm.leaveAtWave = v; refreshAutoStatus(); saveConfig() end,
 }, "LeaveWave")
-autoSellToggle = autoExtraSection:Toggle({
+UIRef.autoSellToggle = autoExtraSection:Toggle({
     Name = "Auto sell unit at wave",
     Default = AutoFarm.autoSell,
     Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus(); saveConfig() end,
@@ -3662,8 +3735,8 @@ local abilitySection = unitsTab:Section({ Side = "Left" })
 local buffSection = unitsTab:Section({ Side = "Right" })
 
 abilitySection:Header({ Text = "Auto abilities" })
-unitStatusParagraph = abilitySection:Paragraph({ Header = "Status", Body = "All off" })
-autoAbilitiesToggle = abilitySection:Toggle({
+UIRef.unitStatusParagraph = abilitySection:Paragraph({ Header = "Status", Body = "All off" })
+UIRef.autoAbilitiesToggle = abilitySection:Toggle({
     Name = "Auto use unit abilities",
     Default = false,
     Callback = function(on)
@@ -3682,7 +3755,7 @@ Controls.abilityCooldown = abilitySection:Slider({
 abilitySection:Paragraph({ Header = "", Body = "Damage abilities: fired only while the unit\nis attacking." })
 
 buffSection:Header({ Text = "Buff rotation" })
-autoBuffToggle = buffSection:Toggle({
+UIRef.autoBuffToggle = buffSection:Toggle({
     Name = "Auto use buffs",
     Default = false,
     Callback = function(on)
@@ -3786,7 +3859,7 @@ local dungeonMainSection = dungeonTab:Section({ Side = "Left" })
 local dungeonConfigSection = dungeonTab:Section({ Side = "Right" })
 
 dungeonMainSection:Header({ Text = "Auto dungeon run" })
-dungeonStatusParagraph = dungeonMainSection:Paragraph({ Header = "Status", Body = "Idle" })
+UIRef.dungeonStatusParagraph = dungeonMainSection:Paragraph({ Header = "Status", Body = "Idle" })
 dungeonMainSection:Toggle({
     Name = "Enable dungeon bot",
     Default = false,
@@ -3894,7 +3967,7 @@ Controls.showAllMacros = optionsSection:Toggle({
         saveConfig()
     end,
 }, "ShowAllMacros")
-antiAfkToggle = optionsSection:Toggle({
+UIRef.antiAfkToggle = optionsSection:Toggle({
     Name = "Anti-AFK",
     Default = false,
     Callback = function(on)
@@ -3928,11 +4001,11 @@ webhookSection:Button({
 })
 
 toolsSection:Header({ Text = "Session stats" })
-statsText = toolsSection:Paragraph({ Header = "Stats", Body = "" })
+UIRef.statsText = toolsSection:Paragraph({ Header = "Stats", Body = "" })
 toolsSection:Button({ Name = "Refresh stats", Callback = ToolsModule.RefreshStats })
 
 logSection:Header({ Text = "Debug" })
-actionsParagraph = logSection:Paragraph({ Header = "Last actions", Body = "Nothing recorded yet." })
+UIRef.actionsParagraph = logSection:Paragraph({ Header = "Last actions", Body = "Nothing recorded yet." })
 logSection:Button({ Name = "Copy full log", Callback = RecordingModule.CopyLog })
 logSection:Button({ Name = "Scan game", Callback = Scan.Run })
 logSection:Button({ Name = "Refresh saved list", Callback = function() refreshSavedList(cleanName(State.macroName)) end })
@@ -4087,10 +4160,10 @@ end
 applyRuntimeFeatures = function()
     local wasReady = configReady
     configReady = false
-    setControl(autoReplayToggle, AutoFarm.autoReplay)
-    setControl(autoNextToggle, AutoFarm.autoNextStage)
-    setControl(autoLeaveToggle, AutoFarm.autoLeave)
-    setControl(autoSellToggle, AutoFarm.autoSell)
+    setControl(UIRef.autoReplayToggle, AutoFarm.autoReplay)
+    setControl(UIRef.autoNextToggle, AutoFarm.autoNextStage)
+    setControl(UIRef.autoLeaveToggle, AutoFarm.autoLeave)
+    setControl(UIRef.autoSellToggle, AutoFarm.autoSell)
     setControl(Controls.leaveAtWave, AutoFarm.leaveAtWave)
     setControl(Controls.sellAtWave, AutoFarm.sellAtWave)
     setControl(Controls.sellUnitName, AutoFarm.sellUnitName)
@@ -4110,13 +4183,13 @@ applyRuntimeFeatures = function()
     setControl(Controls.profileName, Profile.name)
 
     UnitAI.autoAbilities = pendingToggles.autoAbilities == true
-    setControl(autoAbilitiesToggle, UnitAI.autoAbilities)
+    setControl(UIRef.autoAbilitiesToggle, UnitAI.autoAbilities)
     if UnitAI.autoAbilities then UnitAIModule.StartAbilities() else UnitAIModule.StopAbilities() end
     UnitAI.autoBuff = pendingToggles.autoBuff == true
-    setControl(autoBuffToggle, UnitAI.autoBuff)
+    setControl(UIRef.autoBuffToggle, UnitAI.autoBuff)
     if UnitAI.autoBuff then UnitAIModule.StartBuff() else UnitAIModule.StopBuff() end
     Tools.antiAfk = pendingToggles.antiAfk == true
-    setControl(antiAfkToggle, Tools.antiAfk)
+    setControl(UIRef.antiAfkToggle, Tools.antiAfk)
     if Tools.antiAfk then ToolsModule.StartAntiAfk() else ToolsModule.StopAntiAfk() end
     setControl(Controls.autoPlaceUpgrade, AutoPlace.upgrade)
     for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
