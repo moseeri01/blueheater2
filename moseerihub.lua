@@ -3914,9 +3914,16 @@ local function tryPlace(t, spot)
     end
     local before = numbersOnPlayer()
     local count = #placedOf(t.uuid)
+    -- an event copy's placed unit may carry a new uuid: count that unit type on the map too
+    local function sameType()
+        local n = 0
+        for _, u in ipairs(ownedUnits()) do if unitType(u) == t.name then n = n + 1 end end
+        return n
+    end
+    local typeCount = t.temp and sameType() or nil
     local y = spot.groundY or groundAt(spot.x, spot.y, spot.z)
     local repliedAt
-    AutoPlaceModule.inFlight = true
+    AutoPlaceModule.inFlight, AutoPlaceModule.inFlightAt = true, os.clock()
     task.spawn(function()
         pcall(function() remote:InvokeServer(t.uuid, CFrame.new(spot.x, y, spot.z)) end)
         repliedAt = os.clock()
@@ -3928,6 +3935,10 @@ local function tryPlace(t, spot)
     while os.clock() < deadline and not (repliedAt and os.clock() - repliedAt > 0.3) do
         task.wait(0.1)
         local now = placedOf(t.uuid)
+        if typeCount and #now <= count and sameType() > typeCount then
+            AutoPlaceModule.lastTry = t.name .. ": placed (new uuid)"
+            return true
+        end
         if #now > count then
             local stats = now[#now]:FindFirstChild("_stats")
             local spent = stats and stats:FindFirstChild("total_spent")
@@ -3950,6 +3961,7 @@ local function tryPlace(t, spot)
             return true
         end
     end
+    AutoPlaceModule.lastTry = string.format("%s: %s", t.name, repliedAt and "refused" or "no reply yet")
     return false
 end
 
@@ -4705,6 +4717,8 @@ local function tick()
         end
         return 0.1
     end
+    -- (a call the game never answers must not stop placing for good: given up after 6 s)
+    if AutoPlaceModule.inFlight and os.clock() - (AutoPlaceModule.inFlightAt or 0) > 6 then AutoPlaceModule.inFlight = nil end
     if AutoPlaceModule.inFlight then
         -- (the game has not answered the last placement yet: a second one could double it)
         AutoPlaceModule.status = "Waiting for the game to answer the last placement"
@@ -7651,8 +7665,9 @@ function Lobby.Loop()
                 local hp, hpMax = AutoPlaceModule.ScanBaseHp()
                 local money = readCostValue("LP._stats.resource")
                 Lobby.live = Lobby.live or {}
-                table.insert(Lobby.live, string.format("%s wave %s money %s base %s/%s | %s", os.date("%H:%M:%S"), tostring(getCurrentWave()),
-                    tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), (AutoPlaceModule.StatusText():gsub("\n", " | "))))
+                table.insert(Lobby.live, string.format("%s money %s base %s/%s units %d try %s candy %s | %s", os.date("%H:%M:%S"),
+                    tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), #ownedUnits(), tostring(AutoPlaceModule.lastTry),
+                    tostring(Lobby.candy), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
                 if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
             end)
