@@ -140,7 +140,7 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, eggs = {}, claim = false, towerRoom = 0 },
+        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {} },
     watchLog = {},
 }
 
@@ -7569,6 +7569,34 @@ function Lobby.Picked(list, name)
     return false
 end
 
+-- Portal challenges from the game's ChallengeAndRewards data: id -> shown name ("double_cost"
+-- -> "High Cost", "regen_enemies" -> "Regen Enemies" ...), and the names sorted for the list.
+function Lobby.ChallengeNames()
+    local byId, names = {}, {}
+    pcall(function()
+        local data = require(ReplicatedStorage.src.Data.ChallengeAndRewards)
+        for id, ch in pairs(type(data) == "table" and type(data.challenges) == "table" and data.challenges or {}) do
+            local name = type(ch) == "table" and type(ch.name) == "string" and ch.name or tostring(id)
+            byId[tostring(id)] = name
+            table.insert(names, name)
+        end
+    end)
+    table.sort(names)
+    return byId, names
+end
+
+-- The challenges on one portal: any string inside its item data that is a challenge id.
+function Lobby.PortalChallenges(item, byId, out, depth)
+    out, depth = out or {}, depth or 0
+    if type(item) ~= "table" or depth > 5 then return out end
+    for k, v in pairs(item) do
+        if type(v) == "string" and byId[v] then out[byId[v]] = true end
+        if type(k) == "string" and byId[k] and v ~= false then out[byId[k]] = true end
+        if type(v) == "table" then Lobby.PortalChallenges(v, byId, out, depth + 1) end
+    end
+    return out
+end
+
 -- Portals: the picked portal kind with the lowest tier at or above "Lowest tier" is used
 -- (use_portal(uuid), as watched), then its new portal room is started. Returns true when
 -- one was used, false when none is left (Auto join takes over).
@@ -7576,13 +7604,24 @@ function Lobby.UsePortal()
     local c = Lobby.cfg
     if c.portal == "" then return false end
     local best, bestTier
+    -- "Challenges to play": only portals carrying one of the picked challenges (none = any)
+    local byId = #c.challenges > 0 and Lobby.ChallengeNames() or nil
     for _, u in ipairs(Lobby.Bag().uniques) do
         if u.id:find("^portal") and Lobby.prettyName(u.id) == c.portal then
             local tier = Lobby.Tier(u.data) or 0
-            if tier >= (tonumber(c.portalTier) or 1) and (not best or tier < bestTier) then best, bestTier = u, tier end
+            local fits = not byId
+            if byId then
+                for name in pairs(Lobby.PortalChallenges(u.data, byId)) do
+                    if Lobby.Picked(c.challenges, name) then fits = true end
+                end
+            end
+            if fits and tier >= (tonumber(c.portalTier) or 1) and (not best or tier < bestTier) then best, bestTier = u, tier end
         end
     end
-    if not best then Lobby.Status("Portals: no " .. c.portal .. " at tier " .. c.portalTier .. "+ left - Auto join") return false end
+    if not best then
+        Lobby.Status("Portals: no " .. c.portal .. " at tier " .. c.portalTier .. "+" .. (byId and " with a picked challenge" or "") .. " left - Auto join")
+        return false
+    end
     local use, start = getAARemote("use_portal"), getAARemote("request_start_game")
     if not (use and start) then return false end
     local before = {}
@@ -7731,6 +7770,8 @@ portal:Toggle({ Name = "Use portals", Default = Lobby.cfg.usePortals, Callback =
 local portalDropdown = portal:Dropdown({ Name = "Portal", Multi = false, Required = false, Options = portals,
     Default = Lobby.cfg.portal ~= "" and Lobby.cfg.portal or nil,
     Callback = function(v) if syncing or type(v) ~= "string" then return end Lobby.cfg.portal = v saveConfig() end }, "LobbyPortal")
+portal:Dropdown({ Name = "Challenges to play", Multi = true, Required = false, Options = select(2, Lobby.ChallengeNames()),
+    Default = picked(Lobby.cfg.challenges), Callback = setList("challenges") }, "LobbyChallenges")
 portal:Dropdown({ Name = "Lowest tier", Multi = false, Required = true, Options = { "1", "2", "3", "4", "5", "6" },
     Default = Lobby.cfg.portalTier, Callback = set("portalTier") }, "LobbyPortalTier")
 portal:Toggle({ Name = "Friends only (portal)", Default = Lobby.cfg.portalFriends, Callback = set("portalFriends") }, "LobbyPortalFriends")
