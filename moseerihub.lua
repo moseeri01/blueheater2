@@ -97,6 +97,7 @@ local AutoPlace = {
     paths = {},                   -- [stage] = { {x,y,z}, ... } learned from enemy movement
     caps = {},                    -- [unit name] = how many the game lets you place, learned once
     roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
+    unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
 }
 
 -- Dungeon Bot state
@@ -227,6 +228,7 @@ local function buildConfigData()
             moneyPath = AutoPlace.moneyPath, paths = next(AutoPlace.paths) and AutoPlace.paths or nil,
             caps = next(AutoPlace.caps) and AutoPlace.caps or nil,
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
+            unitInfo = next(AutoPlace.unitInfo or {}) and AutoPlace.unitInfo or nil,
         },
     }
 end
@@ -280,6 +282,7 @@ local function applyConfigData(data)
         for i = 1, 6 do AutoPlace.slots[i] = tonumber(ap.slots[i]) or AutoPlace.slots[i] end
     end
     AutoPlace.moneyPath = pick(ap.moneyPath, "string", AutoPlace.moneyPath)
+    if type(ap.unitInfo) == "table" then AutoPlace.unitInfo = ap.unitInfo end
     if type(ap.paths) == "table" then AutoPlace.paths = ap.paths end
     if type(ap.caps) == "table" then AutoPlace.caps = ap.caps end
     if type(ap.roles) == "table" then AutoPlace.roles = ap.roles end
@@ -2936,8 +2939,42 @@ local function bestSpot(skip, role, range, kind)
     return free[skip + 1]
 end
 
+-- Trait names out of whatever shape the game stores them in: "golden", { "golden" },
+-- { golden = true }, { golden = 1 }, { { name = "range", level = 2 } }, nested one more level.
+-- Free text is kept only when it is a known trait word or a short plain name.
+function AutoPlaceModule.CollectTraits(val, out, depth, key)
+    out, depth = out or {}, depth or 0
+    local function add(text)
+        text = tostring(text):gsub("^%s+", ""):gsub("%s+$", "")
+        local word = string.lower(text):match("^%a+")
+        if not word or #text > 24 or text:find("-", 1, true) then return end
+        if not TRAITS[word] and (depth > 1 or text:find("%d%d%d")) then return end
+        for _, have in ipairs(out) do if string.lower(have) == string.lower(text) then return end end
+        table.insert(out, text)
+    end
+    if type(val) == "string" then
+        if val ~= "" then add(val) end
+    elseif (val == true or type(val) == "number") and type(key) == "string" then
+        local word = string.lower(key):match("^%a+")
+        if word and TRAITS[word] then
+            add(type(val) == "number" and val > 1 and val <= 3 and (key .. " " .. math.floor(val)) or key)
+        end
+    elseif type(val) == "table" and depth < 3 then
+        local name = rawget(val, "name") or rawget(val, "id") or rawget(val, "trait") or rawget(val, "trait_id") or rawget(val, "type")
+        if type(name) == "string" then
+            local lvl = tonumber(rawget(val, "level") or rawget(val, "tier") or rawget(val, "rank"))
+            add(lvl and lvl > 1 and (name .. " " .. math.floor(lvl)) or name)
+        else
+            for k, v in pairs(val) do AutoPlaceModule.CollectTraits(v, out, depth + 1, type(k) == "string" and k or nil) end
+        end
+    end
+    return out
+end
+
 -- Team = equipped units { slot -> {uuid, name} }: from the game's own data (getgc), plus
 -- any unit of ours already on the map (its _stats.uuid), so it works without getgc too.
+-- Traits and rolls found once are remembered per unit (AutoPlace.unitInfo, saved), so a
+-- game where the game data cannot be read still knows them.
 function AutoPlaceModule.RefreshTeam()
     local team = {}
     if type(getgc) == "function" then
@@ -2954,14 +2991,9 @@ function AutoPlaceModule.RefreshTeam()
                             table.insert(keys, key)
                             if type(val) == "number" and lower:find("stat", 1, true) then rolls[key] = val end
                             -- named traits (Divine, Godspeed, Sniper II, ...) in any "trait" field
-                            if lower:find("trait", 1, true) then
-                                if type(val) == "string" and val ~= "" then table.insert(traits, val)
-                                elseif type(val) == "table" then
-                                    for tk, tv in pairs(val) do
-                                        if type(tv) == "string" then table.insert(traits, tv)
-                                        elseif tv == true then table.insert(traits, tostring(tk)) end
-                                    end
-                                end
+                            -- ("trait_stats" holds numbers like range = 1.1, not names)
+                            if lower:find("trait", 1, true) and not lower:find("stat", 1, true) then
+                                AutoPlaceModule.CollectTraits(val, traits, 0)
                             end
                         end
                         table.sort(keys)
@@ -3009,9 +3041,24 @@ function AutoPlaceModule.RefreshTeam()
             end
         end
     end
+    AutoPlace.unitInfo = AutoPlace.unitInfo or {}
+    local learned = false
     for s, t in pairs(team) do
         local old = AutoPlaceModule.team[s]
         if old and old.uuid == t.uuid then t.cost = old.cost end
+        local key = (tostring(t.uuid):gsub("[{}%s]", ""))
+        local info = AutoPlace.unitInfo[key]
+        if t.fields then
+            -- read from the game data just now: remember it (changes when traits are rerolled)
+            local traitText = table.concat(t.traits or {}, ",")
+            if not info or info.traits ~= traitText or info.name ~= t.name then
+                AutoPlace.unitInfo[key] = { name = t.name, traits = traitText, rolls = t.rolls }
+                learned = true
+            end
+        elseif info then
+            t.traits, t.rolls, t.fromMemory = {}, info.rolls or {}, true
+            for word in string.gmatch(info.traits or "", "[^,]+") do table.insert(t.traits, word) end
+        end
         -- price and placement limit straight from the game's unit data, when it has them
         local def = AutoPlaceModule.UnitDef(t.name)
         if def then
@@ -3028,6 +3075,8 @@ function AutoPlaceModule.RefreshTeam()
         end
     end
     AutoPlaceModule.team = team
+    AutoPlaceModule.teamReadAt = os.clock()
+    if learned then saveConfig() end
     return team
 end
 
@@ -3191,19 +3240,34 @@ local function upgradeGain(u, level)
     return math.max(0, statsAt(level + 1) - statsAt(level)) * mult
 end
 
--- One upgrade: farms first (they pay for the rest), then damage, buffs last. Farms and buffs
--- go lowest level first; damage units go by the most damage gained per ¥, so the strongest
--- unit (best trait / rolls / upgrade path) is pushed up first instead of spreading thin.
--- onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
+-- Best damage gained per ¥ from upgrading any placed damage unit (0 when none can be upgraded).
+function AutoPlaceModule.BestUpgradeScore()
+    local best, now = 0, os.clock()
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" and (upgradeFails[u] or 0) < now then
+            local lvl = u:FindFirstChild("_stats") and u._stats:FindFirstChild("upgrade")
+            local level = lvl and tonumber(lvl.Value) or 0
+            local can, cost = nextUpgrade(u, level)
+            if can and cost then best = math.max(best, upgradeGain(u, level) / math.max(1, cost)) end
+        end
+    end
+    return best
+end
+
+-- One upgrade: farms first (they pay for the rest), then support, then damage. Buff units
+-- (Erwin, Wendy ...) are never upgraded: their buff does not grow with it, money wasted.
+-- Farms go lowest level first; damage units go by the most damage gained per ¥, so the
+-- strongest unit (best trait / rolls / upgrade path) is pushed up first instead of spreading
+-- thin. onlyRole limits it to one role. Returns seconds to wait, or nil when nothing is left.
 local function upgradeStep(money, onlyRole)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
-    local RANK = { farm = 1, dps = 2, buff = 3, support = 3 }
+    local RANK = { farm = 1, dps = 2, support = 2 }
     local pick, pickLevel, pickRank, pickCost, pickScore, pickRole
     local now = os.clock()
     for _, u in ipairs(ownedUnits()) do
         local role = unitRole(u)
-        if (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now then
+        if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now then
             local stats = u:FindFirstChild("_stats")
             local lvl = stats and stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
@@ -3445,6 +3509,12 @@ local function tick()
     local grew = samplePath()
     if grew and #pathPoints() % 20 == 0 then saveConfig() end
     if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
+    -- part of the team came only from units on the map (no traits/rolls): read again now and then
+    if os.clock() - (AutoPlaceModule.teamReadAt or 0) > 15 then
+        for _, t in pairs(AutoPlaceModule.team) do
+            if not t.fields then AutoPlaceModule.RefreshTeam() break end
+        end
+    end
     if not next(AutoPlaceModule.team) then
         AutoPlaceModule.problem = "team not found yet - place one unit by hand, or press Refresh team"
         return 2
@@ -3490,6 +3560,14 @@ local function tick()
         return 1
     end
     local cost = t.cost or hudPrices[slot]
+    if not danger and AutoPlace.upgrade and role == "dps" and (dpsPlaced or 0) > 0 then
+        -- stay ahead instead of waiting for the base to get hit: when upgrading the strongest
+        -- unit (trait / rolls included) adds more damage per ¥ than another copy, upgrade it
+        if AutoPlaceModule.BestUpgradeScore() > AutoPlaceModule.Value(t, cost) then
+            local wait = upgradeStep(money, "dps")
+            if wait then return wait end
+        end
+    end
     if cost and money and money < cost then
         AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(cost))
         return 0.1
@@ -3604,8 +3682,9 @@ function AutoPlaceModule.StatusText()
             local target = math.min(AutoPlace.slots[s] or 0, cap or 99)
             if role == "buff" then target = math.min(target, AutoPlaceModule.BuffNeed(t)) end
             local full = (cap and target == cap) and " (limit)" or ""
-            table.insert(team, string.format("%d %s%s %d/%d%s", s, t.name, role and ("[" .. role .. "]") or "",
-                #placedOf(t.uuid), target, full))
+            local traitText = #(t.traits or {}) > 0 and (" {" .. table.concat(t.traits, ",") .. "}") or ""
+            table.insert(team, string.format("%d %s%s %d/%d%s%s", s, t.name, role and ("[" .. role .. "]") or "",
+                #placedOf(t.uuid), target, full, traitText))
         end
     end
     table.insert(lines, "Team: " .. (#team > 0 and table.concat(team, ", ") or "not read yet"))
@@ -3636,8 +3715,8 @@ function AutoPlaceModule.MapReport()
                 s, t.name, clip(t.uuid, 14), tostring(t.cost), tostring(AutoPlaceModule.RoleOf(t)),
                 #rolls > 0 and table.concat(rolls, " ") or "none", st.damage, st.cooldown, st.range))
             table.insert(lines, "  team data fields: " .. clip(t.fields or "-", 300))
-            table.insert(lines, string.format("  traits: %s | stands on: %s | raw: %s",
-                #(t.traits or {}) > 0 and table.concat(t.traits, ", ") or "none",
+            table.insert(lines, string.format("  traits: %s%s | stands on: %s | raw: %s",
+                #(t.traits or {}) > 0 and table.concat(t.traits, ", ") or "none", t.fromMemory and " (remembered)" or "",
                 AutoPlaceModule.PlacementKind(t), clip(t.traitRaw ~= "" and t.traitRaw or "-", 200)))
         end
     end
@@ -3668,6 +3747,39 @@ function AutoPlaceModule.MapReport()
         end
     end
     table.insert(lines, string.format("enemies now: %d %s", enemies, sample or ""))
+    -- every enemy type on the map with its own values and attributes (flying, regen, shield
+    -- ... whatever the game calls them), to teach Auto Place which units can hit what
+    local seenKind = {}
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        local stats = u:FindFirstChild("_stats")
+        local id = stats and stats:FindFirstChild("id")
+        local kind = id and tostring(id.Value) or u.Name
+        if isEnemy(u) and not seenKind[kind] then
+            seenKind[kind] = true
+            local parts = {}
+            for _, c in ipairs(stats and stats:GetChildren() or {}) do
+                if c:IsA("ValueBase") then table.insert(parts, c.Name .. "=" .. clip(tostring(c.Value), 20)) end
+            end
+            local ok, attrs = pcall(function() return u:GetAttributes() end)
+            for k, v in pairs(ok and attrs or {}) do table.insert(parts, "@" .. tostring(k) .. "=" .. clip(tostring(v), 20)) end
+            local p = rootPos(u)
+            table.sort(parts)
+            table.insert(lines, string.format("enemy %s y=%s: %s", kind, p and string.format("%.1f", p.Y) or "?", clip(table.concat(parts, " "), 700)))
+        end
+    end
+    -- unit data keys that may decide air / hidden targets
+    local airKeys = {}
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s]
+        local def = t and AutoPlaceModule.UnitDef(t.name)
+        for k, v in pairs(def or {}) do
+            local key = string.lower(tostring(k))
+            if key:find("fly", 1, true) or key:find("air", 1, true) or key:find("hidden", 1, true) or key:find("target", 1, true) then
+                table.insert(airKeys, t.name .. "." .. tostring(k) .. "=" .. clip(tostring(v), 20))
+            end
+        end
+    end
+    table.insert(lines, "unit air/target keys: " .. (#airKeys > 0 and table.concat(airKeys, " ") or "none"))
     local hpNow, hpMax = AutoPlaceModule.BaseHp()
     table.insert(lines, string.format("base hp read from screen: %s / %s (danger mode needs this), leading enemy %.0f%% of the way",
         tostring(hpNow), tostring(hpMax), AutoPlaceModule.EnemyProgress() * 100))
