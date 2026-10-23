@@ -294,17 +294,14 @@ local function applyConfigData(data)
     AutoFarm.autoLeave = pick(a.autoLeave, "boolean", AutoFarm.autoLeave)
     AutoFarm.autoStart = pick(a.autoStart, "boolean", AutoFarm.autoStart)
     AutoFarm.autoSkip = pick(a.autoSkip, "boolean", AutoFarm.autoSkip)
-    AutoFarm.leaveAtWave = pick(a.leaveAtWave, "number", AutoFarm.leaveAtWave)
-    AutoFarm.speedMultiplier = pick(a.speedMultiplier, "number", AutoFarm.speedMultiplier)
-    AutoFarm.autoSell = pick(a.autoSell, "boolean", AutoFarm.autoSell)
-    AutoFarm.sellAtWave = pick(a.sellAtWave, "number", AutoFarm.sellAtWave)
-    AutoFarm.sellUnitName = pick(a.sellUnitName, "string", AutoFarm.sellUnitName)
+    -- macro playback extras have no controls any more (owner removed them): fixed values so an
+    -- old config cannot leave one switched on with no way to turn it off
+    AutoFarm.leaveAtWave, AutoFarm.speedMultiplier, AutoFarm.autoSell, AutoFarm.sellAtWave = 0, 1, false, 0
     local m = data.macro or {}
-    State.retryPlacements = pick(m.retryPlacements, "boolean", State.retryPlacements)
-    -- "Place as soon as money allows" is on for everyone once (configs saved before macroFastV2)
-    if m.macroFastV2 ~= true then State.retryPlacements = true end
+    -- purchases always go the moment money allows (in recorded order)
+    State.retryPlacements = true
     State.autoPlay = pick(m.autoPlay, "boolean", State.autoPlay)
-    State.showAllMacros = pick(m.showAllMacros, "boolean", State.showAllMacros)
+    State.showAllMacros = false
     if type(m.lastMacro) == "string" and #m.lastMacro > 0 then State.macroName = m.lastMacro end
     local t = data.tools or {}
     pendingToggles.antiAfk = t.antiAfk ~= false -- on unless the saved config turned it off
@@ -3220,22 +3217,24 @@ function AutoPlaceModule.WatchHits()
 end
 function AutoPlaceModule.OutOfReach(u)
     if unitRole(u) ~= "dps" then return false end
+    -- summoners and trap units deal their damage through other things, so their own
+    -- counter can stay at 0 while they work (Elyssia's card shows DMG 0)
+    local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+    if def.spawn_unit or def.spawn_script or def.max_path_units or AutoPlaceModule.IsTrap(unitType(u)) then return false end
     local h = AutoPlaceModule.hits[u] or {}
     AutoPlaceModule.hits[u] = h
-    local out
-    if h.total ~= nil then
-        -- (with a hit counter, a unit gets upgrades only once it has hit something)
-        if h.total == 0 and h.quiet < 60 then return true end
+    -- its spot reaches no road point at all (3D): out of range right away
+    local p, pts = rootPos(u), pathPoints()
+    if not p or #pts < 8 then return false end
+    local r = unitReach(u)
+    local out = true
+    for _, q in ipairs(pts) do
+        if (q[1] - p.X) ^ 2 + (q[2] - p.Y) ^ 2 + (q[3] - p.Z) ^ 2 <= r * r then out = false break end
+    end
+    if not out and h.total ~= nil then
+        -- or enemies spent a full minute inside its range and it never hit (no hit yet is
+        -- fine: front units may kill everything before it gets a turn)
         out = h.quiet >= 60 and h.total == 0
-    else
-        -- no hit counter in this game: does its spot reach any road point?
-        local p, pts = rootPos(u), pathPoints()
-        if not p or #pts < 8 then return false end
-        local r = unitReach(u)
-        out = true
-        for _, q in ipairs(pts) do
-            if (q[1] - p.X) ^ 2 + (q[2] - p.Y) ^ 2 + (q[3] - p.Z) ^ 2 <= r * r then out = false break end
-        end
     end
     if out and not h.noted then
         h.noted = true
@@ -6078,7 +6077,10 @@ end
 -- ping), or "<@ID>" for an old config that saved a user id. Normal reports mention nobody.
 -- At most one ping per event type per 2 minutes.
 Webhook.lastPing = {}
+-- owner turned pings off for now (2026-10-24): alerts still post, they just mention nobody
+Webhook.pingsOff = true
 function Webhook.PingFor(kind)
+    if Webhook.pingsOff then return nil end
     local id = tostring(Webhook.pingId or ""):match("^%s*(%d+)%s*$")
     if id and #id < 5 then id = nil end
     local on = ({ mythic = Webhook.pingMythic, bag = Webhook.pingBagFull, disconnect = Webhook.pingDisconnect, losses = Webhook.pingLosses })[kind]
@@ -6903,54 +6905,6 @@ UIRef.nameInput = controlSection:Input({
 }, "MacroName")
 controlSection:Button({ Name = "Save", Callback = ProfilesModule.Save })
 controlSection:Button({ Name = "Delete", Callback = ProfilesModule.DeleteCurrent })
-Controls.speedMultiplier = controlSection:Slider({
-    Name = "Timed actions speed",
-    Minimum = 0.5,
-    Maximum = 5,
-    Default = AutoFarm.speedMultiplier,
-    Precision = 1,
-    Callback = function(v) AutoFarm.speedMultiplier = v; refreshAutoStatus(); saveConfig() end,
-}, "SpeedMul")
-Controls.leaveAtWave = controlSection:Slider({
-    Name = "Leave at wave",
-    Minimum = 0,
-    Maximum = 50,
-    Default = AutoFarm.leaveAtWave,
-    Callback = function(v) AutoFarm.leaveAtWave = v; refreshAutoStatus(); saveConfig() end,
-}, "LeaveWave")
-UIRef.autoSellToggle = controlSection:Toggle({
-    Name = "Sell unit at wave",
-    Default = AutoFarm.autoSell,
-    Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoSell")
-Controls.sellAtWave = controlSection:Slider({
-    Name = "Sell at wave",
-    Minimum = 0,
-    Maximum = 50,
-    Default = AutoFarm.sellAtWave,
-    Callback = function(v) AutoFarm.sellAtWave = v; refreshAutoStatus(); saveConfig() end,
-}, "SellWave")
-Controls.sellUnitName = controlSection:Input({
-    Name = "Unit to sell",
-    Placeholder = "e.g. Farmer",
-    Default = AutoFarm.sellUnitName,
-    AcceptedCharacters = "All",
-    Callback = function(text) AutoFarm.sellUnitName = text or ""; saveConfig() end,
-}, "SellUnitName")
-Controls.retryPlacements = controlSection:Toggle({
-    Name = "Place as soon as money allows",
-    Default = State.retryPlacements,
-    Callback = function(on) State.retryPlacements = on; saveConfig() end,
-}, "RetryPlacements")
-Controls.showAllMacros = controlSection:Toggle({
-    Name = "Show all stages",
-    Default = State.showAllMacros,
-    Callback = function(on)
-        State.showAllMacros = on
-        refreshSavedList(cleanName(State.macroName))
-        saveConfig()
-    end,
-}, "ShowAllMacros")
 
 fileSection:Header({ Text = "Import / export" })
 fileSection:Button({ Name = "Export", Callback = ProfilesModule.Export })
@@ -7571,18 +7525,11 @@ applyRuntimeFeatures = function()
     setControl(UIRef.autoLeaveToggle, AutoFarm.autoLeave)
     setControl(Controls.autoStart, AutoFarm.autoStart)
     setControl(Controls.autoSkip, AutoFarm.autoSkip)
-    setControl(UIRef.autoSellToggle, AutoFarm.autoSell)
-    setControl(Controls.leaveAtWave, AutoFarm.leaveAtWave)
-    setControl(Controls.sellAtWave, AutoFarm.sellAtWave)
-    setControl(Controls.sellUnitName, AutoFarm.sellUnitName)
-    setControl(Controls.speedMultiplier, AutoFarm.speedMultiplier)
     setControl(Controls.abilityCooldown, UnitAI.abilityCooldown)
     setControl(Controls.buffGap, UnitAI.buffGap)
     setControl(Controls.buffDuration, UnitAI.buffDuration)
     setControl(Controls.minUnitsForBuff, UnitAI.minUnitsForBuff)
     setControl(Controls.autoPlay, State.autoPlay)
-    setControl(Controls.retryPlacements, State.retryPlacements)
-    setControl(Controls.showAllMacros, State.showAllMacros)
     setControl(Controls.webhookUrl, Webhook.Masked())
     setControl(Controls.discordAlerts, Webhook.AlertsOn())
     setControl(Controls.shrineEnabled, DungeonRun.acceptShrines)
