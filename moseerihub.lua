@@ -1502,11 +1502,20 @@ function PlaybackModule.Play(fromGameStart)
                 end
                 if not alive() then break end
                 markProgress(i)
-                local firedAt = os.clock()
-                if fireAction(i, a) then
-                    task.spawn(claimSpawnedUnit, i, a, firedAt, alive)
+                local skillPress = a.name == "use_active_attack"
+                for _, e in pairs(UnitAI.learned) do
+                    if e.name == a.name then skillPress = true end
+                end
+                if UnitAI.autoBuff and skillPress then
+                    -- skill presses recorded by hand would break the buff rotation's turn order
+                    addReplayLog(string.format("#%d %s: skipped, buff rotation handles skills", i, a.name))
                 else
-                    failed = failed + 1
+                    local firedAt = os.clock()
+                    if fireAction(i, a) then
+                        task.spawn(claimSpawnedUnit, i, a, firedAt, alive)
+                    else
+                        failed = failed + 1
+                    end
                 end
             end
         end
@@ -1997,10 +2006,22 @@ end
 -- What the last buff tick did, shown on the Units page so a silent failure is visible.
 local BuffInfo = { at = nil, fired = 0, via = "-", reply = "-", problem = nil }
 
+-- unitInFlight[unit] = { [callId] = startTime }. A call the game never answers stops counting
+-- after 8 s; before, unanswered calls piled up and the unit was never cast again after ~6 rounds.
+local IN_FLIGHT_TTL = 8
+local callSeq = 0
+
 local function sendSkill(unit, remote, method, args, n)
-    local inFlight = unitInFlight[unit] or 0
-    if inFlight >= MAX_IN_FLIGHT then return false end
-    unitInFlight[unit] = inFlight + 1
+    local calls = unitInFlight[unit] or {}
+    unitInFlight[unit] = calls
+    local now, live = os.clock(), 0
+    for id, started in pairs(calls) do
+        if now - started > IN_FLIGHT_TTL then calls[id] = nil else live = live + 1 end
+    end
+    if live >= MAX_IN_FLIGHT then return false end
+    callSeq = callSeq + 1
+    local id = callSeq
+    calls[id] = now
     task.spawn(function()
         local ok, reply = pcall(function()
             if method == "FireServer" then
@@ -2010,7 +2031,7 @@ local function sendSkill(unit, remote, method, args, n)
             return describeValue(remote:InvokeServer(table.unpack(args, 1, n)), 0, SHORT)
         end)
         BuffInfo.reply = ok and tostring(reply) or ("error: " .. tostring(reply))
-        unitInFlight[unit] = math.max(0, (unitInFlight[unit] or 1) - 1)
+        calls[id] = nil
     end)
     return true
 end
@@ -2470,7 +2491,8 @@ function UnitAIModule.StartBuff()
         while UnitAI.autoBuff and gen == buffGen do
             if isGameRunning() and #ownedUnits() >= UnitAI.minUnitsForBuff then
                 BuffInfo.problem = nil
-                BuffRot.tick()
+                local ok, err = pcall(BuffRot.tick)
+                if not ok then BuffInfo.problem = "rotation error: " .. clip(tostring(err), 80) end
             end
             task.wait(0.25)
         end
