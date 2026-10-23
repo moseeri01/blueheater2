@@ -3465,6 +3465,29 @@ end
 -- Random-equipped events (Fool's Hunt: LevelData._randomequippedmode): the hotbar holds random
 -- level-100 copies of the player's units made when the game started, not the equipped team.
 AutoPlaceModule.loadUnix = os.time()
+-- live random copies as the game announces them (watched: unit_added_temporary({ uuid,
+-- unit_id, _creation_time, ... }) every 10 s; unit_removed_temporary when one goes);
+-- badTemp: copies the game refused to place
+AutoPlaceModule.liveTemp, AutoPlaceModule.goneTemp, AutoPlaceModule.badTemp, AutoPlaceModule.tempVersion = {}, {}, {}, 0
+task.spawn(pcall, function()
+    local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
+    local function uuidOf(v) return type(v) == "table" and v.uuid and tostring(v.uuid) or (type(v) == "string" and v or nil) end
+    stc:WaitForChild("unit_added_temporary", 5).OnClientEvent:Connect(function(data)
+        local uuid = uuidOf(data)
+        if uuid and type(data) == "table" and data.unit_id then
+            AutoPlaceModule.liveTemp[uuid] = { id = tostring(data.unit_id), made = tonumber(data._creation_time) or os.time() }
+            AutoPlaceModule.goneTemp[uuid] = nil
+            AutoPlaceModule.tempVersion = AutoPlaceModule.tempVersion + 1
+        end
+    end)
+    stc:WaitForChild("unit_removed_temporary", 5).OnClientEvent:Connect(function(data)
+        local uuid = uuidOf(data)
+        if uuid then
+            AutoPlaceModule.liveTemp[uuid], AutoPlaceModule.goneTemp[uuid] = nil, true
+            AutoPlaceModule.tempVersion = AutoPlaceModule.tempVersion + 1
+        end
+    end)
+end)
 function AutoPlaceModule.EventMode()
     local d = Stage.levelData()
     return type(d) == "table" and rawget(d, "_randomequippedmode") ~= nil
@@ -3492,11 +3515,19 @@ function AutoPlaceModule.HotbarTeam()
             sig[#sig + 1] = s .. "=" .. slots[s].id
         end
     end
-    -- getgc walks all of memory: only when the units on the bar changed
-    sig = table.concat(sig, ",")
+    -- getgc walks all of memory: only when the units on the bar changed (or the game said a
+    -- unit was added / removed: tempVersion)
+    sig = table.concat(sig, ",") .. "#" .. AutoPlaceModule.tempVersion
     if sig == AutoPlaceModule.hotbarSig and AutoPlaceModule.hotbarTeam
         and (AutoPlaceModule.hotbarComplete or os.clock() < (AutoPlaceModule.hotbarRetry or 0)) then
         return AutoPlaceModule.hotbarTeam
+    end
+    -- candidates per unit id, newest first: copies the game announced (unit_added_temporary),
+    -- then any made this session found in memory. A replay in the same server leaves the last
+    -- game's copies in memory: placing those is refused (money piled up to 28k in a real game)
+    local found = {}
+    for uuid, info in pairs(AutoPlaceModule.liveTemp) do
+        table.insert(found, { id = info.id, uuid = uuid, made = info.made + 1e9 })
     end
     if type(getgc) == "function" then
         pcall(function()
@@ -3504,16 +3535,20 @@ function AutoPlaceModule.HotbarTeam()
                 if type(v) == "table" and rawget(v, "uuid") and rawget(v, "unit_id") and rawget(v, "equipped_slot") == nil then
                     local made = tonumber(rawget(v, "_creation_time"))
                     if made and made >= AutoPlaceModule.loadUnix - 1800 then
-                        local id = tostring(rawget(v, "unit_id"))
-                        pool[id] = pool[id] or {}
-                        local uuid = tostring(rawget(v, "uuid"))
-                        local dup = false
-                        for _, u in ipairs(pool[id]) do if u == uuid then dup = true end end
-                        if not dup then table.insert(pool[id], uuid) end
+                        table.insert(found, { id = tostring(rawget(v, "unit_id")), uuid = tostring(rawget(v, "uuid")), made = made })
                     end
                 end
             end
         end)
+    end
+    table.sort(found, function(a, b) return a.made > b.made end)
+    for _, f in ipairs(found) do
+        if not AutoPlaceModule.goneTemp[f.uuid] and not AutoPlaceModule.badTemp[f.uuid] then
+            pool[f.id] = pool[f.id] or {}
+            local dup = false
+            for _, u in ipairs(pool[f.id]) do if u == f.uuid then dup = true end end
+            if not dup then table.insert(pool[f.id], f.uuid) end
+        end
     end
     local complete = true
     for s = 1, 6 do
@@ -4711,6 +4746,13 @@ local function tick()
         -- (counted per unit: another unit's refusals say nothing about this one)
         AutoPlaceModule.failsBy[t.uuid] = (AutoPlaceModule.failsBy[t.uuid] or 0) + 1
         t.refused = (t.refused or 0) + 1
+        -- an event copy not announced by the game this run (a replay leaves the last game's in
+        -- memory) and refused twice: try the next copy of that unit
+        if t.temp and t.refused >= 2 and not AutoPlaceModule.liveTemp[t.uuid] then
+            AutoPlaceModule.badTemp[t.uuid], AutoPlaceModule.hotbarSig = true, nil
+            AutoPlaceModule.RefreshTeam()
+            return 0.2
+        end
         if t.refused >= 8 and #placedOf(t.uuid) == 0 then
             -- refused on 8 spots and never placed: not in the equipped team any more
             AutoPlaceModule.full[t.uuid] = true
