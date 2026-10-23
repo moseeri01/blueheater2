@@ -4712,8 +4712,12 @@ local function tick()
     end
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     if tryPlace(t, spot) then
-        -- (event: the copy left the bar; read the bar again on the next tick)
-        if t.temp then AutoPlaceModule.hotbarAt = 0 end
+        -- (event: the copy is used up - the placed unit may carry another uuid, so it is not
+        -- counted from the map; the bar is read again on the next tick)
+        if t.temp then
+            AutoPlaceModule.full[t.uuid], AutoPlaceModule.badTemp[t.uuid] = true, true
+            AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
+        end
         AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
         t.spotRefused = 0
         AutoPlaceModule.problem = nil
