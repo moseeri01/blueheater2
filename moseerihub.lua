@@ -596,8 +596,9 @@ function Stage.nameFromLevelData(data)
     -- the difficulty goes in the report title)
     local difficulty = text("_difficulty")
     Stage.difficulty = difficulty
-    if location and #parts > 1 then
-        Stage.pretty = location .. " — " .. table.concat(parts, " ", 2)
+    if location and level then
+        -- (the raw mode id like "infinite_tower" stays out of the name people read)
+        Stage.pretty = location .. " — " .. level
     else
         Stage.pretty = nil
     end
@@ -3070,11 +3071,15 @@ local TRAITS = {
     godspeed = { spa = 0.8 },
     sniper = { range = 1.25 },
     culling = { dmg = 1.05 }, -- +20% only on enemies under 30% hp
-    ethereal = { dmg = 1.1 },
+    adept = {}, -- levels up faster, no fight effect
     nimble = { spa = { 0.95, 0.925, 0.88 } },
     range = { range = { 1.1, 1.125, 1.15 } },
     superior = { dmg = { 1.1, 1.125, 1.15 } },
 }
+-- game ids whose shown name differs (game_data Traits: ethereal is "Celestial", neuroplasticity
+-- is "Adept"); old saves may still hold the id
+local TRAIT_IDS = { ethereal = "Celestial", neuroplasticity = "Adept" }
+TRAITS.ethereal, TRAITS.neuroplasticity = TRAITS.celestial, TRAITS.adept
 local ROMAN = { i = 1, ii = 2, iii = 3 }
 
 function AutoPlaceModule.TraitMods(traits)
@@ -3399,6 +3404,7 @@ function AutoPlaceModule.CollectTraits(val, out, depth, key)
         text = tostring(text):gsub("^%s+", ""):gsub("%s+$", "")
         local word = string.lower(text):match("^%a+")
         if not word or #text > 24 or text:find("-", 1, true) then return end
+        if TRAIT_IDS[word] then text = TRAIT_IDS[word] .. text:sub(#word + 1) end
         if not TRAITS[word] and (depth > 1 or text:find("%d%d%d")) then return end
         for _, have in ipairs(out) do if string.lower(have) == string.lower(text) then return end end
         table.insert(out, text)
@@ -3893,6 +3899,72 @@ function ControlUp.allowed(u, focus)
     return focus[u] == true or not BuffRot.isControlSkill(u)
 end
 
+-- Fusion (Carrot + Vego: goku_ssj3 and vegeta_majin each get a "vegito_fusion..." skill at
+-- upgrade 7, together they become Vegito). Read from the definitions: a unit whose upgrade
+-- level gives an active_attack with "fusion" in it; the part up to "fusion" pairs them.
+-- Returns key, level or nil.
+function ControlUp.fusionOf(name)
+    local def = AutoPlaceModule.UnitDef(name)
+    local up = def and (def.upgrade or def.upgrades)
+    if type(up) ~= "table" then return nil end
+    for i, step in ipairs(up) do
+        local a = type(step) == "table" and step.active_attack
+        local key = type(a) == "string" and string.lower(a):match("^(.-fusion)")
+        if key then return key, i end
+    end
+    return nil
+end
+
+-- Fusion pairs on the map: key -> list of { u, level, need }, the highest-level copy of each
+-- unit type, only when two or more types share the key (both halves are placed).
+function ControlUp.fusionPairs(units)
+    local byKey, out = {}, {}
+    for _, u in ipairs(units) do
+        local name = unitType(u)
+        local key, need = ControlUp.fusionOf(name)
+        if key then
+            local k = byKey[key] or {}
+            byKey[key] = k
+            local level = AutoPlaceModule.StatNum(u, "upgrade") or 0
+            if not k[name] or level > k[name].level then k[name] = { u = u, level = level, need = need } end
+        end
+    end
+    for key, k in pairs(byKey) do
+        local list = {}
+        for _, c in pairs(k) do table.insert(list, c) end
+        if #list >= 2 then out[key] = list end
+    end
+    return out
+end
+
+-- Copies still on the way to their fusion level: u -> level (they upgrade before other damage
+-- units, lowest level first so both halves arrive together).
+function ControlUp.fusionFocus(units)
+    local out = {}
+    for _, list in pairs(ControlUp.fusionPairs(units)) do
+        for _, c in ipairs(list) do
+            if c.level < c.need then out[c.u] = c.level end
+        end
+    end
+    return out
+end
+
+-- Both halves at their fusion level: press the fusion skill (one press; pressed again after
+-- 15 s if both are still on the map).
+ControlUp.fusedAt = {}
+function ControlUp.FusionStep()
+    for key, list in pairs(ControlUp.fusionPairs(ownedUnits())) do
+        local ready = true
+        for _, c in ipairs(list) do if c.level < c.need then ready = false end end
+        if ready and os.clock() - (ControlUp.fusedAt[key] or -1e9) >= 15 then
+            ControlUp.fusedAt[key] = os.clock()
+            if fireActiveAttack(list[1].u) then
+                AutoPlaceModule.Note(string.format("fusion: %s + %s", unitType(list[1].u), unitType(list[2].u)))
+            end
+        end
+    end
+end
+
 -- Damage per second a placed unit gains from its next upgrade, scaled by the copy's own
 -- trait and rolls (a Golden / high-roll carry gains more from the same upgrade); control
 -- units add the skill's worth (ControlUp.share).
@@ -3960,6 +4032,7 @@ local function upgradeStep(money, onlyRole, airOnly)
     local now = os.clock()
     local units = ownedUnits()
     local focus = ControlUp.focus(units, now)
+    local fuse = ControlUp.fusionFocus(units)
     for _, u in ipairs(units) do
         local role = unitRole(u)
         if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
@@ -3971,6 +4044,7 @@ local function upgradeStep(money, onlyRole, airOnly)
             if can then
                 local rank = RANK[role] or 2
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
+                if rank == 2 and fuse[u] then score = 1e6 - level end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
@@ -3996,7 +4070,7 @@ local function upgradeStep(money, onlyRole, airOnly)
     end
     if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
         AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
-            pickAir and ", hits flying enemies" or BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
+            pickAir and ", hits flying enemies" or fuse[pick] and ", for the fusion" or BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
     elseif not (pickCost and money and money < pickCost) then
         -- refused with the money in hand: leave this unit for 30 s instead of retrying forever
         upgradeFails[pick] = now + 30
@@ -4348,6 +4422,7 @@ local function tick()
         end
     end
     pcall(AutoPlaceModule.WatchHits)
+    pcall(ControlUp.FusionStep)
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
     -- money: the learned value, else AA's in-game yen (_stats.resource), else the screen
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
@@ -5952,7 +6027,7 @@ function Webhook.BagLine(snap)
     if not used then return string.format("%s items", commas(snap.itemTotal)), nil end
     local f = used / snap.bagMax
     local state = (f >= 1 and "⛔ full") or (f >= 0.9 and "⚠️ almost full") or "✅ space left"
-    return string.format("%s / %s   %s", commas(used), commas(snap.bagMax), state), f
+    return string.format("`%s / %s` · %s", commas(used), commas(snap.bagMax), state), f
 end
 
 function Webhook.BuildReport(kind)
@@ -5964,27 +6039,30 @@ function Webhook.BuildReport(kind)
     if diff then head = head .. " · " .. diff end
     local runTime = startSnap and (now.at - startSnap.at) or 0
 
+    -- (Discord squeezes runs of spaces into one, so items on a line are split with " · ")
+    local stage = Stage.Pretty() or State.stage or "Unknown stage"
+    local place, rest = stage:match("^(.-) — (.+)$")
     local desc = {
-        Stage.Pretty() or State.stage or "Unknown stage",
-        string.format("⏱ %s   🌊 Wave %d", clock(runTime), math.max(gameWave, waveNow())),
-        "Username: ||" .. tostring(Players.LocalPlayer.Name) .. "||",
+        "📍 " .. (place and ("**" .. place .. "** — " .. rest) or ("**" .. stage .. "**")),
+        string.format("⏱ `%s` · 🌊 Wave `%d`", clock(runTime), math.max(gameWave, waveNow())),
+        "👤 ||" .. tostring(Players.LocalPlayer.Name) .. "||",
     }
 
     -- Rewards: one line each, what this game added first, the total in brackets
     local rewards = {}
     if now.gems and before.gems and now.gems ~= before.gems then
-        table.insert(rewards, string.format("💎 %s%s Gems   (%s)", now.gems > before.gems and "+" or "", commas(now.gems - before.gems), commas(now.gems)))
+        table.insert(rewards, string.format("💎 **%s%s** Gems · %s", now.gems > before.gems and "+" or "", commas(now.gems - before.gems), commas(now.gems)))
     end
     if now.gold and before.gold and now.gold ~= before.gold then
-        table.insert(rewards, string.format("🪙 %s%s Gold   (%s)", now.gold > before.gold and "+" or "", commas(now.gold - before.gold), commas(now.gold)))
+        table.insert(rewards, string.format("🪙 **%s%s** Gold · %s", now.gold > before.gold and "+" or "", commas(now.gold - before.gold), commas(now.gold)))
     end
     if now.level and now.xp then
         local gain
         if before.level and before.xp and now.level == before.level then gain = now.xp - before.xp
         elseif before.level and before.xp and before.xpMax and now.level > before.level then gain = (before.xpMax - before.xp) + now.xp end
-        local where = string.format("Lv %d%s · %s/%s", now.level, (before.level and now.level > before.level) and " ↑" or "",
+        local where = string.format("Lv %d%s (%s / %s)", now.level, (before.level and now.level > before.level) and " ↑" or "",
             commas(now.xp), commas(now.xpMax or 0))
-        if gain and gain > 0 then table.insert(rewards, string.format("⭐ +%s XP   (%s)", commas(gain), where)) end
+        if gain and gain > 0 then table.insert(rewards, string.format("⭐ **+%s** XP · %s", commas(gain), where)) end
     end
     local gotItems = {}
     for id, n in pairs(now.items or {}) do
@@ -5994,7 +6072,7 @@ function Webhook.BuildReport(kind)
     table.sort(gotItems, function(a, b) return a.got > b.got end)
     for i, it in ipairs(gotItems) do
         if i > 10 then table.insert(rewards, string.format("📦 ... and %d more", #gotItems - 10)) break end
-        table.insert(rewards, string.format("📦 +%d %s", it.got, prettyName(it.id)))
+        table.insert(rewards, string.format("📦 **+%d** %s", it.got, prettyName(it.id)))
     end
     if #rewards == 0 then
         for _, g in ipairs(resultScreenGains()) do table.insert(rewards, "🎁 " .. g) end
