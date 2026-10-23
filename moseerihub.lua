@@ -140,7 +140,7 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, claim = false },
+        openEggs = false, eggs = {}, claim = false },
     watchLog = {},
 }
 
@@ -858,7 +858,9 @@ local function installHook()
             local ok, className = pcall(function() return typeof(self) == "Instance" and self.ClassName end)
             if type(setnamecallmethod) == "function" then setnamecallmethod(method) end
             if ok and (className == "RemoteEvent" or className == "RemoteFunction") and State.watching and State.onWatch then
-                pcall(State.onWatch, self, method, table.pack(...))
+                -- written later on its own thread: a method call in here (GetFullName) replaced
+                -- the namecall method, so the game's own call (joining a stage) went out wrong
+                task.spawn(State.onWatch, self, method, table.pack(...))
             end
             if ok and (className == "RemoteEvent" or className == "RemoteFunction") and State.learning and learnCapture then
                 learnCapture(self, method, table.pack(...))
@@ -878,6 +880,8 @@ local function installHook()
                     })
                 end
             end
+            -- (anything above may have made a method call of its own: restore the game's)
+            if type(setnamecallmethod) == "function" then setnamecallmethod(method) end
         end
         return oldNamecall(self, ...)
     end))
@@ -7290,19 +7294,45 @@ end
 -- Stage lists for Auto join from the game's own Worlds data: Story / Infinite (worlds with
 -- levels), Legend (legend_stage), Raid (raid_world); the Infinity Mansion has no world.
 function Lobby.Worlds(mode)
-    local out, seen = {}, {}
+    local out, seen, rank = {}, {}, {}
     if mode == "Infinity Mansion" then return { "Infinity Mansion" } end
     pcall(function()
+        -- game order, first choice: the game's own WorldLevelOrder list (world ids, or
+        -- tables naming one), position = rank
+        local order = require(ReplicatedStorage.src.Data.WorldLevelOrder)
+        for i, v in ipairs(type(order) == "table" and order or {}) do
+            local id = type(v) == "string" and v or (type(v) == "table" and (v.world or v.id or v[1])) or nil
+            if type(id) == "string" and not rank[id] then rank[id] = i end
+        end
+    end)
+    pcall(function()
+        -- else each level's story_world_rank (first world = 1)
+        if next(rank) then return end
+        local levels = require(ReplicatedStorage.src.Data.Levels)
+        for _, l in pairs(type(levels) == "table" and levels or {}) do
+            local r = type(l) == "table" and tonumber(l.story_world_rank)
+            if r and type(l.world) == "string" then rank[l.world] = math.min(rank[l.world] or r, r) end
+        end
+    end)
+    pcall(function()
         local worlds = require(ReplicatedStorage.src.Data.Worlds)
-        for _, w in pairs(type(worlds) == "table" and worlds or {}) do
+        for id, w in pairs(type(worlds) == "table" and worlds or {}) do
             if type(w) == "table" and type(w.name) == "string" and type(w.levels) == "table" then
                 local kind = (w.legend_stage and "Legend") or (w.raid_world and "Raid") or "Story"
                 local fits = kind == mode or (mode == "Infinite" and kind == "Story" and w.infinite ~= nil)
-                if fits and not seen[w.name] then seen[w.name] = true table.insert(out, w.name) end
+                if fits and not seen[w.name] then
+                    seen[w.name] = rank[id] or math.huge
+                    table.insert(out, w.name)
+                elseif fits and rank[id] then
+                    seen[w.name] = math.min(seen[w.name], rank[id])
+                end
             end
         end
     end)
-    table.sort(out)
+    table.sort(out, function(a, b)
+        if seen[a] ~= seen[b] then return seen[a] < seen[b] end
+        return a < b
+    end)
     return out
 end
 
@@ -7425,6 +7455,7 @@ bag:Button({ Name = "Refresh bag lists", Callback = function()
     pcall(function()
         for _, d in ipairs({ portalDropdown, delPortals }) do d:ClearOptions() d:InsertOptions(p) end
         delItems:ClearOptions() delItems:InsertOptions(i)
+        if UIRef.lobbyEggs then UIRef.lobbyEggs:ClearOptions() UIRef.lobbyEggs:InsertOptions(i) end
     end)
     notify(string.format("Bag: %d portal kinds, %d item kinds", #p, #i))
 end })
@@ -7432,6 +7463,9 @@ end })
 local gifts = UIRef.tabs.lobby:Section({ Side = "Left" })
 gifts:Header({ Text = "Eggs and rewards" })
 gifts:Toggle({ Name = "Open eggs I have", Default = Lobby.cfg.openEggs, Callback = set("openEggs") }, "LobbyOpenEggs")
+-- (which bag items are eggs is not in the game data we have: the player picks them)
+UIRef.lobbyEggs = gifts:Dropdown({ Name = "Eggs to open", Multi = true, Required = false, Options = items,
+    Default = picked(Lobby.cfg.eggs), Callback = setList("eggs") }, "LobbyEggs")
 gifts:Toggle({ Name = "Claim rewards", Default = Lobby.cfg.claim, Callback = set("claim") }, "LobbyClaim")
 gifts:Paragraph({ Header = "Never buys", Body = "Daily, quests, level and battle pass rewards; eggs you already own." })
 local event = UIRef.tabs.event:Section({ Side = "Left" })
