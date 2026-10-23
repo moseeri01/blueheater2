@@ -2629,7 +2629,7 @@ end
 local AutoPlaceModule = { team = {}, status = "Off", problem = nil, placed = {}, full = {}, noSpot = {} }
 do
 local PATH_CELL = 2.5      -- path points closer than this are merged
-local SIDE_DIST = { 5, 8, 12 } -- how far beside the path to try (12 reaches hills set back from the road)
+local SIDE_DIST = { 4, 5, 8, 12 } -- how far beside the path to try (4 for narrow rooftops, 12 reaches hills set back)
 local MIN_FROM_PATH = 4    -- never closer than this to the path (that is the road)
 local MIN_SPACING = 3      -- distance kept between own units
 local DEFAULT_RANGE = 15
@@ -2696,12 +2696,27 @@ end
 -- something called "hill", or it stands well above the road beside it).
 local function groundHit(x, y, z)
     local ok, hit = pcall(function()
+        -- skip units, the invisible _barrier walls, the ignore folder and any part that can be
+        -- walked through (invisible / no collision), so the ray stops on real ground
+        local exclude = { unitsFolder() }
+        for _, n in ipairs({ "_barrier", "ignore", "_DEAD_UNITS", "_PETS" }) do
+            local f = workspace:FindFirstChild(n)
+            if f then table.insert(exclude, f) end
+        end
         local params = RaycastParams.new()
-        params.FilterDescendantsInstances = { unitsFolder() }
         params.FilterType = Enum.RaycastFilterType.Exclude
-        return workspace:Raycast(Vector3.new(x, y + 60, z), Vector3.new(0, -120, 0), params)
+        for _ = 1, 4 do
+            params.FilterDescendantsInstances = exclude
+            local h = workspace:Raycast(Vector3.new(x, y + 60, z), Vector3.new(0, -120, 0), params)
+            if not h then return nil end
+            local inst = h.Instance
+            local okPass, passable = pcall(function() return inst.CanCollide == false or inst.Transparency >= 0.95 end)
+            if not (okPass and passable) or not inst then return h end
+            table.insert(exclude, inst)
+        end
+        return nil
     end)
-    if not (ok and hit) then return nil end
+    if not (ok and hit and hit.Position) then return nil end
     local tag
     pcall(function()
         local node = hit.Instance
@@ -2738,8 +2753,12 @@ local function buildCandidates(pts)
                 end
                 if nearest >= MIN_FROM_PATH * MIN_FROM_PATH then
                     local gy, tag = groundHit(x, p[2], z)
-                    local kind = tag or ((gy and roadY and gy > roadY + 2.5) and "hill" or "ground")
-                    table.insert(list, { x = x, y = p[2], z = z, score = score, groundY = gy, kind = kind })
+                    -- nothing under it, or well below the road (past a rooftop / ledge edge, as on
+                    -- Fiend City where the road runs over roofs): not a place to stand
+                    if gy and not (roadY and gy < roadY - 3) then
+                        local kind = tag or ((roadY and gy > roadY + 2.5) and "hill" or "ground")
+                        table.insert(list, { x = x, y = p[2], z = z, score = score, groundY = gy, kind = kind })
+                    end
                 end
             end
         end
@@ -3392,6 +3411,15 @@ function AutoPlaceModule.ReadHud()
     for _, d in ipairs(gui:GetDescendants()) do
         if d:IsA("TextLabel") or d:IsA("TextButton") then
             local v = parseYen(d.Text)
+            if not v and d.Parent and tostring(d.Text):match("^%s*[%d,]+%s*$") then
+                -- AA draws the price and the ¥ as two labels side by side ("2300" + symbol "¥")
+                for _, sib in ipairs(d.Parent:GetChildren()) do
+                    if sib ~= d and (sib:IsA("TextLabel") or sib:IsA("TextButton")) and parseYen("0" .. tostring(sib.Text)) == 0 then
+                        v = tonumber((tostring(d.Text):gsub("[%s,]", "")))
+                        break
+                    end
+                end
+            end
             if v and isOnScreen(d) and not isOwnGui(d) then
                 local p = d.AbsolutePosition
                 table.insert(labels, { v = v, x = p.X, y = p.Y })
@@ -3625,13 +3653,20 @@ local function tick()
         if wait then return wait end
     end
     if not t then
+        -- units waiting for a free spot are not "placed": say so instead
+        local resting = 0
+        for _, untilT in pairs(AutoPlaceModule.noSpot) do
+            if untilT > os.clock() then resting = resting + 1 end
+        end
         if AutoPlace.upgrade then
             local wait = upgradeStep(money)
             if wait then return wait end
-            AutoPlaceModule.status = "All units placed and fully upgraded"
-            return 1
         end
-        AutoPlaceModule.status = "Everything placed"
+        if resting > 0 then
+            AutoPlaceModule.status = string.format("No free spot for %d unit(s) - trying again soon", resting)
+        else
+            AutoPlaceModule.status = AutoPlace.upgrade and "All units placed and fully upgraded" or "Everything placed"
+        end
         return 1
     end
     local cost = t.cost or hudPrices[slot]
@@ -3929,6 +3964,31 @@ function AutoPlaceModule.MapReport()
         if found == 0 then table.insert(lines, "  team data: no table in memory holds our unit uuids") end
     end
     if AutoPlaceModule.teamError then table.insert(lines, "  team read error: " .. AutoPlaceModule.teamError) end
+    -- portals in the bag with everything they carry (tier, challenge, buffs ...), to learn
+    -- which ones make units or upgrades cheaper
+    pcall(function()
+        local function show(v, depth)
+            if type(v) ~= "table" then return clip(tostring(v), 30) end
+            if depth > 1 then return "{table}" end
+            local parts = {}
+            for k, x in pairs(v) do table.insert(parts, tostring(k) .. "=" .. show(x, depth + 1)) end
+            table.sort(parts)
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+        local bag
+        for _, v in ipairs(type(getgc) == "function" and getgc(true) or {}) do
+            if type(v) == "table" and type(rawget(v, "unique_items")) == "table" then bag = v break end
+        end
+        local shown = 0
+        for key, item in pairs(bag and bag.unique_items or {}) do
+            local id = type(item) == "table" and (item.item_id or item.id or item.name) or key
+            if string.lower(tostring(id)):find("portal", 1, true) and shown < 8 then
+                shown = shown + 1
+                table.insert(lines, string.format("portal %s: %s", tostring(id), clip(show(item, 0), 600)))
+            end
+        end
+        table.insert(lines, bag and string.format("portals in bag: %d shown", shown) or "portals in bag: bag data not found")
+    end)
     local hotbarTexts = {}
     pcall(function()
         local h = workspace.CurrentCamera.ViewportSize.Y
@@ -4045,7 +4105,7 @@ function AutoPlaceModule.MapReport()
         tostring(hpNow), tostring(hpMax), AutoPlaceModule.EnemyProgress() * 100))
     table.insert(lines, string.format("path points: %d", #pathPoints()))
     local spot = #pathPoints() >= 8 and bestSpot()
-    if spot then table.insert(lines, string.format("best spot: (%.1f, %.1f, %.1f) covers %d path points", spot.x, spot.y, spot.z, spot.score)) end
+    if spot then table.insert(lines, string.format("best spot: (%.1f, %.1f, %.1f) %s, covers %d path points", spot.x, spot.groundY or spot.y, spot.z, tostring(spot.kind), spot.score)) end
 
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
     local priceText = {}
