@@ -133,6 +133,17 @@ local Tools = {
     totalActions = 0,
 }
 
+-- Lobby tab (Auto join, Portals, Bag cleaner, Eggs and rewards). Phase 1: the settings and
+-- Watch, which writes every remote the player fires to AAMacro/lobby_watch.txt, so the real
+-- calls (and their arguments) are known before anything is automated.
+local Lobby = {
+    cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
+        usePortals = false, portal = "", portalTier = "1", portalFriends = false,
+        clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
+        openEggs = false, claim = false },
+    watchLog = {},
+}
+
 -- Webhook state
 local Webhook = {
     url = "",
@@ -207,6 +218,7 @@ local function buildConfigData()
         webhook = { url = Webhook.url, notifyComplete = Webhook.notifyComplete, notifyFail = Webhook.notifyFail,
             pingId = Webhook.pingId, pingMythic = Webhook.pingMythic, pingBagFull = Webhook.pingBagFull,
             pingDisconnect = Webhook.pingDisconnect, pingLosses = Webhook.pingLosses },
+        lobby = Lobby.cfg,
         dungeon = { roomPriority = DungeonRun.roomPriority, wishList = DungeonRun.wishList, shrineEnabled = DungeonRun.acceptShrines,
             openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath },
         unitAI = {
@@ -264,6 +276,9 @@ end
 local function applyConfigData(data)
     if type(data) ~= "table" then return end
     if type(data.profile) == "string" then Profile.name = data.profile end
+    for k, v in pairs(type(data.lobby) == "table" and data.lobby or {}) do
+        if Lobby.cfg[k] ~= nil and type(v) == type(Lobby.cfg[k]) then Lobby.cfg[k] = v end
+    end
     local w = data.webhook or {}
     Webhook.url = pick(w.url, "string", Webhook.url)
     Webhook.notifyComplete = pick(w.notifyComplete, "boolean", Webhook.notifyComplete)
@@ -838,10 +853,13 @@ local function installHook()
     local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
     oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
         local method = getnamecallmethod()
-        if (State.recording or State.learning) and (method == "FireServer" or method == "InvokeServer")
+        if (State.recording or State.learning or State.watching) and (method == "FireServer" or method == "InvokeServer")
             and not (type(checkcaller) == "function" and checkcaller()) then
             local ok, className = pcall(function() return typeof(self) == "Instance" and self.ClassName end)
             if type(setnamecallmethod) == "function" then setnamecallmethod(method) end
+            if ok and (className == "RemoteEvent" or className == "RemoteFunction") and State.watching and State.onWatch then
+                pcall(State.onWatch, self, method, table.pack(...))
+            end
             if ok and (className == "RemoteEvent" or className == "RemoteFunction") and State.learning and learnCapture then
                 learnCapture(self, method, table.pack(...))
             end
@@ -5922,6 +5940,9 @@ local function itemCounts(data)
     return counts, total
 end
 
+-- (the Lobby tab reads the bag with the same helpers)
+Lobby.inventoryData, Lobby.itemCounts, Lobby.prettyName = inventoryData, itemCounts, prettyName
+
 -- Bag size: a number field named like max/capacity/limit/slots on the inventory data.
 local function bagCapacity(data)
     if not data then return nil end
@@ -7266,11 +7287,153 @@ section:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport }
 end
 
 
--- TAB: Lobby and Event - planned, waiting for game data
+-- Stage lists for Auto join from the game's own Worlds data: Story / Infinite (worlds with
+-- levels), Legend (legend_stage), Raid (raid_world); the Infinity Mansion has no world.
+function Lobby.Worlds(mode)
+    local out, seen = {}, {}
+    if mode == "Infinity Mansion" then return { "Infinity Mansion" } end
+    pcall(function()
+        local worlds = require(ReplicatedStorage.src.Data.Worlds)
+        for _, w in pairs(type(worlds) == "table" and worlds or {}) do
+            if type(w) == "table" and type(w.name) == "string" and type(w.levels) == "table" then
+                local kind = (w.legend_stage and "Legend") or (w.raid_world and "Raid") or "Story"
+                local fits = kind == mode or (mode == "Infinite" and kind == "Story" and w.infinite ~= nil)
+                if fits and not seen[w.name] then seen[w.name] = true table.insert(out, w.name) end
+            end
+        end
+    end)
+    table.sort(out)
+    return out
+end
+
+-- Portal and item ids in the bag (pretty names), for the Portals and Bag cleaner lists.
+function Lobby.BagNames()
+    local portals, items = {}, {}
+    local counts = Lobby.itemCounts(Lobby.inventoryData())
+    for id in pairs(counts) do
+        local name = Lobby.prettyName(id)
+        table.insert(id:find("^portal") and portals or items, name)
+    end
+    table.sort(portals)
+    table.sort(items)
+    return portals, items
+end
+
+-- Watch: every remote the player fires (lobby buttons, portals, deleting, eggs, rewards) with
+-- its full arguments, newest last, saved to AAMacro/lobby_watch.txt for the next build.
+Lobby.NOISE = { "mouse", "camera", "heartbeat", "ping", "client_loaded" }
+function State.onWatch(remote, method, args)
+    local name = string.lower(remote.Name)
+    for _, w in ipairs(Lobby.NOISE) do if name:find(w, 1, true) then return end end
+    local parts = {}
+    for i = 1, args.n or #args do parts[i] = describeValue(args[i], 0, FULL) end
+    local line = string.format("%s %s %s(%s)", os.date("%H:%M:%S"), remote:GetFullName(), method, table.concat(parts, ", "))
+    table.insert(Lobby.watchLog, line)
+    if #Lobby.watchLog > 300 then table.remove(Lobby.watchLog, 1) end
+    Lobby.watchDirty = true
+end
+function Lobby.SetWatch(on)
+    if on and not installHook() then return false end
+    State.watching = on
+    if on then
+        Lobby.watchLog = { "# lobby_watch " .. os.date("%Y-%m-%d %H:%M:%S") .. " | stage " .. tostring(State.stage or "lobby") }
+        task.spawn(function()
+            -- written every 2 s (not inside the hook) while Watch is on
+            while State.watching and not State.unloaded do
+                if Lobby.watchDirty then
+                    Lobby.watchDirty = false
+                    AutoPlaceModule.Catalog.save("lobby_watch.txt", table.concat(Lobby.watchLog, "\n"))
+                end
+                task.wait(2)
+            end
+        end)
+    end
+    return true
+end
+
+-- TAB: Lobby (phase 1: settings + Watch) and Event - planned, waiting for game data
 do
-local lobby = UIRef.tabs.lobby:Section({ Side = "Left" })
-lobby:Header({ Text = "Lobby (planned)" })
-lobby:Paragraph({ Header = "Coming", Body = "Auto Join a stage, Bag view, Auto Open eggs\nand Portals. Needs remotes_and_hud.txt\n(Settings > Save unit catalog) and a game data\nreport taken on the stage-select screen." })
+local function namesOf(sel)
+    -- MacLib multi dropdown gives { [name] = true }; a plain list works too
+    local out = {}
+    for k, v in pairs(type(sel) == "table" and sel or {}) do
+        if v == true then table.insert(out, k) elseif type(v) == "string" then table.insert(out, v) end
+    end
+    table.sort(out)
+    return out
+end
+local function set(key) return function(v) if syncing then return end Lobby.cfg[key] = v saveConfig() end end
+local function setList(key) return function(v) if syncing then return end Lobby.cfg[key] = namesOf(v) saveConfig() end end
+local function picked(list) local m = {} for _, n in ipairs(list) do m[n] = true end return m end
+
+local join = UIRef.tabs.lobby:Section({ Side = "Left" })
+join:Header({ Text = "Auto join" })
+UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "Phase 1: settings are saved. Press Watch, then do each lobby action yourself once (join a stage, use a portal, delete an item, open an egg, claim a reward) so the next update can do them for you." })
+join:Toggle({ Name = "Auto join", Default = Lobby.cfg.autoJoin, Callback = set("autoJoin") }, "LobbyAutoJoin")
+local worldDropdown
+join:Dropdown({ Name = "Join mode", Multi = false, Required = true,
+    Options = { "Story", "Infinite", "Legend", "Raid", "Infinity Mansion" }, Default = Lobby.cfg.mode,
+    Callback = function(v)
+        if syncing or type(v) ~= "string" then return end
+        Lobby.cfg.mode = v
+        saveConfig()
+        pcall(function()
+            worldDropdown:ClearOptions()
+            worldDropdown:InsertOptions(Lobby.Worlds(v))
+        end)
+    end }, "LobbyMode")
+worldDropdown = join:Dropdown({ Name = "Stage", Multi = false, Required = false,
+    Options = Lobby.Worlds(Lobby.cfg.mode), Default = Lobby.cfg.world ~= "" and Lobby.cfg.world or nil,
+    Callback = function(v) if syncing or type(v) ~= "string" then return end Lobby.cfg.world = v saveConfig() end }, "LobbyWorld")
+join:Dropdown({ Name = "Act", Multi = false, Required = true, Options = { "1", "2", "3", "4", "5", "6" },
+    Default = Lobby.cfg.act, Callback = set("act") }, "LobbyAct")
+join:Dropdown({ Name = "Difficulty", Multi = false, Required = true, Options = { "Normal", "Hard" },
+    Default = Lobby.cfg.difficulty, Callback = set("difficulty") }, "LobbyDifficulty")
+join:Toggle({ Name = "Friends only (join)", Default = Lobby.cfg.joinFriends, Callback = set("joinFriends") }, "LobbyJoinFriends")
+join:Toggle({ Name = "Watch (teach me once)", Default = false, Callback = function(on)
+    local was = State.watching
+    if not Lobby.SetWatch(on) then notify("Watch needs hookmetamethod (this executor has none).") return end
+    if was and not on then
+        AutoPlaceModule.Catalog.save("lobby_watch.txt", table.concat(Lobby.watchLog, "\n"))
+        notify(string.format("Watch saved %d calls to AAMacro/lobby_watch.txt", math.max(0, #Lobby.watchLog - 1)))
+    end
+end }, "LobbyWatch")
+
+local portals, items = Lobby.BagNames()
+local portal = UIRef.tabs.lobby:Section({ Side = "Right" })
+portal:Header({ Text = "Portals" })
+portal:Toggle({ Name = "Use portals", Default = Lobby.cfg.usePortals, Callback = set("usePortals") }, "LobbyUsePortals")
+local portalDropdown = portal:Dropdown({ Name = "Portal", Multi = false, Required = false, Options = portals,
+    Default = Lobby.cfg.portal ~= "" and Lobby.cfg.portal or nil,
+    Callback = function(v) if syncing or type(v) ~= "string" then return end Lobby.cfg.portal = v saveConfig() end }, "LobbyPortal")
+portal:Dropdown({ Name = "Lowest tier", Multi = false, Required = true, Options = { "1", "2", "3", "4", "5", "6" },
+    Default = Lobby.cfg.portalTier, Callback = set("portalTier") }, "LobbyPortalTier")
+portal:Toggle({ Name = "Friends only (portal)", Default = Lobby.cfg.portalFriends, Callback = set("portalFriends") }, "LobbyPortalFriends")
+
+local bag = UIRef.tabs.lobby:Section({ Side = "Right" })
+bag:Header({ Text = "Bag cleaner" })
+bag:Toggle({ Name = "Clean bag", Default = Lobby.cfg.clean, Callback = set("clean") }, "LobbyClean")
+local delPortals = bag:Dropdown({ Name = "Delete portals", Multi = true, Required = false, Options = portals,
+    Default = picked(Lobby.cfg.deletePortals), Callback = setList("deletePortals") }, "LobbyDeletePortals")
+local delItems = bag:Dropdown({ Name = "Delete items", Multi = true, Required = false, Options = items,
+    Default = picked(Lobby.cfg.deleteItems), Callback = setList("deleteItems") }, "LobbyDeleteItems")
+bag:Slider({ Name = "When bag is over (%)", Minimum = 50, Maximum = 100, Default = Lobby.cfg.cleanAt,
+    Callback = set("cleanAt") }, "LobbyCleanAt")
+bag:Toggle({ Name = "Also during stages", Default = Lobby.cfg.cleanInStage, Callback = set("cleanInStage") }, "LobbyCleanInStage")
+bag:Button({ Name = "Refresh bag lists", Callback = function()
+    local p, i = Lobby.BagNames()
+    pcall(function()
+        for _, d in ipairs({ portalDropdown, delPortals }) do d:ClearOptions() d:InsertOptions(p) end
+        delItems:ClearOptions() delItems:InsertOptions(i)
+    end)
+    notify(string.format("Bag: %d portal kinds, %d item kinds", #p, #i))
+end })
+
+local gifts = UIRef.tabs.lobby:Section({ Side = "Left" })
+gifts:Header({ Text = "Eggs and rewards" })
+gifts:Toggle({ Name = "Open eggs I have", Default = Lobby.cfg.openEggs, Callback = set("openEggs") }, "LobbyOpenEggs")
+gifts:Toggle({ Name = "Claim rewards", Default = Lobby.cfg.claim, Callback = set("claim") }, "LobbyClaim")
+gifts:Paragraph({ Header = "Never buys", Body = "Daily, quests, level and battle pass rewards; eggs you already own." })
 local event = UIRef.tabs.event:Section({ Side = "Left" })
 event:Header({ Text = "Event (planned)" })
 event:Paragraph({ Header = "Coming", Body = "Fool's Hunt: random temporary units and\nspells, and card votes. Needs remotes_and_hud.txt\nand event_data.txt saved during the event with\nunits in the hotbar, and again while a card\nvote (Choose a card!) is on screen." })
