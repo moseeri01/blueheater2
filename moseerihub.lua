@@ -17,6 +17,8 @@ local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
+local Words = {} -- keyword lists, grouped to stay under Lua's 200-locals limit
+
 local Config = {
     MaxActions = 5000,
     MaxDuration = 3600,
@@ -80,6 +82,7 @@ local UnitAI = {
     autoBuff = false,
     buffInterval = 1,
     minUnitsForBuff = 4,
+    learned = {},
 }
 
 -- Dungeon Bot state
@@ -186,6 +189,7 @@ local function buildConfigData()
             autoBuff = UnitAI.autoBuff,
             buffInterval = UnitAI.buffInterval,
             minUnitsForBuff = UnitAI.minUnitsForBuff,
+            learned = next(UnitAI.learned) and UnitAI.learned or nil,
         },
         autoFarm = {
             autoReplay = AutoFarm.autoReplay,
@@ -227,6 +231,7 @@ local function applyConfigData(data)
     UnitAI.abilityCooldown = pick(u.abilityCooldown, "number", UnitAI.abilityCooldown)
     UnitAI.buffInterval = pick(u.buffInterval, "number", UnitAI.buffInterval)
     UnitAI.minUnitsForBuff = pick(u.minUnitsForBuff, "number", UnitAI.minUnitsForBuff)
+    UnitAI.learned = type(u.learned) == "table" and u.learned or {}
     pendingToggles.autoAbilities = u.autoAbilities == true
     pendingToggles.autoBuff = u.autoBuff == true
     local a = data.autoFarm or {}
@@ -607,7 +612,7 @@ local function readCostValue(path)
     return ok and tonumber(value) or nil
 end
 
-local SPEND_REMOTES = { spawn_unit = true, upgrade_unit_ingame = true }
+Words.SPEND = { spawn_unit = true, upgrade_unit_ingame = true }
 
 -- A drop in a tracked value is charged to ONE action: the earliest still-unresolved
 -- spend remote (spawn/upgrade), else the earliest unresolved action. Charging every
@@ -620,7 +625,7 @@ local function attributeSpending(prev, snap)
     -- AA only takes money through spawn/upgrade; once those show up, nothing else is charged.
     local spendSeen, pendingSpend, pendingAny = false, nil, nil
     for _, a in ipairs(State.actions) do
-        if SPEND_REMOTES[a.name] then
+        if Words.SPEND[a.name] then
             spendSeen = true
             if a.spent == nil and not pendingSpend then pendingSpend = a end
         end
@@ -687,6 +692,8 @@ local function onUnitAddedWhileRecording(unit)
 end
 
 -- Hook
+local learnCapture -- set by the Unit AI module; receives remotes the game fires while learning
+
 local function installHook()
     if hookInstalled then return true end
     if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
@@ -696,11 +703,14 @@ local function installHook()
     local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
     oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
         local method = getnamecallmethod()
-        if State.recording and (method == "FireServer" or method == "InvokeServer")
+        if (State.recording or State.learning) and (method == "FireServer" or method == "InvokeServer")
             and not (type(checkcaller) == "function" and checkcaller()) then
             local ok, className = pcall(function() return typeof(self) == "Instance" and self.ClassName end)
             if type(setnamecallmethod) == "function" then setnamecallmethod(method) end
-            if ok and (className == "RemoteEvent" or className == "RemoteFunction") then
+            if ok and (className == "RemoteEvent" or className == "RemoteFunction") and State.learning and learnCapture then
+                learnCapture(self, method, table.pack(...))
+            end
+            if State.recording and ok and (className == "RemoteEvent" or className == "RemoteFunction") then
                 local elapsed = os.clock() - State.startedAt
                 if elapsed < Config.MaxDuration and #State.actions < Config.MaxActions then
                     table.insert(State.actions, {
@@ -1056,11 +1066,11 @@ local function finalizeRecording()
     attributeSpending(State.snapshot, snap)
     local spendSeen = false
     for _, action in ipairs(State.actions) do
-        if SPEND_REMOTES[action.name] then spendSeen = true break end
+        if Words.SPEND[action.name] then spendSeen = true break end
     end
     for _, action in ipairs(State.actions) do
         if action.spent == nil then action.spent = false end
-        if spendSeen and action.spent and not SPEND_REMOTES[action.name] then
+        if spendSeen and action.spent and not Words.SPEND[action.name] then
             action.spent, action.cost, action.costPath = false, nil, nil
         end
         action.before = nil
@@ -1536,8 +1546,7 @@ end
 
 -- Scan
 local Scan = {}
-local STAGE_WORDS = { "map", "level", "stage", "world", "act", "mode", "difficulty", "wave", "chapter", "story", "infinite", "raid", "challenge", "dungeon" }
-local BUTTON_WORDS = { "replay", "retry", "next", "lobby", "return", "leave", "victory", "defeat", "clear", "ready", "act ", "wave", "stage", "shop", "hoard", "battle", "boss", "shrine", "room", "depth" }
+Words.BUTTON = { "replay", "retry", "next", "lobby", "return", "leave", "victory", "defeat", "clear", "ready", "act ", "wave", "stage", "shop", "hoard", "battle", "boss", "shrine", "room", "depth" }
 
 local function matchesAny(s, words)
     s = string.lower(tostring(s))
@@ -1608,7 +1617,7 @@ function Scan.Run()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if gui then
         for _, d in ipairs(gui:GetDescendants()) do
-            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and d.Text ~= "" and matchesAny(d.Text, BUTTON_WORDS) then
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and d.Text ~= "" and matchesAny(d.Text, Words.BUTTON) then
                 add(string.format("  %s [%s] = %q", d:GetFullName(), d.ClassName, clip(d.Text, 60)))
             end
         end
@@ -1752,7 +1761,7 @@ local function isGameOver()
     return false
 end
 
-local END_WORDS = { "victory", "defeat", "game over", "waves completed", "total time" }
+Words.END = { "victory", "defeat", "game over", "waves completed", "total time" }
 
 local function isResultsShowing()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -1762,7 +1771,7 @@ local function isResultsShowing()
     for _, d in ipairs(gui:GetDescendants()) do
         if (d:IsA("TextLabel") or d:IsA("TextButton")) and #d.Text > 0 then
             local lower = string.lower(d.Text)
-            for _, word in ipairs(END_WORDS) do
+            for _, word in ipairs(Words.END) do
                 if lower:find(word, 1, true) and isOnScreen(d) and not isOwnGui(d) then return true end
             end
         end
@@ -1799,21 +1808,21 @@ local function refreshAutoStatus()
     autoStatusParagraph:UpdateBody(table.concat(parts, "\n"))
 end
 
-local REPLAY_WORDS = { "replay", "retry", "play again", "restart" }
-local NEXT_STAGE_WORDS = { "next stage", "next act", "next level", "next story" }
-local LEAVE_WORDS = { "lobby", "leave", "return", "exit" }
+Words.REPLAY = { "replay", "retry", "play again", "restart" }
+Words.NEXT_STAGE = { "next stage", "next act", "next level", "next story" }
+Words.LEAVE = { "lobby", "leave", "return", "exit" }
 -- Pages in front of the final choice (AA shows Victory -> "Next" -> Replay / Next Stage / Lobby).
-local ADVANCE_WORDS = { "next", "continue", "skip" }
-local ADVANCE_EXCLUDE = { "next stage", "next act", "next level", "next story", "lobby", "leave", "return", "exit" }
+Words.ADVANCE = { "next", "continue", "skip" }
+Words.ADVANCE_EXCLUDE = { "next stage", "next act", "next level", "next story", "lobby", "leave", "return", "exit" }
 
 local endHandling = false
 
 -- Decides what to do with this result screen; nil = leave it for the player.
 local function endGoal()
     local victory = resultIsVictory()
-    if AutoFarm.autoNextStage and victory then return "next_story", NEXT_STAGE_WORDS end
-    if AutoFarm.autoReplay then return "replay", REPLAY_WORDS end
-    if AutoFarm.autoLeave and not victory then return "leave", LEAVE_WORDS end
+    if AutoFarm.autoNextStage and victory then return "next_story", Words.NEXT_STAGE end
+    if AutoFarm.autoReplay then return "replay", Words.REPLAY end
+    if AutoFarm.autoLeave and not victory then return "leave", Words.LEAVE end
     return nil
 end
 
@@ -1846,7 +1855,7 @@ function AutoFarmModule.OnGameEnd()
                 break
             end
         elseif isResultsShowing() then
-            local nextBtn = advanced < 6 and findScreenButton(ADVANCE_WORDS, ADVANCE_EXCLUDE)
+            local nextBtn = advanced < 6 and findScreenButton(Words.ADVANCE, Words.ADVANCE_EXCLUDE)
             if nextBtn then
                 clickButton(nextBtn)
                 advanced = advanced + 1
@@ -1955,38 +1964,220 @@ local function inAttackState(unit)
     return not stateVal or stateVal.Value == "attack"
 end
 
-local function fireActiveAttack(unit)
+-- What the last buff tick did, shown on the Units page so a silent failure is visible.
+local BuffInfo = { at = nil, fired = 0, via = "-", reply = "-", problem = nil }
+
+local function sendSkill(unit, remote, method, args, n)
     local inFlight = unitInFlight[unit] or 0
-    if inFlight >= MAX_IN_FLIGHT then return end
-    local remote = getAARemote("use_active_attack")
-    if not remote then return end
+    if inFlight >= MAX_IN_FLIGHT then return false end
     unitInFlight[unit] = inFlight + 1
     task.spawn(function()
-        pcall(function() remote:InvokeServer(unit) end)
+        local ok, reply = pcall(function()
+            if method == "FireServer" then
+                remote:FireServer(table.unpack(args, 1, n))
+                return "sent"
+            end
+            return describeValue(remote:InvokeServer(table.unpack(args, 1, n)), 0, SHORT)
+        end)
+        BuffInfo.reply = ok and tostring(reply) or ("error: " .. tostring(reply))
         unitInFlight[unit] = math.max(0, (unitInFlight[unit] or 1) - 1)
     end)
+    return true
+end
+
+local function fireActiveAttack(unit)
+    local remote = getAARemote("use_active_attack")
+    if not remote then
+        BuffInfo.problem = "use_active_attack does not exist in this game - use Learn buff"
+        return false
+    end
+    BuffInfo.via = "use_active_attack"
+    return sendSkill(unit, remote, "InvokeServer", { unit }, 1)
+end
+
+-- ---------------------------------------------------------------- learned buffs
+-- The player clicks a buff skill once while learning; the remote and its arguments are
+-- stored per unit type and replayed for every unit of that type.
+Words.LEARN_SKIP = { "upgrade", "sell", "spawn", "priority", "target", "select", "place", "vote" }
+
+local function unitType(unit)
+    local stats = unit:FindFirstChild("_stats")
+    local id = stats and stats:FindFirstChild("id")
+    if id and tostring(id.Value) ~= "" then return tostring(id.Value) end
+    return unit.Name
+end
+
+local function ownedUnits()
+    local folder = unitsFolder()
+    if not folder then return {} end
+    local mine, all, anyOwnerField = {}, {}, false
+    for _, unit in ipairs(folder:GetChildren()) do
+        table.insert(all, unit)
+        local stats = unit:FindFirstChild("_stats")
+        if stats and stats:FindFirstChild("player") then anyOwnerField = true end
+        if isMyUnit(unit) then table.insert(mine, unit) end
+    end
+    if #mine == 0 and not anyOwnerField then return all end
+    return mine
+end
+
+-- Learn internals live in their own block (Lua 5.1 allows 200 active locals per function).
+do
+local function unitFromArg(value)
+    if typeof(value) ~= "Instance" then return nil end
+    local folder = unitsFolder()
+    if not folder then return nil end
+    local node = value
+    while node and node.Parent ~= folder do
+        node = node.Parent
+        if node == game or node == nil then return nil end
+    end
+    return node
+end
+
+local learnGen = 0
+
+Words.LEARN_SKILL = { "attack", "abil", "skill", "buff", "ult", "enchant", "active", "cast" }
+local learnFallback -- a unit remote without a skill-like name, kept in case no better one comes
+
+local function commitLearn(c, guessed)
+    State.learning = false
+    learnFallback = nil
+    UnitAI.learned[c.kind] = c.entry
+    task.spawn(function()
+        saveConfig()
+        if UnitAIModule.refreshLearnedUI then UnitAIModule.refreshLearnedUI() end
+        notify(string.format("Learned buff for %s (%s)%s. Every %s will now be recast.",
+            c.kind, c.entry.name, guessed and " - best guess" or "", c.kind))
+    end)
+end
+
+-- Called inside the namecall hook: no yielding here.
+learnCapture = function(remote, method, packed)
+    local name = string.lower(remote.Name)
+    for _, word in ipairs(Words.LEARN_SKIP) do
+        if name:find(word, 1, true) then return end
+    end
+    local unitArg, unit
+    for j = 1, packed.n do
+        local u = unitFromArg(packed[j])
+        if u then unitArg, unit = j, u break end
+    end
+    if not unitArg then return end
+    local args = {}
+    for j = 1, packed.n do
+        args[j] = (j == unitArg) and { _t = "unit" } or serializeValue(packed[j])
+    end
+    local c = {
+        kind = unitType(unit),
+        entry = { path = remote:GetFullName(), name = remote.Name, method = method,
+            argCount = packed.n, unitArg = unitArg, args = args },
+    }
+    for _, word in ipairs(Words.LEARN_SKILL) do
+        if name:find(word, 1, true) then
+            commitLearn(c, false)
+            return
+        end
+    end
+    if not learnFallback then
+        learnFallback = c
+        local gen = learnGen
+        task.delay(3, function()
+            if State.learning and learnFallback == c and gen == learnGen then commitLearn(c, true) end
+        end)
+    end
+end
+
+function UnitAIModule.StartLearn()
+    if not installHook() then return end
+    learnGen = learnGen + 1
+    local gen = learnGen
+    learnFallback = nil
+    State.learning = true
+    notify("Learn buff: open a unit in game and click its buff skill now (30 s).")
+    task.delay(30, function()
+        if State.learning and gen == learnGen then
+            State.learning = false
+            notify("Learn buff: no skill click seen. Open the unit panel first, then press Learn, then click the skill.")
+        end
+    end)
+end
+
+function UnitAIModule.ForgetLearned()
+    UnitAI.learned = {}
+    saveConfig()
+    if UnitAIModule.refreshLearnedUI then UnitAIModule.refreshLearnedUI() end
+    notify("Learned buffs cleared; the buff loop uses use_active_attack again.")
+end
+end
+
+local function fireLearned(unit, entry)
+    local remote = resolveInstance(entry.path)
+    if not remote then
+        BuffInfo.problem = entry.name .. " not found any more - learn the buff again"
+        return false
+    end
+    local n = entry.argCount or #entry.args
+    local args = {}
+    for j = 1, n do
+        if j == entry.unitArg then args[j] = unit else args[j] = deserializeValue(entry.args[j]) end
+    end
+    BuffInfo.via = entry.name .. " (learned)"
+    return sendSkill(unit, remote, entry.method, args, n)
+end
+
+function UnitAIModule.BuffReport()
+    local lines = { "[Buff report] " .. os.date("%H:%M:%S") }
+    local cts = ReplicatedStorage:FindFirstChild("endpoints")
+    cts = cts and cts:FindFirstChild("client_to_server")
+    if cts then
+        local names = {}
+        for _, r in ipairs(cts:GetChildren()) do
+            local lower = string.lower(r.Name)
+            for _, w in ipairs({ "attack", "abil", "skill", "buff", "ult", "enchant", "active", "auto", "toggle", "use" }) do
+                if lower:find(w, 1, true) then table.insert(names, r.Name .. "(" .. r.ClassName .. ")") break end
+            end
+        end
+        table.insert(lines, "skill-like remotes: " .. (#names > 0 and table.concat(names, ", ") or "none"))
+    else
+        table.insert(lines, "ReplicatedStorage.endpoints.client_to_server: NOT FOUND")
+    end
+    table.insert(lines, string.format("last tick: fired %d via %s, reply %s, problem %s",
+        BuffInfo.fired, BuffInfo.via, BuffInfo.reply, tostring(BuffInfo.problem)))
+    for kind, e in pairs(UnitAI.learned) do
+        table.insert(lines, string.format("learned %s: %s:%s arg#%d of %d", kind, e.path, e.method, e.unitArg, e.argCount or 0))
+    end
+    local shown = 0
+    for _, unit in ipairs(ownedUnits()) do
+        if shown >= 8 then break end
+        shown = shown + 1
+        local parts = {}
+        local stats = unit:FindFirstChild("_stats")
+        for _, v in ipairs(stats and stats:GetChildren() or {}) do
+            local ok, val = pcall(function() return v.Value end)
+            table.insert(parts, v.Name .. "=" .. (ok and clip(tostring(val), 24) or "?"))
+        end
+        local attrs = {}
+        for k, val in pairs(unit:GetAttributes()) do table.insert(attrs, k .. "=" .. clip(tostring(val), 16)) end
+        table.insert(lines, string.format("unit %s mine=%s: %s%s", unit.Name, tostring(isMyUnit(unit)),
+            table.concat(parts, " "), #attrs > 0 and (" | attr " .. table.concat(attrs, " ")) or ""))
+    end
+    if shown == 0 then table.insert(lines, "no units of yours on the map") end
+    local text = table.concat(lines, "\n")
+    print(text)
+    if type(setclipboard) == "function" and pcall(setclipboard, text) then
+        notify("Buff report copied to clipboard - paste it to me.")
+    else
+        notify("Buff report printed to the console (F9).")
+    end
 end
 
 local function myUnitsWithAbility()
     local list = {}
-    local folder = unitsFolder()
-    if not folder then return list end
-    for _, unit in ipairs(folder:GetChildren()) do
-        if unit.Parent and isMyUnit(unit) and hasActiveAttack(unit) then
-            table.insert(list, unit)
-        end
+    for _, unit in ipairs(ownedUnits()) do
+        if hasActiveAttack(unit) then table.insert(list, unit) end
     end
     return list
-end
-
-local function countMyUnits()
-    local n = 0
-    local folder = unitsFolder()
-    if not folder then return 0 end
-    for _, unit in ipairs(folder:GetChildren()) do
-        if isMyUnit(unit) then n = n + 1 end
-    end
-    return n
 end
 
 local function refreshUnitStatus()
@@ -1994,11 +2185,15 @@ local function refreshUnitStatus()
     local parts = {}
     if UnitAI.autoAbilities then table.insert(parts, "Abilities: ON (every " .. UnitAI.abilityCooldown .. "s)") end
     if UnitAI.autoBuff then
-        local mine = countMyUnits()
+        local mine = #ownedUnits()
         local waiting = mine < UnitAI.minUnitsForBuff and string.format(" - waiting %d/%d units", mine, UnitAI.minUnitsForBuff) or " - looping"
         table.insert(parts, "Buff loop: ON (every " .. UnitAI.buffInterval .. "s)" .. waiting)
+        if BuffInfo.at then
+            table.insert(parts, string.format("Last: %d unit(s) via %s, reply %s", BuffInfo.fired, BuffInfo.via, clip(BuffInfo.reply, 30)))
+        end
+        if BuffInfo.problem then table.insert(parts, "Problem: " .. BuffInfo.problem) end
     end
-    table.insert(parts, "My units on map: " .. countMyUnits())
+    table.insert(parts, "My units on map: " .. #ownedUnits())
     unitStatusParagraph:UpdateBody(table.concat(parts, "\n"))
 end
 
@@ -2031,10 +2226,24 @@ function UnitAIModule.StartBuff()
     local gen = buffGen
     task.spawn(function()
         while UnitAI.autoBuff and gen == buffGen do
-            if isGameRunning() and countMyUnits() >= UnitAI.minUnitsForBuff then
-                for _, unit in ipairs(myUnitsWithAbility()) do
-                    fireActiveAttack(unit)
+            local units = ownedUnits()
+            if isGameRunning() and #units >= UnitAI.minUnitsForBuff then
+                local fired = 0
+                BuffInfo.problem = nil
+                if next(UnitAI.learned) then
+                    for _, unit in ipairs(units) do
+                        local entry = UnitAI.learned[unitType(unit)]
+                        if entry and fireLearned(unit, entry) then fired = fired + 1 end
+                    end
+                else
+                    for _, unit in ipairs(units) do
+                        if hasActiveAttack(unit) and fireActiveAttack(unit) then fired = fired + 1 end
+                    end
+                    if fired == 0 and not BuffInfo.problem then
+                        BuffInfo.problem = "no unit has a skill in _stats.active_attack - use Learn buff"
+                    end
                 end
+                BuffInfo.at, BuffInfo.fired = os.clock(), fired
             end
             task.wait(math.max(1, UnitAI.buffInterval))
         end
@@ -2299,9 +2508,13 @@ watchCamera()
 table.insert(State.connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchCamera))
 
 local tabGroup = Window:TabGroup()
+-- Each tab is built inside its own do-block: Lua 5.1 allows only 200 active locals per
+-- function, and the section variables are not needed once a tab is built.
+local macroTab, refreshProfileUI
 
 -- TAB 1: Macro (record / play / files)
-local macroTab = tabGroup:Tab({ Name = "Macro", Image = "rbxassetid://10734950309" })
+do
+macroTab = tabGroup:Tab({ Name = "Macro", Image = "rbxassetid://10734950309" })
 
 local controlSection = macroTab:Section({ Side = "Left" })
 local fileSection = macroTab:Section({ Side = "Right" })
@@ -2371,7 +2584,10 @@ pasteInput = fileSection:Input({
     Callback = ProfilesModule.ImportText,
 }, "PasteJSON")
 
+end
+
 -- TAB 2: Auto Farm (replay automation)
+do
 local autoTab = tabGroup:Tab({ Name = "Auto Farm", Image = "rbxassetid://10734950309" })
 
 local autoReplaySection = autoTab:Section({ Side = "Left" })
@@ -2434,7 +2650,10 @@ Controls.speedMultiplier = autoExtraSection:Slider({
     Callback = function(v) AutoFarm.speedMultiplier = v; refreshAutoStatus(); saveConfig() end,
 }, "SpeedMul")
 
+end
+
 -- TAB 3: Units (AI)
+do
 local unitsTab = tabGroup:Tab({ Name = "Units", Image = "rbxassetid://10734950309" })
 
 local abilitySection = unitsTab:Section({ Side = "Left" })
@@ -2484,9 +2703,30 @@ Controls.minUnitsForBuff = buffSection:Slider({
     Default = UnitAI.minUnitsForBuff,
     Callback = function(v) UnitAI.minUnitsForBuff = v; refreshUnitStatus(); saveConfig() end,
 }, "MinUnitsForBuff")
-buffSection:Paragraph({ Header = "", Body = "Every check, each of your units with a skill\nis told to cast it. Units still on cooldown\nare skipped by the game, so every buff\n(physical or magic) is recast the moment\nits own cooldown ends." })
+buffSection:Paragraph({ Header = "", Body = "Every check, each buff unit is told to cast.\nUnits still on cooldown are skipped by the\ngame, so every buff (physical or magic) is\nrecast the moment its own cooldown ends." })
+
+buffSection:Header({ Text = "Learn buff (if the loop does nothing)" })
+local learnedParagraph = buffSection:Paragraph({ Header = "Learned", Body = "" })
+local function refreshLearnedUI()
+    local kinds = {}
+    for kind, e in pairs(UnitAI.learned) do table.insert(kinds, kind .. "  (" .. e.name .. ")") end
+    table.sort(kinds)
+    pcall(function()
+        learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, "\n")
+            or "Nothing yet - the loop uses use_active_attack.")
+    end)
+end
+UnitAIModule.refreshLearnedUI = refreshLearnedUI
+refreshLearnedUI()
+buffSection:Button({ Name = "Learn buff (then click the skill)", Callback = UnitAIModule.StartLearn })
+buffSection:Paragraph({ Header = "", Body = "1. Click a buff unit (e.g. Windsong) in game.\n2. Press Learn buff.\n3. Click its skill (e.g. Sky Enchantment).\nRepeat for each buff unit type." })
+buffSection:Button({ Name = "Forget learned buffs", Callback = UnitAIModule.ForgetLearned })
+buffSection:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport })
+
+end
 
 -- TAB 4: Dungeon
+do
 local dungeonTab = tabGroup:Tab({ Name = "Dungeon", Image = "rbxassetid://10734950309" })
 
 local dungeonMainSection = dungeonTab:Section({ Side = "Left" })
@@ -2517,7 +2757,10 @@ Controls.autoBuyBuffs = dungeonConfigSection:Toggle({
     Callback = function(on) DungeonBot.autoBuyBuffs = on; refreshDungeonStatus(); saveConfig() end,
 }, "AutoBuyBuffs")
 
+end
+
 -- TAB 5: Settings
+do
 local settingsTab = tabGroup:Tab({ Name = "Settings", Image = "rbxassetid://10734950309" })
 
 local profileSection = settingsTab:Section({ Side = "Left" })
@@ -2531,7 +2774,7 @@ local profileStatus = profileSection:Paragraph({ Header = "Active profile", Body
 local profileNameText = Profile.name
 local profileDropdown
 
-local function refreshProfileUI()
+refreshProfileUI = function()
     pcall(function()
         profileStatus:UpdateBody((Profile.name ~= "" and Profile.name or "(none)")
             .. "\nEvery change auto-saves and is restored\nwhen you run the script again.")
@@ -2640,6 +2883,7 @@ actionsParagraph = logSection:Paragraph({ Header = "Last actions", Body = "Nothi
 logSection:Button({ Name = "Copy full log", Callback = RecordingModule.CopyLog })
 logSection:Button({ Name = "Scan game", Callback = Scan.Run })
 logSection:Button({ Name = "Refresh saved list", Callback = function() refreshSavedList(cleanName(State.macroName)) end })
+end
 
 --------------------------------------------------------------------------------
 -- Runtime: game start, stage detect, heartbeat, auto farm wave checks
@@ -2706,6 +2950,7 @@ table.insert(State.connections, RunService.Heartbeat:Connect(function()
     if now >= nextRefresh then
         nextRefresh = now + 0.5
         refreshStatus()
+        if UnitAI.autoBuff or UnitAI.autoAbilities then refreshUnitStatus() end
         if #State.actions ~= lastListedCount then
             lastListedCount = #State.actions
             refreshActionList()
