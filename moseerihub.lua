@@ -140,7 +140,8 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false },
+        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false,
+        watchNoPause = false }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
 }
 
@@ -7580,7 +7581,7 @@ function Lobby.Loop()
             Lobby.lastRefresh = os.clock()
             pcall(Lobby.RefreshLists, false)
         end
-        if not State.watching then
+        if not State.watching or c.watchNoPause then
             if c.clean and (inLobbyNow or c.cleanInStage) and os.clock() - (Lobby.lastClean or -1e9) > 30 then
                 Lobby.lastClean = os.clock()
                 pcall(Lobby.Clean)
@@ -8357,8 +8358,9 @@ task.spawn(function()
     applyRuntimeFeatures()
     configReady = true
     saveConfig()
-    task.spawn(Lobby.Loop)
+    -- (Watch first: the loop must not act once before it is back on)
     if Lobby.cfg.watch and not State.watching then Lobby.SetWatch(true) end
+    task.spawn(Lobby.Loop)
     local restored = {}
     if UnitAI.autoAbilities then table.insert(restored, "Abilities") end
     if UnitAI.autoBuff then table.insert(restored, "Buff") end
