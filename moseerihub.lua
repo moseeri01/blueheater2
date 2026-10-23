@@ -140,7 +140,7 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {} },
+        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false },
     watchLog = {},
 }
 
@@ -7701,6 +7701,24 @@ function Lobby.SetWatch(on)
         Lobby.watchLog = {}
         if type(old) == "string" and old ~= "" then table.insert(Lobby.watchLog, (old:sub(-20000))) end
         table.insert(Lobby.watchLog, "# lobby_watch " .. os.date("%Y-%m-%d %H:%M:%S") .. " | stage " .. tostring(State.stage or "lobby"))
+        -- what the game sends us too (event cards on offer, temporary units, spells): logged
+        -- as "<-" lines from plain OnClientEvent connections (nothing hooked, nothing sent)
+        Lobby.watchConns = Lobby.watchConns or {}
+        pcall(function()
+            for _, r in ipairs(ReplicatedStorage.endpoints.server_to_client:GetChildren()) do
+                local n = string.lower(r.Name)
+                if r:IsA("RemoteEvent") and (n:find("temporary", 1, true) or n:find("roguelike", 1, true)
+                    or n:find("spell", 1, true) or n:find("vote", 1, true) or n:find("unit_spawned", 1, true)) then
+                    table.insert(Lobby.watchConns, r.OnClientEvent:Connect(function(...)
+                        local args = table.pack(...)
+                        local parts = {}
+                        for i = 1, args.n do parts[i] = describeValue(args[i], 0, FULL) end
+                        table.insert(Lobby.watchLog, string.format("%s <- %s(%s)", os.date("%H:%M:%S"), r.Name, table.concat(parts, ", ")))
+                        Lobby.watchDirty = true
+                    end))
+                end
+            end
+        end)
         task.spawn(function()
             -- written every 2 s (not inside the hook) while Watch is on
             while State.watching and not State.unloaded do
@@ -7711,6 +7729,9 @@ function Lobby.SetWatch(on)
                 task.wait(2)
             end
         end)
+    else
+        for _, c in ipairs(Lobby.watchConns or {}) do pcall(function() c:Disconnect() end) end
+        Lobby.watchConns = {}
     end
     return true
 end
@@ -7754,8 +7775,10 @@ join:Dropdown({ Name = "Act", Multi = false, Required = true, Options = { "1", "
 join:Dropdown({ Name = "Difficulty", Multi = false, Required = true, Options = { "Normal", "Hard" },
     Default = Lobby.cfg.difficulty, Callback = set("difficulty") }, "LobbyDifficulty")
 join:Toggle({ Name = "Friends only (join)", Default = Lobby.cfg.joinFriends, Callback = set("joinFriends") }, "LobbyJoinFriends")
-join:Toggle({ Name = "Watch (teach me once)", Default = false, Callback = function(on)
+-- (stays on across teleports until turned off: the script restarts in every stage)
+join:Toggle({ Name = "Watch (teach me once)", Default = Lobby.cfg.watch, Callback = function(on)
     local was = State.watching
+    if Lobby.cfg.watch ~= on then Lobby.cfg.watch = on saveConfig() end
     if not Lobby.SetWatch(on) then notify("Watch needs hookmetamethod (this executor has none).") return end
     if was and not on then
         AutoPlaceModule.Catalog.save("lobby_watch.txt", table.concat(Lobby.watchLog, "\n"))
@@ -8233,6 +8256,7 @@ task.spawn(function()
     configReady = true
     saveConfig()
     task.spawn(Lobby.Loop)
+    if Lobby.cfg.watch and not State.watching then Lobby.SetWatch(true) end
     local restored = {}
     if UnitAI.autoAbilities then table.insert(restored, "Abilities") end
     if UnitAI.autoBuff then table.insert(restored, "Buff") end
