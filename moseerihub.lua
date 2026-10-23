@@ -3720,6 +3720,36 @@ function AutoPlaceModule.MapReport()
                 AutoPlaceModule.PlacementKind(t), clip(t.traitRaw ~= "" and t.traitRaw or "-", 200)))
         end
     end
+    -- team data not found in memory: list tables that hold one of our uuids, to learn the new shape
+    local missing = {}
+    for _, t in pairs(AutoPlaceModule.team) do
+        if not t.fields then missing[(tostring(t.uuid):gsub("[{}%s]", ""))] = t.name end
+    end
+    if next(missing) and type(getgc) == "function" then
+        local found = 0
+        pcall(function()
+            for _, v in ipairs(getgc(true)) do
+                if found >= 6 then break end
+                if type(v) == "table" then
+                    for k, val in pairs(v) do
+                        local name = type(val) == "string" and missing[(val:gsub("[{}%s]", ""))]
+                        if name then
+                            found = found + 1
+                            local parts = {}
+                            for k2, v2 in pairs(v) do
+                                local shown = type(v2) == "table" and "{table}" or clip(tostring(v2), 24)
+                                table.insert(parts, tostring(k2) .. "=" .. shown)
+                            end
+                            table.sort(parts)
+                            table.insert(lines, string.format("  %s's data in memory (via %s): %s", name, tostring(k), clip(table.concat(parts, " "), 400)))
+                            break
+                        end
+                    end
+                end
+            end
+        end)
+        if found == 0 then table.insert(lines, "  team data: no table in memory holds our unit uuids") end
+    end
     table.insert(lines, "money value: " .. tostring(AutoPlace.moneyPath) .. " = " .. tostring(AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)))
     local top = {}
     for _, c in ipairs(workspace:GetChildren()) do table.insert(top, c.Name) end
