@@ -80,7 +80,7 @@ local UnitAI = {
     autoAbilities = false,
     abilityCooldown = 2,
     autoBuff = false,
-    buffInterval = 1,
+    buffGap = 0, -- seconds between casts of one buff type; 0 = cooldown / unit count
     minUnitsForBuff = 4,
     learned = {},
 }
@@ -187,7 +187,7 @@ local function buildConfigData()
             autoAbilities = UnitAI.autoAbilities,
             abilityCooldown = UnitAI.abilityCooldown,
             autoBuff = UnitAI.autoBuff,
-            buffInterval = UnitAI.buffInterval,
+            buffGap = UnitAI.buffGap,
             minUnitsForBuff = UnitAI.minUnitsForBuff,
             learned = next(UnitAI.learned) and UnitAI.learned or nil,
         },
@@ -229,7 +229,7 @@ local function applyConfigData(data)
     DungeonBot.autoBuyBuffs = pick(d.autoBuyBuffs, "boolean", DungeonBot.autoBuyBuffs)
     local u = data.unitAI or {}
     UnitAI.abilityCooldown = pick(u.abilityCooldown, "number", UnitAI.abilityCooldown)
-    UnitAI.buffInterval = pick(u.buffInterval, "number", UnitAI.buffInterval)
+    UnitAI.buffGap = pick(u.buffGap, "number", UnitAI.buffGap)
     UnitAI.minUnitsForBuff = pick(u.minUnitsForBuff, "number", UnitAI.minUnitsForBuff)
     UnitAI.learned = type(u.learned) == "table" and u.learned or {}
     pendingToggles.autoAbilities = u.autoAbilities == true
@@ -2172,10 +2172,111 @@ function UnitAIModule.BuffReport()
     end
 end
 
+-- Buff rotation. Buff units of one type (e.g. 4x Wendy, 64 s cooldown) cast ONE AT A TIME,
+-- a gap apart (cooldown / count by default), so one buff is always running. Casting them
+-- all together puts them on cooldown together and leaves a long gap with no buff.
+local BuffRot = { groups = {}, autoActive = 0, buffUnits = 0 }
+do
+local function statNum(unit, name)
+    local stats = unit:FindFirstChild("_stats")
+    local v = stats and stats:FindFirstChild(name)
+    return v and tonumber(v.Value) or nil
+end
+
+local function serverNow()
+    local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
+    if ok and type(t) == "number" then return t end
+    return os.time()
+end
+
+function BuffRot.isBuffUnit(unit)
+    if UnitAI.learned[unitType(unit)] then return true end
+    local stats = unit:FindFirstChild("_stats")
+    local a = stats and stats:FindFirstChild("active_attack")
+    return a ~= nil and string.lower(tostring(a.Value)):find("buff", 1, true) ~= nil
+end
+
+-- Seconds until this unit's skill is off cooldown (0 = ready, also when the game gives no data).
+local function readyIn(unit)
+    local last, cd = statNum(unit, "last_active_cast"), statNum(unit, "active_attack_cooldown")
+    if not last or not cd or last <= 0 then return 0 end
+    return math.max(0, last + cd - serverNow())
+end
+
+local function cast(unit)
+    local entry = UnitAI.learned[unitType(unit)]
+    if entry then return fireLearned(unit, entry) end
+    return fireActiveAttack(unit)
+end
+
+-- One pass over every buff type; called a few times per second.
+function BuffRot.tick()
+    local byType, order = {}, {}
+    BuffRot.autoActive, BuffRot.buffUnits = 0, 0
+    for _, unit in ipairs(ownedUnits()) do
+        if BuffRot.isBuffUnit(unit) then
+            local kind = unitType(unit)
+            if not byType[kind] then byType[kind] = {} table.insert(order, kind) end
+            table.insert(byType[kind], unit)
+            BuffRot.buffUnits = BuffRot.buffUnits + 1
+            if unit:GetAttribute("_auto_active") == true then BuffRot.autoActive = BuffRot.autoActive + 1 end
+        end
+    end
+    local now = os.clock()
+    for kind, g in pairs(BuffRot.groups) do
+        if not byType[kind] then BuffRot.groups[kind] = nil end
+    end
+    for _, kind in ipairs(order) do
+        local list = byType[kind]
+        local g = BuffRot.groups[kind] or { nextAt = 0, ok = 0, failed = 0 }
+        BuffRot.groups[kind] = g
+        local cd = statNum(list[1], "active_attack_cooldown")
+        g.count = #list
+        g.auto = not (UnitAI.buffGap and UnitAI.buffGap > 0)
+        g.gap = g.auto and ((cd and cd > 0) and (cd / #list) or 20) or UnitAI.buffGap
+        g.cd = cd
+
+        if g.pending then
+            local last = statNum(g.pending.unit, "last_active_cast")
+            if g.pending.before == nil then
+                g.pending = nil
+                g.ok = g.ok + 1
+            elseif last and last > g.pending.before + 1e-3 then
+                g.pending = nil
+                g.ok = g.ok + 1
+            elseif now - g.pending.at > 3 then
+                g.pending = nil
+                g.failed = g.failed + 1
+                g.nextAt = now + 0.5
+            end
+        elseif now >= g.nextAt then
+            local best, bestLast, soonest
+            for _, unit in ipairs(list) do
+                local wait = readyIn(unit)
+                if wait <= 0 then
+                    local last = statNum(unit, "last_active_cast") or 0
+                    if not best or last < bestLast then best, bestLast = unit, last end
+                elseif not soonest or wait < soonest then
+                    soonest = wait
+                end
+            end
+            g.waitReady = (not best) and soonest or nil
+            if best and cast(best) then
+                g.pending = { unit = best, at = now, before = statNum(best, "last_active_cast") }
+                g.lastCastAt = now
+                g.nextAt = now + g.gap
+            end
+        end
+    end
+end
+end
+
 local function myUnitsWithAbility()
     local list = {}
     for _, unit in ipairs(ownedUnits()) do
-        if hasActiveAttack(unit) then table.insert(list, unit) end
+        if hasActiveAttack(unit) and not (UnitAI.autoBuff and BuffRot.isBuffUnit(unit)) then
+            table.insert(list, unit)
+        end
     end
     return list
 end
@@ -2186,12 +2287,30 @@ local function refreshUnitStatus()
     if UnitAI.autoAbilities then table.insert(parts, "Abilities: ON (every " .. UnitAI.abilityCooldown .. "s)") end
     if UnitAI.autoBuff then
         local mine = #ownedUnits()
-        local waiting = mine < UnitAI.minUnitsForBuff and string.format(" - waiting %d/%d units", mine, UnitAI.minUnitsForBuff) or " - looping"
-        table.insert(parts, "Buff loop: ON (every " .. UnitAI.buffInterval .. "s)" .. waiting)
-        if BuffInfo.at then
-            table.insert(parts, string.format("Last: %d unit(s) via %s, reply %s", BuffInfo.fired, BuffInfo.via, clip(BuffInfo.reply, 30)))
+        if mine < UnitAI.minUnitsForBuff then
+            table.insert(parts, string.format("Buff rotation: waiting %d/%d units", mine, UnitAI.minUnitsForBuff))
+        else
+            table.insert(parts, "Buff rotation: running")
+        end
+        local kinds = {}
+        for kind in pairs(BuffRot.groups) do table.insert(kinds, kind) end
+        table.sort(kinds)
+        for _, kind in ipairs(kinds) do
+            local g = BuffRot.groups[kind]
+            local nextText
+            if g.waitReady then nextText = string.format("cooldown %ds", math.ceil(g.waitReady))
+            else nextText = string.format("next in %ds", math.max(0, math.ceil(g.nextAt - os.clock()))) end
+            table.insert(parts, string.format("%s x%d: every %.1fs%s, %s, cast %d ok / %d no",
+                kind, g.count or 0, g.gap or 0, g.auto and " (auto)" or "", nextText, g.ok, g.failed))
+        end
+        if BuffRot.autoActive > 0 then
+            table.insert(parts, string.format("Problem: in-game Auto skill is ON for %d buff unit(s) - set it Off (the On/Off button next to the skill) so they take turns", BuffRot.autoActive))
+        end
+        if mine >= UnitAI.minUnitsForBuff and BuffRot.buffUnits == 0 then
+            table.insert(parts, "Problem: no buff unit found - use Learn buff")
         end
         if BuffInfo.problem then table.insert(parts, "Problem: " .. BuffInfo.problem) end
+        if BuffInfo.reply ~= "-" then table.insert(parts, "Last reply: " .. clip(BuffInfo.reply, 30)) end
     end
     table.insert(parts, "My units on map: " .. #ownedUnits())
     unitStatusParagraph:UpdateBody(table.concat(parts, "\n"))
@@ -2219,33 +2338,17 @@ function UnitAIModule.StopAbilities()
     abilityGen = abilityGen + 1
 end
 
--- Buff units (Windsong etc.) are re-fired every tick with no attack-state check;
--- the server ignores calls during cooldown, so each buff is recast as soon as it is ready.
 function UnitAIModule.StartBuff()
     buffGen = buffGen + 1
     local gen = buffGen
+    BuffRot.groups = {}
     task.spawn(function()
         while UnitAI.autoBuff and gen == buffGen do
-            local units = ownedUnits()
-            if isGameRunning() and #units >= UnitAI.minUnitsForBuff then
-                local fired = 0
+            if isGameRunning() and #ownedUnits() >= UnitAI.minUnitsForBuff then
                 BuffInfo.problem = nil
-                if next(UnitAI.learned) then
-                    for _, unit in ipairs(units) do
-                        local entry = UnitAI.learned[unitType(unit)]
-                        if entry and fireLearned(unit, entry) then fired = fired + 1 end
-                    end
-                else
-                    for _, unit in ipairs(units) do
-                        if hasActiveAttack(unit) and fireActiveAttack(unit) then fired = fired + 1 end
-                    end
-                    if fired == 0 and not BuffInfo.problem then
-                        BuffInfo.problem = "no unit has a skill in _stats.active_attack - use Learn buff"
-                    end
-                end
-                BuffInfo.at, BuffInfo.fired = os.clock(), fired
+                BuffRot.tick()
             end
-            task.wait(math.max(1, UnitAI.buffInterval))
+            task.wait(0.25)
         end
     end)
 end
@@ -2679,7 +2782,7 @@ Controls.abilityCooldown = abilitySection:Slider({
 }, "AbilityCooldown")
 abilitySection:Paragraph({ Header = "", Body = "Damage abilities: fired only while the unit\nis attacking." })
 
-buffSection:Header({ Text = "Auto buff loop" })
+buffSection:Header({ Text = "Buff rotation" })
 autoBuffToggle = buffSection:Toggle({
     Name = "Auto use buffs",
     Default = false,
@@ -2689,13 +2792,13 @@ autoBuffToggle = buffSection:Toggle({
         refreshUnitStatus(); saveConfig()
     end,
 }, "AutoBuff")
-Controls.buffInterval = buffSection:Slider({
-    Name = "Check every (seconds)",
-    Minimum = 1,
-    Maximum = 30,
-    Default = UnitAI.buffInterval,
-    Callback = function(v) UnitAI.buffInterval = v; refreshUnitStatus(); saveConfig() end,
-}, "BuffInterval")
+Controls.buffGap = buffSection:Slider({
+    Name = "Gap between casts (0 = auto)",
+    Minimum = 0,
+    Maximum = 60,
+    Default = UnitAI.buffGap,
+    Callback = function(v) UnitAI.buffGap = v; refreshUnitStatus(); saveConfig() end,
+}, "BuffGap")
 Controls.minUnitsForBuff = buffSection:Slider({
     Name = "Min units before buff starts",
     Minimum = 1,
@@ -2703,7 +2806,7 @@ Controls.minUnitsForBuff = buffSection:Slider({
     Default = UnitAI.minUnitsForBuff,
     Callback = function(v) UnitAI.minUnitsForBuff = v; refreshUnitStatus(); saveConfig() end,
 }, "MinUnitsForBuff")
-buffSection:Paragraph({ Header = "", Body = "Every check, each buff unit is told to cast.\nUnits still on cooldown are skipped by the\ngame, so every buff (physical or magic) is\nrecast the moment its own cooldown ends." })
+buffSection:Paragraph({ Header = "", Body = "Buff units of the same type cast one at a\ntime, a gap apart, so one buff is always on.\nAuto gap = cooldown / number of that unit\n(4 Wendy, 64 s cooldown -> every 16 s).\nSet the in-game Auto skill button to Off\nfor buff units, or they all cast together." })
 
 buffSection:Header({ Text = "Learn buff (if the loop does nothing)" })
 local learnedParagraph = buffSection:Paragraph({ Header = "Learned", Body = "" })
@@ -3041,7 +3144,7 @@ applyRuntimeFeatures = function()
     setControl(Controls.sellUnitName, AutoFarm.sellUnitName)
     setControl(Controls.speedMultiplier, AutoFarm.speedMultiplier)
     setControl(Controls.abilityCooldown, UnitAI.abilityCooldown)
-    setControl(Controls.buffInterval, UnitAI.buffInterval)
+    setControl(Controls.buffGap, UnitAI.buffGap)
     setControl(Controls.minUnitsForBuff, UnitAI.minUnitsForBuff)
     setControl(Controls.autoPlay, State.autoPlay)
     setControl(Controls.retryPlacements, State.retryPlacements)
