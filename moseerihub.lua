@@ -7731,9 +7731,9 @@ function Lobby.Loop()
                     if t then table.insert(slots, s .. "=" .. t.name .. ":" .. tostring(t.uuid):sub(2, 5)) end
                 end
                 for _ in pairs(AutoPlaceModule.liveTemp) do live = live + 1 end
-                table.insert(Lobby.live, string.format("%s tick %ss@%s money %s base %s/%s units %d try %s candy %s live %d team %s | %s", os.date("%H:%M:%S"),
+                table.insert(Lobby.live, string.format("%s tick %ss@%s money %s base %s/%s units %d try %s candy %s card %s spells %s live %d team %s | %s", os.date("%H:%M:%S"),
                     tostring(AutoPlaceModule.tickAt and math.floor(os.clock() - AutoPlaceModule.tickAt)), tostring(AutoPlaceModule.tickStep), tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), #ownedUnits(), tostring(AutoPlaceModule.lastTry),
-                    tostring(Lobby.candy), live, table.concat(slots, ","), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
+                    tostring(Lobby.candy), tostring(Lobby.cardInfo), table.concat(Lobby.spells or {}, "+"), live, table.concat(slots, ","), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
                 if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
             end)
@@ -7868,6 +7868,7 @@ function Lobby.OnCardOptions(seconds, options)
     local way = Lobby.cfg.voteWay ~= "" and Lobby.cfg.voteWay or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
     local arg = (way == "index0" and i - 1) or (way == "title" and options[i].title) or (way == "option" and options[i]) or i
     Lobby.pendingVote = { title = options[i].title, way = way }
+    Lobby.cardInfo = string.format("want %s (%s)", tostring(options[i].title), way)
     AutoPlaceModule.Note(string.format("card: %s (%s, way %s)", tostring(options[i].title), why, way))
     task.spawn(pcall, function()
         if way == "gui" then
@@ -7888,6 +7889,7 @@ function Lobby.OnCardResult(picked, state)
     if type(state) == "table" then Lobby.candy = tonumber(state.candy_multiplier) or Lobby.candy end
     local p = Lobby.pendingVote
     Lobby.pendingVote = nil
+    Lobby.cardInfo = string.format("%s -> got %s", tostring(Lobby.cardInfo), type(picked) == "table" and tostring(picked.title) or "?")
     if not p or type(picked) ~= "table" or Lobby.cfg.voteWay ~= "" then return end
     if picked.title == p.title then
         Lobby.voteHits = (Lobby.voteHits or 0) + 1
