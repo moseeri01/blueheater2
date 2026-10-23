@@ -2214,12 +2214,6 @@ local function statNum(unit, name)
     return v and tonumber(v.Value) or nil
 end
 
-local function serverNow()
-    local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
-    if ok and type(t) == "number" then return t end
-    return os.time()
-end
-
 function BuffRot.isBuffUnit(unit)
     if UnitAI.learned[unitType(unit)] then return true end
     local stats = unit:FindFirstChild("_stats")
@@ -2231,11 +2225,26 @@ end
 -- every cast, so both are used: whichever is more recent wins.
 local ourCast = setmetatable({}, { __mode = "k" })
 
+-- last_active_cast is NOT compared with any clock: in the real game it runs about 7 h
+-- (timezone) ahead of GetServerTimeNow, which made every unit look on cooldown forever.
+-- Instead, the local moment the value CHANGES is taken as the cast time.
+local seenCast = setmetatable({}, { __mode = "k" })
+
+local function observeCast(unit)
+    local v = statNum(unit, "last_active_cast")
+    local s = seenCast[unit]
+    if not s then
+        seenCast[unit] = { value = v }
+    elseif v ~= s.value then
+        s.value, s.at = v, os.clock()
+    end
+end
+
 -- Seconds since this unit last cast (nil = never seen casting).
 local function castAge(unit)
     local age
-    local last = statNum(unit, "last_active_cast")
-    if last and last > 0 then age = serverNow() - last end
+    local s = seenCast[unit]
+    if s and s.at then age = os.clock() - s.at end
     if ourCast[unit] then
         local mine = os.clock() - ourCast[unit]
         if not age or mine < age then age = mine end
@@ -2321,6 +2330,7 @@ function BuffRot.tick()
         g.gap = g.auto and ((cd and cd > 0) and (cd / #list) or 20) or UnitAI.buffGap
         g.cd = cd
 
+        for _, unit in ipairs(list) do observeCast(unit) end
         measureTick(g, now)
         if g.pending then
             local last = statNum(g.pending.unit, "last_active_cast")
@@ -2371,12 +2381,12 @@ function BuffRot.coverageText(g)
         local cover = math.min(1, (g.count or 0) * dur / g.cd)
         local need = math.ceil(g.cd / dur - 1e-6)
         if cover >= 0.999 then
-            return string.format("buff lasts %.1fs: %d cover 100%%", dur, g.count or 0)
+            return string.format("buff lasts %.1fs: %d keep it on 100%% of the time", dur, g.count or 0)
         end
-        return string.format("buff lasts %.1fs, cooldown %.0fs: %d cover %d%% - need %d of this unit for 100%%",
-            dur, g.cd, g.count or 0, math.floor(cover * 100), need)
+        return string.format("Max possible %d%%: each buff lasts %.1fs, cooldown %.0fs. Place %d for 100%% (have %d)",
+            math.floor(cover * 100), dur, g.cd, need, g.count or 0)
     end
-    if g.durationAtLeast then return string.format("buff lasts over %.0fs: covers 100%%", g.durationAtLeast) end
+    if g.durationAtLeast then return string.format("buff lasts over %.0fs: kept on 100%% of the time", g.durationAtLeast) end
     if g.noEffect then return "buff length not measurable - set 'Buff lasts' to see coverage" end
     return "measuring buff length..."
 end
@@ -3252,6 +3262,7 @@ end
 -- TAB 2: Auto Farm (replay automation)
 do
 local autoTab = tabGroup:Tab({ Name = "Auto Farm", Image = "rbxassetid://10734950309" })
+AutoPlaceModule.farmTab = autoTab -- Auto Place sections are added to this tab further down
 
 local autoReplaySection = autoTab:Section({ Side = "Left" })
 local autoExtraSection = autoTab:Section({ Side = "Right" })
@@ -3395,9 +3406,9 @@ buffSection:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffRepo
 
 end
 
--- TAB: Auto Place
+-- Auto Place: sections on the Auto Farm tab (below the stage automation ones)
 do
-local placeTab = tabGroup:Tab({ Name = "Auto Place", Image = "rbxassetid://10734950309" })
+local placeTab = AutoPlaceModule.farmTab
 local placeMain = placeTab:Section({ Side = "Left" })
 local placeSlots = placeTab:Section({ Side = "Right" })
 
