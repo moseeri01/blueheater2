@@ -98,6 +98,7 @@ local AutoPlace = {
     caps = {},                    -- [unit name] = how many the game lets you place, learned once
     roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
     unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
+    placeMode = "Balanced",       -- damage units: "Safe" near our base, "Fast clear" near the enemy spawn
 }
 
 -- Dungeon Bot state
@@ -229,6 +230,7 @@ local function buildConfigData()
             caps = next(AutoPlace.caps) and AutoPlace.caps or nil,
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
             unitInfo = next(AutoPlace.unitInfo or {}) and AutoPlace.unitInfo or nil,
+            placeMode = AutoPlace.placeMode,
         },
     }
 end
@@ -283,6 +285,7 @@ local function applyConfigData(data)
     end
     AutoPlace.moneyPath = pick(ap.moneyPath, "string", AutoPlace.moneyPath)
     if type(ap.unitInfo) == "table" then AutoPlace.unitInfo = ap.unitInfo end
+    AutoPlace.placeMode = pick(ap.placeMode, "string", AutoPlace.placeMode)
     if type(ap.paths) == "table" then AutoPlace.paths = ap.paths end
     if type(ap.caps) == "table" then AutoPlace.caps = ap.caps end
     if type(ap.roles) == "table" then AutoPlace.roles = ap.roles end
@@ -2922,14 +2925,25 @@ local function bestSpot(skip, role, range, kind)
         table.sort(scored, function(a, b) return a.k > b.k end)
         return scored[skip + 1] and scored[skip + 1].c
     end
-    if range and range ~= DEFAULT_RANGE and role ~= "buff" and role ~= "support" then
-        local r2 = range * range
+    if role ~= "buff" and role ~= "support" then
+        local r = (range and range > 0) and range or DEFAULT_RANGE
+        local r2 = r * r
+        -- Fast clear: prefer spots near the enemy spawn (kills early, waves end sooner);
+        -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
+        local mode = AutoPlace.placeMode
+        local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
         local scored = {}
         for _, c in ipairs(free) do
             local n = 0
             for _, q in ipairs(pts) do
                 local dx, dz = q[1] - c.x, q[3] - c.z
                 if dx * dx + dz * dz <= r2 then n = n + 1 end
+            end
+            if spawn and goal and (mode == "Fast clear" or mode == "Safe") then
+                local ds = math.sqrt((c.x - spawn.X) ^ 2 + (c.z - spawn.Z) ^ 2)
+                local dg = math.sqrt((c.x - goal.X) ^ 2 + (c.z - goal.Z) ^ 2)
+                local nearSpawn = dg / math.max(1, ds + dg) -- 1 at the spawn, 0 at our base
+                n = n * (mode == "Fast clear" and nearSpawn ^ 2 or (1 - nearSpawn) ^ 2)
             end
             table.insert(scored, { c = c, n = n })
         end
@@ -2990,6 +3004,11 @@ function AutoPlaceModule.RefreshTeam()
                             local lower = string.lower(key)
                             table.insert(keys, key)
                             if type(val) == "number" and lower:find("stat", 1, true) then rolls[key] = val end
+                            if type(val) == "table" and lower:find("stat", 1, true) then
+                                for rk, rv in pairs(val) do
+                                    if type(rv) == "number" then rolls[tostring(rk)] = rv end
+                                end
+                            end
                             -- named traits (Divine, Godspeed, Sniper II, ...) in any "trait" field
                             -- ("trait_stats" holds numbers like range = 1.1, not names)
                             if lower:find("trait", 1, true) and not lower:find("stat", 1, true) then
@@ -3063,7 +3082,11 @@ function AutoPlaceModule.RefreshTeam()
         local def = AutoPlaceModule.UnitDef(t.name)
         if def then
             t.cost = t.cost or tonumber(def.cost)
-            if not AutoPlace.caps[t.name] then
+            local gameCap = tonumber(def.spawn_cap)
+            if gameCap and gameCap >= 1 then
+                -- (a cap learned from a misread message must not stick: Speedwagon stayed at 1)
+                AutoPlace.caps[t.name], t.gameCap = gameCap, gameCap
+            elseif not AutoPlace.caps[t.name] then
                 for k, v in pairs(def) do
                     local key = string.lower(tostring(k))
                     if type(v) == "number" and v >= 1 and v <= 20 and (key:find("cap", 1, true) or key:find("limit", 1, true)) then
@@ -3364,7 +3387,8 @@ local function refusalReason()
             local kind
             if t:find("not enough", 1, true) then kind = "money"
             elseif t:find("cannot place", 1, true) or t:find("can't place", 1, true) or t:find("invalid", 1, true) then kind = "spot"
-            elseif t:find("max", 1, true) or t:find("limit", 1, true) then kind = "cap" end
+            elseif (t:find("max", 1, true) or t:find("limit", 1, true))
+                and (t:find("place", 1, true) or t:find("unit", 1, true) or t:find("reach", 1, true)) then kind = "cap" end
             if kind and isOnScreen(d) and not isOwnGui(d) then return kind end
         end
     end
@@ -3386,6 +3410,9 @@ end
 local dangerUntil, lastHp = 0, nil
 
 local function basePos(side)
+    return AutoPlaceModule.BasePos(side)
+end
+function AutoPlaceModule.BasePos(side)
     local bases = workspace:FindFirstChild("_BASES")
     local b = bases and bases:FindFirstChild(side)
     local base = b and b:FindFirstChild("base")
@@ -3595,6 +3622,8 @@ local function tick()
     end
     local why = refusalReason()
     if why == "money" then return 0.5 end
+    -- below the game's own limit a "limit" message cannot be about this unit
+    if why == "cap" and t.gameCap and #placedOf(t.uuid) < t.gameCap then why = "spot" end
     if why == "spot" then
         badSpots[spotKey(spot, kind)] = true
         return 0.1
@@ -3611,7 +3640,7 @@ local function tick()
         badSpots[key] = true
         recentBad[#recentBad + 1] = key
         failsInRow = failsInRow + 1
-        if failsInRow >= 4 then
+        if failsInRow >= 4 and not t.gameCap then
             -- refused on 4 different spots with money in hand: this unit is at its limit,
             -- and those spots were fine for other units
             AutoPlaceModule.full[t.uuid] = true
@@ -4719,6 +4748,18 @@ Controls.autoPlaceUpgrade = placeMain:Toggle({
     Default = AutoPlace.upgrade,
     Callback = function(on) AutoPlace.upgrade = on; saveConfig() end,
 }, "AutoPlaceUpgrade")
+Controls.placeMode = placeMain:Dropdown({
+    Name = "Where to put damage units",
+    Multi = false,
+    Required = true,
+    Options = { "Balanced", "Fast clear", "Safe" },
+    Default = AutoPlace.placeMode,
+    Callback = function(v)
+        if type(v) ~= "string" then return end
+        AutoPlace.placeMode = v
+        saveConfig()
+    end,
+}, "AutoPlaceMode")
 placeMain:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
 placeMain:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
@@ -5085,6 +5126,7 @@ applyRuntimeFeatures = function()
     setControl(UIRef.antiAfkToggle, Tools.antiAfk)
     if Tools.antiAfk then ToolsModule.StartAntiAfk() else ToolsModule.StopAntiAfk() end
     setControl(Controls.autoPlaceUpgrade, AutoPlace.upgrade)
+    pcall(function() Controls.placeMode:UpdateSelection(AutoPlace.placeMode) end)
     for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
     AutoPlace.enabled = pendingToggles.autoPlace == true
     setControl(Controls.autoPlace, AutoPlace.enabled)
