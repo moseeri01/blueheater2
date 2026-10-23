@@ -7408,6 +7408,7 @@ end
 function Lobby.Worlds(mode)
     local out, seen, rank = {}, {}, {}
     if mode == "Infinity Mansion" then return { "Infinity Mansion" } end
+    if mode == "Event" then return { "Current event" } end
     pcall(function()
         -- game order, first choice: the game's own WorldLevelOrder list (world ids, or
         -- tables naming one), position = rank
@@ -7490,16 +7491,18 @@ function Lobby.Rooms(kind)
         if n and n:find("^_lobbytemplate") then
             local rest = n:sub(15)
             local isPortal, isRaid, isGreen = rest:find("^portal") ~= nil, rest:find("^%d+$") ~= nil, rest:find("^green") ~= nil
-            if (kind == "portal" and isPortal) or (kind == "raid" and isRaid) or (kind ~= "portal" and kind ~= "raid" and isGreen) then
+            local isEvent = rest:find("^_?event") ~= nil -- watched: "_lobbytemplate_event3"
+            if (kind == "portal" and isPortal) or (kind == "raid" and isRaid) or (kind == "event" and isEvent)
+                or (kind ~= "portal" and kind ~= "raid" and kind ~= "event" and isGreen) then
                 table.insert(want, n)
-            elseif not isPortal then
+            elseif not isPortal and not isEvent then
                 table.insert(other, n)
             end
         end
     end
     table.sort(want)
     table.sort(other)
-    if #want == 0 and kind ~= "portal" then return other end
+    if #want == 0 and kind ~= "portal" and kind ~= "event" then return other end
     return want
 end
 
@@ -7512,6 +7515,16 @@ end
 -- friends only, difficulty), start. A room that refuses is skipped for the next one.
 function Lobby.Join()
     local c = Lobby.cfg
+    if c.mode == "Event" then
+        -- watched: walking into an event room is all it takes, the room starts by itself
+        local join = getAARemote("request_join_lobby")
+        for _, room in ipairs(join and Lobby.Rooms("event") or {}) do
+            local ok, reply = pcall(function() return join:InvokeServer(room) end)
+            if ok and reply ~= false then Lobby.Status("Auto join: event room " .. room) return true end
+        end
+        Lobby.Status("Auto join: no event room found")
+        return false
+    end
     local level = Lobby.LevelId(c.mode, c.world, tonumber(c.act) or 1)
     if not level then Lobby.Status("Auto join: pick a Stage for " .. c.mode) return false end
     local join, lock, start = getAARemote("request_join_lobby"), getAARemote("request_lock_level"), getAARemote("request_start_game")
@@ -7846,7 +7859,7 @@ UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "In the lobby: cl
 join:Toggle({ Name = "Auto join", Default = Lobby.cfg.autoJoin, Callback = set("autoJoin") }, "LobbyAutoJoin")
 local worldDropdown
 join:Dropdown({ Name = "Join mode", Multi = false, Required = true,
-    Options = { "Story", "Infinite", "Legend", "Raid", "Infinity Mansion" }, Default = Lobby.cfg.mode,
+    Options = { "Story", "Infinite", "Legend", "Raid", "Infinity Mansion", "Event" }, Default = Lobby.cfg.mode,
     Callback = function(v)
         if syncing or type(v) ~= "string" then return end
         Lobby.cfg.mode = v
