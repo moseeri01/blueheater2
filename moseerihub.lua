@@ -7517,10 +7517,26 @@ end
 function Lobby.Join()
     local c = Lobby.cfg
     if c.mode == "Event" then
-        -- watched: walking into an event room is all it takes, the room starts by itself
+        -- watched: walking into an event room is all it takes, the room starts by itself. The
+        -- join call alone (made from across the lobby) did not start it in the real game, so
+        -- the character is moved onto the room's floor, like walking in; the call follows.
         local join = getAARemote("request_join_lobby")
-        for _, room in ipairs(join and Lobby.Rooms("event") or {}) do
-            local ok, reply = pcall(function() return join:InvokeServer(room) end)
+        for _, room in ipairs(Lobby.Rooms("event")) do
+            local model
+            for _, d in ipairs(workspace:GetDescendants()) do
+                if d:IsA("Model") and d.Name == room then model = d break end
+            end
+            local root
+            pcall(function() root = Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart") end)
+            if model and root then
+                pcall(function()
+                    local cf, size = model:GetBoundingBox()
+                    root.CFrame = CFrame.new(cf.Position - Vector3.new(0, size.Y / 2 - 3, 0))
+                end)
+                task.wait(1)
+            end
+            local ok, reply = true, nil
+            if join then ok, reply = pcall(function() return join:InvokeServer(room) end) end
             if ok and reply ~= false then Lobby.Status("Auto join: event room " .. room) return true end
         end
         Lobby.Status("Auto join: no event room found")
