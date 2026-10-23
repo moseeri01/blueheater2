@@ -81,6 +81,7 @@ local UnitAI = {
     abilityCooldown = 2,
     autoBuff = false,
     buffGap = 0, -- seconds between casts of one buff type; 0 = cooldown / unit count
+    buffDuration = 0, -- how long one buff lasts, for the coverage verdict; 0 = measure it
     minUnitsForBuff = 4,
     learned = {},
 }
@@ -198,6 +199,7 @@ local function buildConfigData()
             abilityCooldown = UnitAI.abilityCooldown,
             autoBuff = UnitAI.autoBuff,
             buffGap = UnitAI.buffGap,
+            buffDuration = UnitAI.buffDuration,
             minUnitsForBuff = UnitAI.minUnitsForBuff,
             learned = next(UnitAI.learned) and UnitAI.learned or nil,
         },
@@ -245,6 +247,7 @@ local function applyConfigData(data)
     local u = data.unitAI or {}
     UnitAI.abilityCooldown = pick(u.abilityCooldown, "number", UnitAI.abilityCooldown)
     UnitAI.buffGap = pick(u.buffGap, "number", UnitAI.buffGap)
+    UnitAI.buffDuration = pick(u.buffDuration, "number", UnitAI.buffDuration)
     UnitAI.minUnitsForBuff = pick(u.minUnitsForBuff, "number", UnitAI.minUnitsForBuff)
     UnitAI.learned = type(u.learned) == "table" and u.learned or {}
     pendingToggles.autoAbilities = u.autoAbilities == true
@@ -2224,11 +2227,65 @@ function BuffRot.isBuffUnit(unit)
     return a ~= nil and string.lower(tostring(a.Value)):find("buff", 1, true) ~= nil
 end
 
+-- When WE last cast each unit (os.clock). The game's last_active_cast may not update for
+-- every cast, so both are used: whichever is more recent wins.
+local ourCast = setmetatable({}, { __mode = "k" })
+
+-- Seconds since this unit last cast (nil = never seen casting).
+local function castAge(unit)
+    local age
+    local last = statNum(unit, "last_active_cast")
+    if last and last > 0 then age = serverNow() - last end
+    if ourCast[unit] then
+        local mine = os.clock() - ourCast[unit]
+        if not age or mine < age then age = mine end
+    end
+    return age
+end
+
 -- Seconds until this unit's skill is off cooldown (0 = ready, also when the game gives no data).
 local function readyIn(unit)
-    local last, cd = statNum(unit, "last_active_cast"), statNum(unit, "active_attack_cooldown")
-    if not last or not cd or last <= 0 then return 0 end
-    return math.max(0, last + cd - serverNow())
+    local cd = statNum(unit, "active_attack_cooldown")
+    local age = castAge(unit)
+    if not cd or not age then return 0 end
+    return math.max(0, cd - age)
+end
+
+-- Buff effect on the team: numbers on our units that a buff changes (damage/buff multipliers).
+local function effectSnapshot()
+    local snap = {}
+    for _, u in ipairs(ownedUnits()) do
+        local stats = u:FindFirstChild("_stats")
+        for _, v in ipairs(stats and stats:GetChildren() or {}) do
+            local n = string.lower(v.Name)
+            if (v:IsA("NumberValue") or v:IsA("IntValue"))
+                and (n:find("multiplier", 1, true) or n:find("buff", 1, true) or n:find("potency", 1, true))
+                and not n:find("cooldown", 1, true) then
+                snap[v] = v.Value
+            end
+        end
+    end
+    return snap
+end
+
+local function effectChanged(base)
+    for v, old in pairs(base) do
+        if v.Parent and math.abs((tonumber(v.Value) or 0) - (tonumber(old) or 0)) > 1e-6 then return true end
+    end
+    return false
+end
+
+-- Measures how long one buff lasts, from the first cast of a game (team not buffed yet).
+local function measureTick(g, now)
+    local m = g.measure
+    if not m then return end
+    local changed = effectChanged(m.base)
+    if changed and not m.startAt then m.startAt = now end
+    if m.startAt and not changed then
+        g.duration, g.durationAtLeast, g.measure = now - m.startAt, nil, nil
+    elseif not m.startAt and now - m.castAt > 10 then
+        g.measure, g.noEffect = nil, true
+    end
 end
 
 local function cast(unit)
@@ -2264,38 +2321,64 @@ function BuffRot.tick()
         g.gap = g.auto and ((cd and cd > 0) and (cd / #list) or 20) or UnitAI.buffGap
         g.cd = cd
 
+        measureTick(g, now)
         if g.pending then
             local last = statNum(g.pending.unit, "last_active_cast")
-            if g.pending.before == nil then
-                g.pending = nil
-                g.ok = g.ok + 1
-            elseif last and last > g.pending.before + 1e-3 then
+            if g.pending.before == nil or (last and last > g.pending.before + 1e-3) then
                 g.pending = nil
                 g.ok = g.ok + 1
             elseif now - g.pending.at > 3 then
+                -- the game did not confirm; it may still have cast. Keep the turn order and
+                -- the gap (firing the next unit at once is what made all of them cast together)
                 g.pending = nil
-                g.failed = g.failed + 1
-                g.nextAt = now + 0.5
+                g.unconfirmed = (g.unconfirmed or 0) + 1
             end
         elseif now >= g.nextAt then
-            local best, bestLast, soonest
+            local best, bestAge, soonest
             for _, unit in ipairs(list) do
                 local wait = readyIn(unit)
                 if wait <= 0 then
-                    local last = statNum(unit, "last_active_cast") or 0
-                    if not best or last < bestLast then best, bestLast = unit, last end
+                    local age = castAge(unit) or math.huge
+                    if not best or age > bestAge then best, bestAge = unit, age end
                 elseif not soonest or wait < soonest then
                     soonest = wait
                 end
             end
             g.waitReady = (not best) and soonest or nil
-            if best and cast(best) then
-                g.pending = { unit = best, at = now, before = statNum(best, "last_active_cast") }
-                g.lastCastAt = now
-                g.nextAt = now + g.gap
+            if best then
+                local base = (not g.duration and not g.measure and not g.noEffect and g.ok == 0) and effectSnapshot() or nil
+                if cast(best) then
+                    ourCast[best] = now
+                    g.pending = { unit = best, at = now, before = statNum(best, "last_active_cast") }
+                    g.lastCastAt = now
+                    g.nextAt = now + g.gap
+                    if base then g.measure = { base = base, castAt = now } end
+                end
             end
         end
+        if g.measure and g.measure.startAt and g.lastCastAt and g.lastCastAt > g.measure.castAt then
+            -- the next cast came while the first buff was still on: it lasts at least the gap
+            g.durationAtLeast, g.measure = now - g.measure.startAt, nil
+        end
     end
+end
+
+-- "4 cover 75%, need 6 for 100%" from the buff length and cooldown.
+function BuffRot.coverageText(g)
+    local dur = (UnitAI.buffDuration and UnitAI.buffDuration > 0) and UnitAI.buffDuration or g.duration
+    if not g.cd or g.cd <= 0 then return nil end
+    if dur and dur > 0 then
+        local cover = math.min(1, (g.count or 0) * dur / g.cd)
+        local need = math.ceil(g.cd / dur - 1e-6)
+        if cover >= 0.999 then
+            return string.format("buff lasts %.1fs: %d cover 100%%", dur, g.count or 0)
+        end
+        return string.format("buff lasts %.1fs, cooldown %.0fs: %d cover %d%% - need %d of this unit for 100%%",
+            dur, g.cd, g.count or 0, math.floor(cover * 100), need)
+    end
+    if g.durationAtLeast then return string.format("buff lasts over %.0fs: covers 100%%", g.durationAtLeast) end
+    if g.noEffect then return "buff length not measurable - set 'Buff lasts' to see coverage" end
+    return "measuring buff length..."
 end
 end
 
@@ -2328,8 +2411,11 @@ local function refreshUnitStatus()
             local nextText
             if g.waitReady then nextText = string.format("cooldown %ds", math.ceil(g.waitReady))
             else nextText = string.format("next in %ds", math.max(0, math.ceil(g.nextAt - os.clock()))) end
-            table.insert(parts, string.format("%s x%d: every %.1fs%s, %s, cast %d ok / %d no",
-                kind, g.count or 0, g.gap or 0, g.auto and " (auto)" or "", nextText, g.ok, g.failed))
+            table.insert(parts, string.format("%s x%d: every %.1fs%s, %s, cast %d ok%s",
+                kind, g.count or 0, g.gap or 0, g.auto and " (auto)" or "", nextText, g.ok,
+                (g.unconfirmed or 0) > 0 and string.format(" / %d unconfirmed", g.unconfirmed) or ""))
+            local cover = BuffRot.coverageText(g)
+            if cover then table.insert(parts, "  " .. cover) end
         end
         if BuffRot.autoActive > 0 then
             table.insert(parts, string.format("Problem: in-game Auto skill is ON for %d buff unit(s) - set it Off (the On/Off button next to the skill) so they take turns", BuffRot.autoActive))
@@ -3273,6 +3359,13 @@ Controls.buffGap = buffSection:Slider({
     Default = UnitAI.buffGap,
     Callback = function(v) UnitAI.buffGap = v; refreshUnitStatus(); saveConfig() end,
 }, "BuffGap")
+Controls.buffDuration = buffSection:Slider({
+    Name = "Buff lasts (s, 0 = measure)",
+    Minimum = 0,
+    Maximum = 60,
+    Default = UnitAI.buffDuration,
+    Callback = function(v) UnitAI.buffDuration = v; refreshUnitStatus(); saveConfig() end,
+}, "BuffDuration")
 Controls.minUnitsForBuff = buffSection:Slider({
     Name = "Min units before buff starts",
     Minimum = 1,
@@ -3665,6 +3758,7 @@ applyRuntimeFeatures = function()
     setControl(Controls.speedMultiplier, AutoFarm.speedMultiplier)
     setControl(Controls.abilityCooldown, UnitAI.abilityCooldown)
     setControl(Controls.buffGap, UnitAI.buffGap)
+    setControl(Controls.buffDuration, UnitAI.buffDuration)
     setControl(Controls.minUnitsForBuff, UnitAI.minUnitsForBuff)
     setControl(Controls.autoPlay, State.autoPlay)
     setControl(Controls.retryPlacements, State.retryPlacements)
