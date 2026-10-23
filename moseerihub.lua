@@ -85,6 +85,16 @@ local UnitAI = {
     learned = {},
 }
 
+-- Auto Place state: places the team along the path the enemies walk.
+local AutoPlace = {
+    enabled = false,
+    upgrade = false,
+    slots = { 8, 8, 8, 8, 8, 8 }, -- how many of each team slot to place (0 = none)
+    moneyPath = nil,              -- tracked value that pays for units, found on the first placement
+    paths = {},                   -- [stage] = { {x,y,z}, ... } learned from enemy movement
+    caps = {},                    -- [unit name] = how many the game lets you place, learned once
+}
+
 -- Dungeon Bot state
 local DungeonBot = {
     enabled = false,
@@ -208,6 +218,11 @@ local function buildConfigData()
             lastMacro = State.macroName,
         },
         tools = { antiAfk = Tools.antiAfk },
+        autoPlace = {
+            enabled = AutoPlace.enabled, upgrade = AutoPlace.upgrade, slots = AutoPlace.slots,
+            moneyPath = AutoPlace.moneyPath, paths = next(AutoPlace.paths) and AutoPlace.paths or nil,
+            caps = next(AutoPlace.caps) and AutoPlace.caps or nil,
+        },
     }
 end
 
@@ -250,6 +265,15 @@ local function applyConfigData(data)
     if type(m.lastMacro) == "string" and #m.lastMacro > 0 then State.macroName = m.lastMacro end
     local t = data.tools or {}
     pendingToggles.antiAfk = t.antiAfk == true
+    local ap = data.autoPlace or {}
+    pendingToggles.autoPlace = ap.enabled == true
+    AutoPlace.upgrade = pick(ap.upgrade, "boolean", AutoPlace.upgrade)
+    if type(ap.slots) == "table" then
+        for i = 1, 6 do AutoPlace.slots[i] = tonumber(ap.slots[i]) or AutoPlace.slots[i] end
+    end
+    AutoPlace.moneyPath = pick(ap.moneyPath, "string", AutoPlace.moneyPath)
+    if type(ap.paths) == "table" then AutoPlace.paths = ap.paths end
+    if type(ap.caps) == "table" then AutoPlace.caps = ap.caps end
 end
 
 local function saveConfig()
@@ -672,6 +696,9 @@ local function unitPosition(unit)
 end
 
 local function matchesSpot(unit, target)
+    local stats = unit:FindFirstChild("_stats")
+    local base = stats and stats:FindFirstChild("base")
+    if base and tostring(base.Value) == "pve" then return false end
     local pos = target and unitPosition(unit)
     return pos ~= nil and (pos - target).Magnitude <= Config.UnitMatchDistance
 end
@@ -2012,8 +2039,9 @@ local function ownedUnits()
     if not folder then return {} end
     local mine, all, anyOwnerField = {}, {}, false
     for _, unit in ipairs(folder:GetChildren()) do
-        table.insert(all, unit)
         local stats = unit:FindFirstChild("_stats")
+        local base = stats and stats:FindFirstChild("base")
+        if not (base and tostring(base.Value) == "pve") then table.insert(all, unit) end
         if stats and stats:FindFirstChild("player") then anyOwnerField = true end
         if isMyUnit(unit) then table.insert(mine, unit) end
     end
@@ -2356,6 +2384,452 @@ end
 function UnitAIModule.StopBuff()
     UnitAI.autoBuff = false
     buffGen = buffGen + 1
+end
+
+--------------------------------------------------------------------------------
+-- MODULE: Auto Place (team units along the enemy path)
+--------------------------------------------------------------------------------
+-- Learns the path from where enemies walk (saved per stage), scores spots beside it by how
+-- much path they cover, and places team slot 1..6 as soon as money allows. The team is read
+-- fresh every game, so changing units in game needs no setup.
+local AutoPlaceModule = { team = {}, status = "Off", problem = nil, placed = {}, full = {} }
+do
+local PATH_CELL = 2.5      -- path points closer than this are merged
+local SIDE_DIST = { 5, 8 } -- how far beside the path to try
+local MIN_FROM_PATH = 4    -- never closer than this to the path (that is the road)
+local MIN_SPACING = 3      -- distance kept between own units
+local DEFAULT_RANGE = 15
+local apGen = 0
+local badSpots = {}
+local candidates, candidatesFor = nil, -1
+local failsInRow = 0
+local recentBad = {}
+local unknownTries = 0
+
+local function stageKey() return State.stage or "unknown" end
+
+local function pathPoints()
+    local key = stageKey()
+    AutoPlace.paths[key] = AutoPlace.paths[key] or {}
+    return AutoPlace.paths[key]
+end
+
+local function rootPos(model)
+    local root = model:FindFirstChild("HumanoidRootPart")
+    if root then
+        local ok, p = pcall(function() return root.Position end)
+        if ok and p then return p end
+    end
+    local ok, pivot = pcall(function() return model:GetPivot() end)
+    return ok and pivot.Position or nil
+end
+
+local function isEnemy(unit)
+    local stats = unit:FindFirstChild("_stats")
+    if not stats then return false end
+    local base = stats:FindFirstChild("base")
+    if base then return tostring(base.Value) == "pve" end
+    return stats:FindFirstChild("player") == nil and unit:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+-- Adds where the enemies are now to the stage path; returns true when it grew.
+local function samplePath()
+    local folder = unitsFolder()
+    if not folder then return false end
+    local pts = pathPoints()
+    local grew = false
+    for _, unit in ipairs(folder:GetChildren()) do
+        if #pts >= 400 then break end
+        if isEnemy(unit) then
+            local p = rootPos(unit)
+            if p then
+                local near = false
+                for _, q in ipairs(pts) do
+                    local dx, dz = q[1] - p.X, q[3] - p.Z
+                    if dx * dx + dz * dz < PATH_CELL * PATH_CELL then near = true break end
+                end
+                if not near then
+                    table.insert(pts, { math.floor(p.X * 2 + 0.5) / 2, math.floor(p.Y * 2 + 0.5) / 2, math.floor(p.Z * 2 + 0.5) / 2 })
+                    grew = true
+                end
+            end
+        end
+    end
+    return grew
+end
+
+local function groundAt(x, y, z)
+    local ok, hit = pcall(function()
+        local params = RaycastParams.new()
+        params.FilterDescendantsInstances = { unitsFolder() }
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        return workspace:Raycast(Vector3.new(x, y + 12, z), Vector3.new(0, -40, 0), params)
+    end)
+    if ok and hit then return hit.Position.Y end
+    return y - 2
+end
+
+local function buildCandidates(pts)
+    local list = {}
+    local dirs = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 0.71, 0.71 }, { -0.71, 0.71 }, { 0.71, -0.71 }, { -0.71, -0.71 } }
+    local step = math.max(1, math.floor(#pts / 120))
+    for i = 1, #pts, step do
+        local p = pts[i]
+        for _, d in ipairs(dirs) do
+            for _, dist in ipairs(SIDE_DIST) do
+                local x, z = p[1] + d[1] * dist, p[3] + d[2] * dist
+                local nearest, score = math.huge, 0
+                for _, q in ipairs(pts) do
+                    local dx, dz = q[1] - x, q[3] - z
+                    local d2 = dx * dx + dz * dz
+                    if d2 < nearest then nearest = d2 end
+                    if d2 <= DEFAULT_RANGE * DEFAULT_RANGE then score = score + 1 end
+                end
+                if nearest >= MIN_FROM_PATH * MIN_FROM_PATH then
+                    table.insert(list, { x = x, y = p[2], z = z, score = score })
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.score > b.score end)
+    return list
+end
+
+local function spotKey(c) return string.format("%d,%d", math.floor(c.x + 0.5), math.floor(c.z + 0.5)) end
+
+-- skip = how many good free spots to pass over (used to rotate while the price is unknown)
+local function bestSpot(skip)
+    skip = skip or 0
+    local pts = pathPoints()
+    if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor then
+        candidates, candidatesFor = buildCandidates(pts), #pts
+    end
+    local mine = {}
+    for _, u in ipairs(ownedUnits()) do
+        local p = rootPos(u)
+        if p then table.insert(mine, p) end
+    end
+    for _, c in ipairs(candidates) do
+        if not badSpots[spotKey(c)] then
+            local free = true
+            for _, p in ipairs(mine) do
+                local dx, dz = p.X - c.x, p.Z - c.z
+                if dx * dx + dz * dz < MIN_SPACING * MIN_SPACING then free = false break end
+            end
+            if free then
+                if skip <= 0 then return c end
+                skip = skip - 1
+            end
+        end
+    end
+    return nil
+end
+
+-- Team = equipped units { slot -> {uuid, name} }: from the game's own data (getgc), plus
+-- any unit of ours already on the map (its _stats.uuid), so it works without getgc too.
+function AutoPlaceModule.RefreshTeam()
+    local team = {}
+    if type(getgc) == "function" then
+        pcall(function()
+            for _, v in ipairs(getgc(true)) do
+                if type(v) == "table" and rawget(v, "uuid") and rawget(v, "equipped_slot") and rawget(v, "unit_id") then
+                    local slot = tonumber(rawget(v, "equipped_slot"))
+                    if slot and slot >= 1 and slot <= 6 then
+                        team[slot] = { uuid = tostring(rawget(v, "uuid")), name = tostring(rawget(v, "unit_id")) }
+                    end
+                end
+            end
+        end)
+    end
+    local known = {}
+    for _, t in pairs(team) do known[(tostring(t.uuid):gsub("[{}%s]", ""))] = true end
+    for _, u in ipairs(ownedUnits()) do
+        local stats = u:FindFirstChild("_stats")
+        local uuidVal = stats and stats:FindFirstChild("uuid")
+        local uuid = uuidVal and tostring(uuidVal.Value)
+        local key = uuid and (uuid:gsub("[{}%s]", ""))
+        if uuid and not known[key] then
+            for s = 1, 6 do
+                if not team[s] then
+                    local id = stats:FindFirstChild("id")
+                    team[s] = { uuid = uuid, name = id and tostring(id.Value) or u.Name }
+                    known[key] = true
+                    break
+                end
+            end
+        end
+    end
+    for s, t in pairs(team) do
+        local old = AutoPlaceModule.team[s]
+        if old and old.uuid == t.uuid then t.cost = old.cost end
+    end
+    AutoPlaceModule.team = team
+    return team
+end
+
+local function normUuid(u) return (tostring(u):gsub("[{}%s]", "")) end
+
+local function placedOf(uuid)
+    local list = {}
+    local want = normUuid(uuid)
+    for _, u in ipairs(ownedUnits()) do
+        local stats = u:FindFirstChild("_stats")
+        local v = stats and stats:FindFirstChild("uuid")
+        if v and normUuid(v.Value) == want then table.insert(list, u) end
+    end
+    return list
+end
+
+local function numbersOnPlayer()
+    local out = {}
+    for _, d in ipairs(Players.LocalPlayer:GetDescendants()) do
+        if d:IsA("IntValue") or d:IsA("NumberValue") then
+            local path = trackedPath({ obj = d })
+            if path then out[path] = tonumber(d.Value) end
+        end
+    end
+    return out
+end
+
+-- Fires spawn_unit and waits for the unit to appear; learns its price and the money value.
+local function tryPlace(t, spot)
+    local remote = getAARemote("spawn_unit")
+    if not remote then
+        AutoPlaceModule.problem = "spawn_unit not found in this game"
+        return false
+    end
+    local before = numbersOnPlayer()
+    local count = #placedOf(t.uuid)
+    local y = groundAt(spot.x, spot.y, spot.z)
+    local repliedAt
+    task.spawn(function()
+        pcall(function() remote:InvokeServer(t.uuid, CFrame.new(spot.x, y, spot.z)) end)
+        repliedAt = os.clock()
+    end)
+    -- Success = the unit shows up. A refusal is known once the server has answered and
+    -- nothing appeared shortly after, so a refused spot costs well under a second.
+    local deadline = os.clock() + 2
+    while os.clock() < deadline and not (repliedAt and os.clock() - repliedAt > 0.3) do
+        task.wait(0.1)
+        local now = placedOf(t.uuid)
+        if #now > count then
+            local stats = now[#now]:FindFirstChild("_stats")
+            local spent = stats and stats:FindFirstChild("total_spent")
+            if spent and tonumber(spent.Value) and tonumber(spent.Value) > 0 then t.cost = tonumber(spent.Value) end
+            if t.cost then
+                local after = numbersOnPlayer()
+                local bestPath, bestErr
+                for path, old in pairs(before) do
+                    local new = after[path]
+                    if new and old and new < old then
+                        local err = math.abs((old - new) - t.cost)
+                        if not bestErr or err < bestErr then bestPath, bestErr = path, err end
+                    end
+                end
+                if bestPath and bestErr <= math.max(1, t.cost * 0.05) and bestPath ~= AutoPlace.moneyPath then
+                    AutoPlace.moneyPath = bestPath
+                    saveConfig()
+                end
+            end
+            return true
+        end
+    end
+    return false
+end
+
+local function upgradeStep()
+    local remote = getAARemote("upgrade_unit_ingame")
+    if not remote then return end
+    local pick, pickLevel
+    for _, u in ipairs(ownedUnits()) do
+        local stats = u:FindFirstChild("_stats")
+        local lvl = stats and stats:FindFirstChild("upgrade")
+        local maxLvl = stats and stats:FindFirstChild("max_upgrade")
+        local level = lvl and tonumber(lvl.Value) or 0
+        if not (maxLvl and tonumber(maxLvl.Value) and level >= tonumber(maxLvl.Value)) then
+            if not pick or level < pickLevel then pick, pickLevel = u, level end
+        end
+    end
+    if not pick then
+        AutoPlaceModule.status = "All units placed and fully upgraded"
+        return
+    end
+    AutoPlaceModule.status = string.format("Upgrading %s (level %d)", pick.Name, pickLevel)
+    pcall(function() remote:InvokeServer(pick) end)
+end
+
+local function tick()
+    if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
+    if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
+    local grew = samplePath()
+    if grew and #pathPoints() % 20 == 0 then saveConfig() end
+    if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
+    if not next(AutoPlaceModule.team) then
+        AutoPlaceModule.problem = "team not found yet - place one unit by hand, or press Refresh team"
+        return 2
+    end
+    if #pathPoints() < 8 then
+        AutoPlaceModule.status = string.format("Learning the enemy path (%d points)", #pathPoints())
+        return 0.5
+    end
+    local slot, t
+    for s = 1, 6 do
+        local entry = AutoPlaceModule.team[s]
+        local target = math.min(AutoPlace.slots[s] or 0, entry and tonumber(AutoPlace.caps[entry.name]) or 99)
+        if entry and not AutoPlaceModule.full[entry.uuid] and #placedOf(entry.uuid) < target then
+            slot, t = s, entry
+            break
+        end
+    end
+    if not t then
+        if AutoPlace.upgrade then upgradeStep() return 1.5 end
+        AutoPlaceModule.status = "Everything placed"
+        return 1
+    end
+    local money = AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)
+    if t.cost and money and money < t.cost then
+        AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(t.cost))
+        return 0.1
+    end
+    local unknown = not (t.cost and money)
+    local spot = bestSpot(unknown and (unknownTries % 3) or 0) or bestSpot(0)
+    if not spot then
+        AutoPlaceModule.problem = "no free spot beside the path - the path may still be short"
+        return 1
+    end
+    AutoPlaceModule.status = string.format("Slot %d %s: placing", slot, t.name)
+    if tryPlace(t, spot) then
+        failsInRow, recentBad = 0, {}
+        AutoPlaceModule.problem = nil
+        return 0.2
+    end
+    if t.cost and money and money >= t.cost then
+        -- enough money but refused: the spot is not allowed; several in a row = unit limit
+        local key = spotKey(spot)
+        badSpots[key] = true
+        recentBad[#recentBad + 1] = key
+        failsInRow = failsInRow + 1
+        if failsInRow >= 4 then
+            -- refused on 4 different spots with money in hand: this unit is at its limit,
+            -- and those spots were fine for other units
+            AutoPlaceModule.full[t.uuid] = true
+            AutoPlace.caps[t.name] = #placedOf(t.uuid)
+            saveConfig()
+            for _, k in ipairs(recentBad) do badSpots[k] = nil end
+            recentBad, failsInRow = {}, 0
+        end
+        return 0.2
+    end
+    -- price or money not known yet: a refusal may just mean "not enough money", so keep
+    -- every spot and rotate between the top three until one placement succeeds
+    unknownTries = unknownTries + 1
+    return 1
+end
+
+function AutoPlaceModule.Start()
+    apGen = apGen + 1
+    local gen = apGen
+    AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+    task.spawn(function()
+        local lastGame
+        while AutoPlace.enabled and gen == apGen and not State.unloaded do
+            local data = workspace:FindFirstChild("_DATA")
+            local started = data and data:FindFirstChild("GameStarted")
+            local gameNow = started and started.Value
+            if gameNow and not lastGame then
+                AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+                AutoPlaceModule.RefreshTeam()
+            end
+            lastGame = gameNow
+            local ok, waitFor = pcall(tick)
+            if not ok then
+                AutoPlaceModule.problem = "error: " .. clip(tostring(waitFor), 60)
+                waitFor = 2
+            end
+            task.wait(waitFor or 1)
+        end
+    end)
+end
+
+function AutoPlaceModule.Stop()
+    AutoPlace.enabled = false
+    apGen = apGen + 1
+    AutoPlaceModule.status = "Off"
+end
+
+function AutoPlaceModule.ForgetPath()
+    AutoPlace.paths[stageKey()] = nil
+    AutoPlace.caps = {}
+    candidates, candidatesFor = nil, -1
+    badSpots = {}
+    saveConfig()
+    notify("Saved enemy path for " .. stageKey() .. " and unit limits cleared.")
+end
+
+function AutoPlaceModule.StatusText()
+    local lines = { "Status: " .. AutoPlaceModule.status }
+    local team = {}
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s]
+        if t then
+            local cap = tonumber(AutoPlace.caps[t.name])
+            local target = math.min(AutoPlace.slots[s] or 0, cap or 99)
+            local full = (cap and target == cap) and " (limit)" or ""
+            table.insert(team, string.format("%d %s %d/%d%s", s, t.name, #placedOf(t.uuid), target, full))
+        end
+    end
+    table.insert(lines, "Team: " .. (#team > 0 and table.concat(team, ", ") or "not read yet"))
+    table.insert(lines, string.format("Path: %d points for %s", #pathPoints(), stageKey()))
+    if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
+    return table.concat(lines, "\n")
+end
+
+function AutoPlaceModule.MapReport()
+    local lines = { "[Map report] " .. os.date("%H:%M:%S") .. " stage " .. stageKey() }
+    table.insert(lines, "getgc: " .. tostring(type(getgc) == "function") .. ", Raycast: " .. tostring(pcall(function() return RaycastParams.new() end)))
+    AutoPlaceModule.RefreshTeam()
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s]
+        if t then table.insert(lines, string.format("slot %d: %s uuid %s cost %s", s, t.name, clip(t.uuid, 14), tostring(t.cost))) end
+    end
+    table.insert(lines, "money value: " .. tostring(AutoPlace.moneyPath) .. " = " .. tostring(AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)))
+    local top = {}
+    for _, c in ipairs(workspace:GetChildren()) do table.insert(top, c.Name) end
+    table.insert(lines, "workspace: " .. clip(table.concat(top, ", "), 400))
+    local bases = workspace:FindFirstChild("_BASES")
+    if bases then
+        local names = {}
+        for _, d in ipairs(bases:GetDescendants()) do
+            if #names >= 20 then break end
+            table.insert(names, (d:GetFullName():gsub("^Workspace%._BASES%.", "")))
+        end
+        table.insert(lines, "_BASES: " .. table.concat(names, ", "))
+    end
+    local enemies, sample = 0, nil
+    local folder = unitsFolder()
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(u) then
+            enemies = enemies + 1
+            if not sample then
+                local p = rootPos(u)
+                local stats = u:FindFirstChild("_stats")
+                local bend = stats and stats:FindFirstChild("last_reached_bend")
+                sample = string.format("%s at %s bend %s", u.Name, p and string.format("(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z) or "?", bend and tostring(bend.Value) or "?")
+            end
+        end
+    end
+    table.insert(lines, string.format("enemies now: %d %s", enemies, sample or ""))
+    table.insert(lines, string.format("path points: %d", #pathPoints()))
+    local spot = #pathPoints() >= 8 and bestSpot()
+    if spot then table.insert(lines, string.format("best spot: (%.1f, %.1f, %.1f) covers %d path points", spot.x, spot.y, spot.z, spot.score)) end
+    local text = table.concat(lines, "\n")
+    print(text)
+    if type(setclipboard) == "function" and pcall(setclipboard, text) then
+        notify("Map report copied to clipboard - paste it to me.")
+    else
+        notify("Map report printed to the console (F9).")
+    end
+end
 end
 
 --------------------------------------------------------------------------------
@@ -2828,6 +3302,50 @@ buffSection:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffRepo
 
 end
 
+-- TAB: Auto Place
+do
+local placeTab = tabGroup:Tab({ Name = "Auto Place", Image = "rbxassetid://10734950309" })
+local placeMain = placeTab:Section({ Side = "Left" })
+local placeSlots = placeTab:Section({ Side = "Right" })
+
+placeMain:Header({ Text = "Auto place along the enemy path" })
+local placeStatus = placeMain:Paragraph({ Header = "Status", Body = "Off" })
+AutoPlaceModule.refreshUI = function()
+    pcall(function() placeStatus:UpdateBody(AutoPlaceModule.StatusText()) end)
+end
+Controls.autoPlace = placeMain:Toggle({
+    Name = "Auto place units",
+    Default = false,
+    Callback = function(on)
+        AutoPlace.enabled = on
+        if on then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
+        AutoPlaceModule.refreshUI(); saveConfig()
+    end,
+}, "AutoPlace")
+Controls.autoPlaceUpgrade = placeMain:Toggle({
+    Name = "Upgrade after everything is placed",
+    Default = AutoPlace.upgrade,
+    Callback = function(on) AutoPlace.upgrade = on; saveConfig() end,
+}, "AutoPlaceUpgrade")
+placeMain:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
+placeMain:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
+placeMain:Button({ Name = "Copy map report", Callback = AutoPlaceModule.MapReport })
+placeMain:Paragraph({ Header = "", Body = "Watches where enemies walk (saved per stage),\nthen places your team beside the path where\nit covers the most road, as soon as money\nallows. Uses whatever team you have equipped." })
+
+placeSlots:Header({ Text = "How many per team slot (0 = none)" })
+Controls.placeSlots = {}
+for s = 1, 6 do
+    Controls.placeSlots[s] = placeSlots:Slider({
+        Name = "Slot " .. s,
+        Minimum = 0,
+        Maximum = 8,
+        Default = AutoPlace.slots[s] or 0,
+        Callback = function(v) AutoPlace.slots[s] = v; saveConfig() end,
+    }, "PlaceSlot" .. s)
+end
+placeSlots:Paragraph({ Header = "", Body = "Slots follow your in-game team order and are\nfilled from slot 1 down. 8 = as many as the\ngame allows. Buff units placed here join the\nbuff rotation on the Units page." })
+end
+
 -- TAB 4: Dungeon
 do
 local dungeonTab = tabGroup:Tab({ Name = "Dungeon", Image = "rbxassetid://10734950309" })
@@ -3054,6 +3572,7 @@ table.insert(State.connections, RunService.Heartbeat:Connect(function()
         nextRefresh = now + 0.5
         refreshStatus()
         if UnitAI.autoBuff or UnitAI.autoAbilities then refreshUnitStatus() end
+        if AutoPlace.enabled and AutoPlaceModule.refreshUI then AutoPlaceModule.refreshUI() end
         if #State.actions ~= lastListedCount then
             lastListedCount = #State.actions
             refreshActionList()
@@ -3094,6 +3613,7 @@ local function shutdown()
     UnitAI.autoAbilities = false
     UnitAI.autoBuff = false
     Tools.antiAfk = false
+    AutoPlace.enabled = false
     DungeonBot.enabled = false
     DungeonBot.dungeonActive = false
     for _, connection in ipairs(State.connections) do connection:Disconnect() end
@@ -3165,6 +3685,11 @@ applyRuntimeFeatures = function()
     Tools.antiAfk = pendingToggles.antiAfk == true
     setControl(antiAfkToggle, Tools.antiAfk)
     if Tools.antiAfk then ToolsModule.StartAntiAfk() else ToolsModule.StopAntiAfk() end
+    setControl(Controls.autoPlaceUpgrade, AutoPlace.upgrade)
+    for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
+    AutoPlace.enabled = pendingToggles.autoPlace == true
+    setControl(Controls.autoPlace, AutoPlace.enabled)
+    if AutoPlace.enabled then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
 
     refreshUnitStatus()
     refreshAutoStatus()
@@ -3187,6 +3712,7 @@ task.spawn(function()
     if UnitAI.autoAbilities then table.insert(restored, "Abilities") end
     if UnitAI.autoBuff then table.insert(restored, "Buff") end
     if Tools.antiAfk then table.insert(restored, "Anti-AFK") end
+    if AutoPlace.enabled then table.insert(restored, "Auto Place") end
     if AutoFarm.autoReplay then table.insert(restored, "Auto Replay") end
     if AutoFarm.autoNextStage then table.insert(restored, "Next Stage") end
     if AutoFarm.autoLeave then table.insert(restored, "Auto Leave") end
