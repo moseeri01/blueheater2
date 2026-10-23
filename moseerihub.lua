@@ -2592,10 +2592,10 @@ end
 -- Learns the path from where enemies walk (saved per stage), scores spots beside it by how
 -- much path they cover, and places team slot 1..6 as soon as money allows. The team is read
 -- fresh every game, so changing units in game needs no setup.
-local AutoPlaceModule = { team = {}, status = "Off", problem = nil, placed = {}, full = {} }
+local AutoPlaceModule = { team = {}, status = "Off", problem = nil, placed = {}, full = {}, noSpot = {} }
 do
 local PATH_CELL = 2.5      -- path points closer than this are merged
-local SIDE_DIST = { 5, 8 } -- how far beside the path to try
+local SIDE_DIST = { 5, 8, 12 } -- how far beside the path to try (12 reaches hills set back from the road)
 local MIN_FROM_PATH = 4    -- never closer than this to the path (that is the road)
 local MIN_SPACING = 3      -- distance kept between own units
 local DEFAULT_RANGE = 15
@@ -2658,15 +2658,31 @@ local function samplePath()
     return grew
 end
 
-local function groundAt(x, y, z)
+-- Ground under a point: height, and whether it is a hill (the part hit is named/inside
+-- something called "hill", or it stands well above the road beside it).
+local function groundHit(x, y, z)
     local ok, hit = pcall(function()
         local params = RaycastParams.new()
         params.FilterDescendantsInstances = { unitsFolder() }
         params.FilterType = Enum.RaycastFilterType.Exclude
-        return workspace:Raycast(Vector3.new(x, y + 12, z), Vector3.new(0, -40, 0), params)
+        return workspace:Raycast(Vector3.new(x, y + 60, z), Vector3.new(0, -120, 0), params)
     end)
-    if ok and hit then return hit.Position.Y end
-    return y - 2
+    if not (ok and hit) then return nil end
+    local tag
+    pcall(function()
+        local node = hit.Instance
+        while node and node ~= workspace do
+            local n = string.lower(node.Name)
+            if n:find("hill", 1, true) then tag = "hill" break end
+            if n:find("ground", 1, true) then tag = "ground" break end
+            node = node.Parent
+        end
+    end)
+    return hit.Position.Y, tag
+end
+
+local function groundAt(x, y, z)
+    return (groundHit(x, y, z)) or (y - 2)
 end
 
 local function buildCandidates(pts)
@@ -2675,6 +2691,7 @@ local function buildCandidates(pts)
     local step = math.max(1, math.floor(#pts / 120))
     for i = 1, #pts, step do
         local p = pts[i]
+        local roadY = groundHit(p[1], p[2], p[3])
         for _, d in ipairs(dirs) do
             for _, dist in ipairs(SIDE_DIST) do
                 local x, z = p[1] + d[1] * dist, p[3] + d[2] * dist
@@ -2686,7 +2703,9 @@ local function buildCandidates(pts)
                     if d2 <= DEFAULT_RANGE * DEFAULT_RANGE then score = score + 1 end
                 end
                 if nearest >= MIN_FROM_PATH * MIN_FROM_PATH then
-                    table.insert(list, { x = x, y = p[2], z = z, score = score })
+                    local gy, tag = groundHit(x, p[2], z)
+                    local kind = tag or ((gy and roadY and gy > roadY + 2.5) and "hill" or "ground")
+                    table.insert(list, { x = x, y = p[2], z = z, score = score, groundY = gy, kind = kind })
                 end
             end
         end
@@ -2695,7 +2714,18 @@ local function buildCandidates(pts)
     return list
 end
 
-local function spotKey(c) return string.format("%d,%d", math.floor(c.x + 0.5), math.floor(c.z + 0.5)) end
+-- Where a unit may stand: "hill" (hill_unit), "any" (hybrid_placement) or "ground".
+function AutoPlaceModule.PlacementKind(t)
+    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(t.name)
+    if def and def.hill_unit == true then return "hill" end
+    if def and def.hybrid_placement == true then return "any" end
+    return "ground"
+end
+
+-- Bad spots are remembered per placement kind: a spot refused to a hill unit may suit a ground one.
+local function spotKey(c, kind)
+    return string.format("%d,%d|%s", math.floor(c.x + 0.5), math.floor(c.z + 0.5), kind or "ground")
+end
 
 -- Role from the game's own unit definition (src.Data.Units): farm_amount > 0 = farm,
 -- _show_as_buff_unit / _NO_ATTACKS_UNIT = buff or support, else damage. nil = no definition.
@@ -2726,15 +2756,52 @@ function AutoPlaceModule.RoleFromDef(name)
 end
 
 -- Damage per second per ¥ from the definition (higher = better value); 0 when unknown.
+-- Trait effects (from the AA trait guides): damage, attack time (SPA) and range multipliers,
+-- plus "cap" for traits that limit placement. Levels I/II/III or 1/2/3 pick the column.
+local TRAITS = {
+    unique = { dmg = 4, spa = 0.9, range = 1.1, cap = 1 },
+    divine = { dmg = 1.2, spa = 0.9, range = 1.2 },
+    celestial = { dmg = 1.3, range = 1.1 },
+    golden = { dmg = 1.3 },
+    reaper = { dmg = 1.15 },
+    godspeed = { spa = 0.8 },
+    sniper = { range = 1.25 },
+    culling = { dmg = 1.1 },
+    nimble = { spa = { 0.95, 0.925, 0.88 } },
+    range = { range = { 1.1, 1.125, 1.15 } },
+    superior = { dmg = { 1.1, 1.125, 1.15 } },
+}
+local ROMAN = { i = 1, ii = 2, iii = 3 }
+
+function AutoPlaceModule.TraitMods(traits)
+    local m = { dmg = 1, spa = 1, range = 1 }
+    for _, raw in ipairs(traits or {}) do
+        local text = string.lower(tostring(raw))
+        local word = text:match("^%a+") or text
+        local lvl = tonumber(text:match("(%d+)%s*$")) or ROMAN[text:match("%s([iv]+)%s*$") or ""] or 1
+        local t = TRAITS[word]
+        if t then
+            for _, k in ipairs({ "dmg", "spa", "range" }) do
+                local v = t[k]
+                if type(v) == "table" then v = v[math.max(1, math.min(#v, lvl))] end
+                if v then m[k] = m[k] * v end
+            end
+            if t.cap then m.cap = t.cap end
+        end
+    end
+    return m
+end
+
 -- A team unit's real numbers: a placed copy's own _stats when there is one (already includes
--- its random rolls), else the definition scaled by the rolls read from the team data.
+-- its rolls and trait), else the definition scaled by the rolls and trait from the team data.
 function AutoPlaceModule.Stats(t)
     local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(t.name) or {}
     local rolls = t.rolls or {}
+    local tm = AutoPlaceModule.TraitMods(t.traits)
     local s = {
-        damage = (tonumber(def.damage) or 0) * (rolls.potency_stat or 1),
-        cooldown = math.max(0.5, tonumber(def.attack_cooldown) or 1) / math.max(0.1, rolls.speed_stat or 1),
-        range = (tonumber(def.range) or DEFAULT_RANGE) * (rolls.range_stat or 1),
+        damage = (tonumber(def.damage) or 0) * (rolls.potency_stat or 1) * tm.dmg,
+        cooldown = math.max(0.5, tonumber(def.attack_cooldown) or 1) / math.max(0.1, rolls.speed_stat or 1) * tm.spa,
+        range = (tonumber(def.range) or DEFAULT_RANGE) * (rolls.range_stat or 1) * tm.range,
     }
     local placed = t.placedSample
     local st = placed and placed.Parent and placed:FindFirstChild("_stats")
@@ -2790,8 +2857,9 @@ local BUFF_REACH = 12
 -- role: "farm" takes the spots that cover the least road (farms earn anywhere), "buff"
 -- the spots next to the most damage units, anything else the spots covering the most road
 -- within that unit's own range (a range-9 unit must stand closer than a range-16 one).
-local function bestSpot(skip, role, range)
+local function bestSpot(skip, role, range, kind)
     skip = skip or 0
+    kind = kind or "ground"
     local pts = pathPoints()
     if not candidates or #pts >= candidatesFor + math.max(10, math.floor(candidatesFor * 0.1)) or #pts < candidatesFor then
         candidates, candidatesFor = buildCandidates(pts), #pts
@@ -2815,7 +2883,7 @@ local function bestSpot(skip, role, range)
     end
     local free = {}
     for _, c in ipairs(candidates) do
-        if not badSpots[spotKey(c)] then
+        if not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) then
             local ok = true
             for _, p in ipairs(mine) do
                 local dx, dz = p.X - c.x, p.Z - c.z
@@ -2875,15 +2943,45 @@ function AutoPlaceModule.RefreshTeam()
                     local slot = tonumber(rawget(v, "equipped_slot"))
                     if slot and slot >= 1 and slot <= 6 then
                         -- this copy's random rolls (speed_stat, potency_stat, range_stat, ...)
-                        local rolls, keys = {}, {}
+                        local rolls, keys, traits = {}, {}, {}
                         for k, val in pairs(v) do
                             local key = tostring(k)
+                            local lower = string.lower(key)
                             table.insert(keys, key)
-                            if type(val) == "number" and string.lower(key):find("stat", 1, true) then rolls[key] = val end
+                            if type(val) == "number" and lower:find("stat", 1, true) then rolls[key] = val end
+                            -- named traits (Divine, Godspeed, Sniper II, ...) in any "trait" field
+                            if lower:find("trait", 1, true) then
+                                if type(val) == "string" and val ~= "" then table.insert(traits, val)
+                                elseif type(val) == "table" then
+                                    for tk, tv in pairs(val) do
+                                        if type(tv) == "string" then table.insert(traits, tv)
+                                        elseif tv == true then table.insert(traits, tostring(tk)) end
+                                    end
+                                end
+                            end
                         end
                         table.sort(keys)
+                        -- raw trait data for the game data report (its exact shape is not known yet)
+                        local raw = {}
+                        for _, key in ipairs({ "traits", "trait_stats" }) do
+                            local val = rawget(v, key)
+                            if type(val) == "table" then
+                                local parts = {}
+                                for tk, tv in pairs(val) do
+                                    if type(tv) == "table" then
+                                        local inner = {}
+                                        for ik, iv in pairs(tv) do table.insert(inner, tostring(ik) .. "=" .. tostring(iv)) end
+                                        tv = "{" .. table.concat(inner, ",") .. "}"
+                                    end
+                                    table.insert(parts, tostring(tk) .. "=" .. tostring(tv))
+                                end
+                                table.insert(raw, key .. "{" .. table.concat(parts, ",") .. "}")
+                            elseif val ~= nil then
+                                table.insert(raw, key .. "=" .. tostring(val))
+                            end
+                        end
                         team[slot] = { uuid = tostring(rawget(v, "uuid")), name = tostring(rawget(v, "unit_id")),
-                            rolls = rolls, fields = table.concat(keys, ",") }
+                            rolls = rolls, traits = traits, traitRaw = table.concat(raw, " "), fields = table.concat(keys, ",") }
                     end
                 end
             end
@@ -2986,7 +3084,7 @@ local function tryPlace(t, spot)
     end
     local before = numbersOnPlayer()
     local count = #placedOf(t.uuid)
-    local y = groundAt(spot.x, spot.y, spot.z)
+    local y = spot.groundY or groundAt(spot.x, spot.y, spot.z)
     local repliedAt
     task.spawn(function()
         pcall(function() remote:InvokeServer(t.uuid, CFrame.new(spot.x, y, spot.z)) end)
@@ -3073,7 +3171,9 @@ end
 -- ("10175¥"). Reading them means the first placement of a game needs no guessing, and a
 -- "Cannot place unit here!" spot is skipped at once instead of retried.
 local function parseYen(text)
-    local num = tostring(text):match("^%s*([%d,]+)%s*¥%s*$")
+    -- "1350 ¥", "12352¥", the full-width "￥", and rich text tags stripped first
+    local plain = tostring(text):gsub("<[^>]->", "")
+    local num = plain:match("^%s*([%d,]+)%s*¥%s*$") or plain:match("^%s*([%d,]+)%s*￥%s*$")
     return num and tonumber((num:gsub(",", ""))) or nil
 end
 
@@ -3160,13 +3260,20 @@ end
 function AutoPlaceModule.BaseHp()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not gui then return nil end
+    -- several "a / b" labels sit at the top (unit counts like 240/200, wave counters): the
+    -- base HP is the one with the biggest maximum that is not over it
+    local bestCur, bestMax
     for _, d in ipairs(gui:GetDescendants()) do
-        if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
-            local cur, max = tostring(d.Text):match("^%s*(%d+%.?%d*)%s*/%s*(%d+%.?%d*)%s*$")
-            if cur and d.AbsolutePosition.Y < 200 then return tonumber(cur), tonumber(max) end
+        if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) and d.AbsolutePosition.Y < 200 then
+            local plain = tostring(d.Text):gsub("<[^>]->", ""):gsub(",", "")
+            local cur, max = plain:match("^%s*(%d+%.?%d*)%s*/%s*(%d+%.?%d*)%s*$")
+            cur, max = tonumber(cur), tonumber(max)
+            if cur and max and max > 0 and cur <= max and (not bestMax or max > bestMax) then
+                bestCur, bestMax = cur, max
+            end
         end
     end
-    return nil
+    return bestCur, bestMax
 end
 
 function AutoPlaceModule.EnemyProgress()
@@ -3213,8 +3320,10 @@ local function chooseNext(prices, danger)
             t.placedSample = copies[1]
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
-            local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99)
-            if not AutoPlaceModule.full[t.uuid] and placed < target then
+            local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99,
+                AutoPlaceModule.TraitMods(t.traits).cap or 99)
+            local resting = (AutoPlaceModule.noSpot[t.uuid] or 0) > os.clock()
+            if not AutoPlaceModule.full[t.uuid] and not resting and placed < target then
                 table.insert(list, { slot = s, t = t, role = role, placed = placed, target = target,
                     cost = t.cost or prices[s] or math.huge })
             end
@@ -3276,7 +3385,9 @@ local function tick()
         end
     end
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
-    local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
+    -- money: the learned value, else AA's in-game yen (_stats.resource), else the screen
+    local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
+        or readCostValue("LP._stats.resource") or hudMoney
     local danger = AutoPlaceModule.Danger()
     AutoPlaceModule.danger = danger
     local slot, t, role, dpsPlaced = chooseNext(hudPrices, danger)
@@ -3309,10 +3420,14 @@ local function tick()
     end
     local unknown = not (cost and money)
     local range = AutoPlaceModule.Range(t)
-    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range) or bestSpot(0, role, range)
+    local kind = AutoPlaceModule.PlacementKind(t)
+    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range, kind) or bestSpot(0, role, range, kind)
     if not spot then
-        AutoPlaceModule.problem = "no free spot beside the path - the path may still be short"
-        return 1
+        -- no spot of this kind (e.g. a hill unit on a map without free hills): let the
+        -- other units go first and try this one again later
+        AutoPlaceModule.noSpot[t.uuid] = os.clock() + 20
+        AutoPlaceModule.problem = string.format("no free %s spot for %s - trying the other units first", kind, t.name)
+        return 0.1
     end
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     if tryPlace(t, spot) then
@@ -3323,7 +3438,7 @@ local function tick()
     local why = refusalReason()
     if why == "money" then return 0.5 end
     if why == "spot" then
-        badSpots[spotKey(spot)] = true
+        badSpots[spotKey(spot, kind)] = true
         return 0.1
     end
     if why == "cap" then
@@ -3334,7 +3449,7 @@ local function tick()
     end
     if cost and money and money >= cost then
         -- enough money but refused: the spot is not allowed; several in a row = unit limit
-        local key = spotKey(spot)
+        local key = spotKey(spot, kind)
         badSpots[key] = true
         recentBad[#recentBad + 1] = key
         failsInRow = failsInRow + 1
@@ -3359,6 +3474,7 @@ function AutoPlaceModule.Start()
     apGen = apGen + 1
     local gen = apGen
     AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+    AutoPlaceModule.noSpot = {}
     task.spawn(function()
         local lastGame
         while AutoPlace.enabled and gen == apGen and not State.unloaded do
@@ -3367,6 +3483,7 @@ function AutoPlaceModule.Start()
             local gameNow = started and started.Value
             if gameNow and not lastGame then
                 AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+                AutoPlaceModule.noSpot = {}
                 AutoPlaceModule.RefreshTeam()
             end
             lastGame = gameNow
@@ -3431,6 +3548,9 @@ function AutoPlaceModule.MapReport()
                 s, t.name, clip(t.uuid, 14), tostring(t.cost), tostring(AutoPlaceModule.RoleOf(t)),
                 #rolls > 0 and table.concat(rolls, " ") or "none", st.damage, st.cooldown, st.range))
             table.insert(lines, "  team data fields: " .. clip(t.fields or "-", 300))
+            table.insert(lines, string.format("  traits: %s | stands on: %s | raw: %s",
+                #(t.traits or {}) > 0 and table.concat(t.traits, ", ") or "none",
+                AutoPlaceModule.PlacementKind(t), clip(t.traitRaw ~= "" and t.traitRaw or "-", 200)))
         end
     end
     table.insert(lines, "money value: " .. tostring(AutoPlace.moneyPath) .. " = " .. tostring(AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)))
@@ -3763,7 +3883,8 @@ function Webhook.BuildReport(kind)
             local role = AutoPlaceModule.RoleOf(t)
             local st = AutoPlaceModule.Stats(t)
             local extra = (role == "dps" or role == nil) and string.format(" · %s dmg", commas(st.damage)) or ""
-            table.insert(team, string.format("`%d` %s%s%s", s, prettyName(t.name), role and (" · " .. role) or "", extra))
+            local traitText = #(t.traits or {}) > 0 and (" · *" .. table.concat(t.traits, ", ") .. "*") or ""
+            table.insert(team, string.format("`%d` %s%s%s%s", s, prettyName(t.name), role and (" · " .. role) or "", extra, traitText))
         end
     end
 
