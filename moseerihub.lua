@@ -588,6 +588,7 @@ function Stage.nameFromLevelData(data)
     local level = text("name") or text("id")
     if level then table.insert(parts, level) end
     local mode = text("_gamemode")
+    Stage.mode = mode
     if mode and mode ~= "story" and not string.lower(level or ""):find(string.lower(mode), 1, true)
         and not string.lower(level or ""):find((string.lower(mode):gsub("_", " ")), 1, true) then
         table.insert(parts, mode)
@@ -3252,7 +3253,7 @@ end
 -- role: "farm" takes the spots that cover the least road (farms earn anywhere), "buff"
 -- the spots next to the most damage units, anything else the spots covering the most road
 -- within that unit's own range (a range-9 unit must stand closer than a range-16 one).
-local function bestSpot(skip, role, range, kind, aoe)
+local function bestSpot(skip, role, range, kind, aoe, back)
     skip = skip or 0
     kind = kind or "ground"
     local pts = pathPoints()
@@ -3381,11 +3382,17 @@ local function bestSpot(skip, role, range, kind, aoe)
             -- area attacks hit the whole crowd: a spot where the road passes by two or three
             -- times (a bend, a U-turn) is worth more than one long straight
             if aoe and passes > 1 then n = n * (1 + 0.5 * (passes - 1)) end
-            if spawn and goal and (mode == "Fast clear" or mode == "Safe") then
+            -- back: a trap unit that also hits flyers (Usopp) guards the last stretch before
+            -- our base in every mode (owner): whatever slips past the front line meets its traps
+            if spawn and goal and (back or mode == "Fast clear" or mode == "Safe") then
                 local ds = math.sqrt((c.x - spawn.X) ^ 2 + (c.z - spawn.Z) ^ 2)
                 local dg = math.sqrt((c.x - goal.X) ^ 2 + (c.z - goal.Z) ^ 2)
                 local nearSpawn = dg / math.max(1, ds + dg) -- 1 at the spawn, 0 at our base
-                n = n * (mode == "Fast clear" and nearSpawn ^ 2 or (1 - nearSpawn) ^ 2)
+                -- (back alone leans softer than Safe: a spot that still covers a lot of road
+                -- near the base beats a tiny corner right at the gate)
+                if mode == "Fast clear" and not back then n = n * nearSpawn ^ 2
+                elseif mode == "Safe" then n = n * (1 - nearSpawn) ^ 2
+                else n = n * (1 - nearSpawn) end
             end
             table.insert(scored, { c = c, n = n })
         end
@@ -3919,6 +3926,10 @@ end
 -- unit type, only when two or more types share the key (both halves are placed).
 function ControlUp.fusionPairs(units)
     local byKey, out = {}, {}
+    -- no fusion in the Infinity Tower (owner): the money there goes into raw strength, and the
+    -- fusion would also take Carrot (a hill unit that hits flyers) off the map
+    local where = string.lower(tostring(Stage.mode or "") .. " " .. tostring(State.stage or ""))
+    if where:find("infinite_tower", 1, true) or where:find("infinity mansion", 1, true) then return out end
     for _, u in ipairs(units) do
         local name = unitType(u)
         local key, need = ControlUp.fusionOf(name)
@@ -4530,7 +4541,8 @@ local function tick()
     local range = AutoPlaceModule.Range(t)
     local kind = AutoPlaceModule.PlacementKind(t)
     local aoe = AutoPlaceModule.IsAoe(t.name)
-    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range, kind, aoe) or bestSpot(0, role, range, kind, aoe)
+    local back = AutoPlaceModule.IsTrap(t.name) and AutoPlaceModule.AirCapable(t.name, 0)
+    local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range, kind, aoe, back) or bestSpot(0, role, range, kind, aoe, back)
     if not spot then
         -- no spot of this kind (e.g. a hill unit on a map without free hills): let the
         -- other units go first and try this one again later
