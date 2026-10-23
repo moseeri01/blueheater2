@@ -7470,7 +7470,12 @@ function Lobby.SetWatch(on)
     if on and not installHook() then return false end
     State.watching = on
     if on then
-        Lobby.watchLog = { "# lobby_watch " .. os.date("%Y-%m-%d %H:%M:%S") .. " | stage " .. tostring(State.stage or "lobby") }
+        -- added to what earlier Watch runs wrote (the script restarts after every teleport)
+        local old
+        pcall(function() old = readfile(Config.Folder .. "/lobby_watch.txt") end)
+        Lobby.watchLog = {}
+        if type(old) == "string" and old ~= "" then table.insert(Lobby.watchLog, (old:sub(-20000))) end
+        table.insert(Lobby.watchLog, "# lobby_watch " .. os.date("%Y-%m-%d %H:%M:%S") .. " | stage " .. tostring(State.stage or "lobby"))
         task.spawn(function()
             -- written every 2 s (not inside the hook) while Watch is on
             while State.watching and not State.unloaded do
