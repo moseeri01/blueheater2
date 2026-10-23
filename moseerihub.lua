@@ -92,7 +92,9 @@ local UnitAI = {
 local AutoPlace = {
     enabled = false,
     upgrade = true,               -- "Auto upgrade": every upgrade (farms, damage) is done by Auto Place
-    slots = { 8, 8, 8, 8, 8, 8 }, -- how many of each team slot to place (0 = none)
+    slots = { 8, 8, 8, 8, 8, 8 }, -- how many of each team slot to place (0 = none, old configs: see skip)
+    skip = {},                    -- [unit name] = true: never placed ("Skip these units")
+    homeKeep = nil,               -- the switches as they were before Home AUTO went on (back when it goes off)
     moneyPath = nil,              -- tracked value that pays for units, found on the first placement
     paths = {},                   -- [stage] = { {x,y,z}, ... } learned from enemy movement
     caps = {},                    -- [unit name] = how many the game lets you place, learned once
@@ -229,14 +231,15 @@ local function buildConfigData()
             sellUnitName = AutoFarm.sellUnitName,
         },
         macro = {
-            retryPlacements = State.retryPlacements,
+            retryPlacements = State.retryPlacements, macroFastV2 = true,
             autoPlay = State.autoPlay,
             showAllMacros = State.showAllMacros,
             lastMacro = State.macroName,
         },
-        tools = { antiAfk = Tools.antiAfk },
+        tools = { antiAfk = Tools.antiAfk, perf = Tools.perf },
         autoPlace = {
-            enabled = AutoPlace.enabled, upgrade = AutoPlace.upgrade, slots = AutoPlace.slots,
+            enabled = AutoPlace.enabled, manual = AutoPlace.manual, skip = next(AutoPlace.skip) and AutoPlace.skip or nil,
+            homeKeep = AutoPlace.homeKeep, upgrade = AutoPlace.upgrade, slots = AutoPlace.slots,
             moneyPath = AutoPlace.moneyPath, paths = next(AutoPlace.paths) and AutoPlace.paths or nil,
             caps = next(AutoPlace.caps) and AutoPlace.caps or nil,
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
@@ -298,13 +301,22 @@ local function applyConfigData(data)
     AutoFarm.sellUnitName = pick(a.sellUnitName, "string", AutoFarm.sellUnitName)
     local m = data.macro or {}
     State.retryPlacements = pick(m.retryPlacements, "boolean", State.retryPlacements)
+    -- "Place as soon as money allows" is on for everyone once (configs saved before macroFastV2)
+    if m.macroFastV2 ~= true then State.retryPlacements = true end
     State.autoPlay = pick(m.autoPlay, "boolean", State.autoPlay)
     State.showAllMacros = pick(m.showAllMacros, "boolean", State.showAllMacros)
     if type(m.lastMacro) == "string" and #m.lastMacro > 0 then State.macroName = m.lastMacro end
     local t = data.tools or {}
-    pendingToggles.antiAfk = t.antiAfk == true
+    pendingToggles.antiAfk = t.antiAfk ~= false -- on unless the saved config turned it off
+    pendingToggles.perf = type(t.perf) == "table" and t.perf or nil
     local ap = data.autoPlace or {}
     pendingToggles.autoPlace = ap.enabled == true
+    AutoPlace.manual = ap.manual == true
+    if type(ap.skip) == "table" then
+        AutoPlace.skip = {}
+        for k, v in pairs(ap.skip) do if v == true then AutoPlace.skip[tostring(k)] = true end end
+    end
+    AutoPlace.homeKeep = type(ap.homeKeep) == "table" and ap.homeKeep or nil
     AutoPlace.upgrade = pick(ap.upgrade, "boolean", AutoPlace.upgrade)
     if type(ap.slots) == "table" then
         for i = 1, 6 do AutoPlace.slots[i] = tonumber(ap.slots[i]) or AutoPlace.slots[i] end
@@ -334,8 +346,26 @@ local function applyConfigData(data)
             end
         end
     end
-    if type(ap.paths) == "table" then AutoPlace.paths = ap.paths end
-    if type(ap.caps) == "table" then AutoPlace.caps = ap.caps end
+    if type(ap.paths) == "table" then
+        -- (a damaged or hand-edited config: only points made of three numbers are kept)
+        AutoPlace.paths = {}
+        for stage, pts in pairs(ap.paths) do
+            if type(stage) == "string" and type(pts) == "table" then
+                local ok = {}
+                for _, p in ipairs(pts) do
+                    if type(p) == "table" and type(p[1]) == "number" and type(p[2]) == "number" and type(p[3]) == "number"
+                        and p[1] == p[1] and p[2] == p[2] and p[3] == p[3] then
+                        table.insert(ok, { p[1], p[2], p[3] })
+                    end
+                end
+                if #ok > 0 then AutoPlace.paths[stage] = ok end
+            end
+        end
+    end
+    if type(ap.caps) == "table" then
+        -- (a limit below 1 came from misread refusals: dropped)
+        for k, v in pairs(ap.caps) do if tonumber(v) and tonumber(v) >= 1 then AutoPlace.caps[k] = tonumber(v) end end
+    end
     if type(ap.roles) == "table" then AutoPlace.roles = ap.roles end
 end
 
@@ -1582,9 +1612,10 @@ function PlaybackModule.Play(fromGameStart)
                 for _, e in pairs(UnitAI.learned) do
                     if e.name == a.name then skillPress = true end
                 end
-                if UnitAI.autoBuff and skillPress then
-                    -- skill presses recorded by hand would break the buff rotation's turn order
-                    addReplayLog(string.format("#%d %s: skipped, buff rotation handles skills", i, a.name))
+                if skillPress and (UnitAI.autoBuff or UnitAI.autoAbilities or (AutoPlace.enabled and AutoPlace.smartFreeze)) then
+                    -- skill presses recorded by hand would break the buff rotation's turn order, and
+                    -- the unit skills / smart freeze loops cast them at the right time themselves
+                    addReplayLog(string.format("#%d %s: skipped, the buff rotation / unit skills / freeze cast skills", i, a.name))
                 else
                     local firedAt = os.clock()
                     if fireAction(i, a) then
@@ -1659,6 +1690,16 @@ end
 
 -- Scan
 local Scan = {}
+-- A full PlayerGui scan walks thousands of instances and several loops ask the same question
+-- many times a second: each answer below is reused for half a second.
+Scan.memo = {}
+function Scan.Cached(key, fn)
+    local m, now = Scan.memo[key], os.clock()
+    if m and now - m.at >= 0 and now - m.at < 0.5 then return m[1], m[2] end
+    local a, b = fn()
+    Scan.memo[key] = { at = now, a, b }
+    return a, b
+end
 Words.BUTTON = { "replay", "retry", "next", "lobby", "return", "leave", "victory", "defeat", "clear", "ready", "act ", "wave", "stage", "shop", "hoard", "battle", "boss", "shrine", "room", "depth" }
 
 local function matchesAny(s, words)
@@ -1876,21 +1917,35 @@ end
 
 Words.END = { "victory", "defeat", "game over", "waves completed", "total time" }
 
-local function isResultsShowing()
+function Scan.Results()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not gui then return false end
     local results = gui:FindFirstChild("ResultsUI")
     if results and results:IsA("LayerCollector") and results.Enabled then return true end
+    -- never in the lobby (result words show up there on passes, quests, banners)
+    local cfg = workspace:FindFirstChild("_MAP_CONFIG")
+    local lobby = cfg and cfg:FindFirstChild("IsLobby")
+    if not cfg or (lobby and lobby.Value == true) then return false end
+    local data = workspace:FindFirstChild("_DATA")
+    local fin = data and (data:FindFirstChild("GameFinished") or data:FindFirstChild("GameOver") or data:FindFirstChild("GameEnded"))
+    if fin and fin:IsA("BoolValue") and fin.Value == true then return true end
+    -- fallback, only once the match has started (wave counter moved): a label that IS a
+    -- result word ("VICTORY", "Defeat!", "Total Time: 01:15"), not one that has it inside
+    -- (the quest line "Defeat 50 enemies")
+    if getCurrentWave() <= 0 then return false end
     for _, d in ipairs(gui:GetDescendants()) do
         if (d:IsA("TextLabel") or d:IsA("TextButton")) and #d.Text > 0 then
-            local lower = string.lower(d.Text)
+            local t = string.lower(tostring(d.Text)):gsub("<[^>]->", ""):match("^%s*(.-)[%p%s]*$")
             for _, word in ipairs(Words.END) do
-                if lower:find(word, 1, true) and isOnScreen(d) and not isOwnGui(d) then return true end
+                local whole = t == word or ((word == "total time" or word == "waves completed") and t:sub(1, #word) == word)
+                if whole and isOnScreen(d) and not isOwnGui(d) then return true end
             end
         end
     end
     return false
 end
+
+local function isResultsShowing() return Scan.Cached("results", Scan.Results) end
 
 local function resultIsVictory()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -1981,7 +2036,8 @@ function AutoFarmModule.OnGameEnd()
         end
     end
 
-    if not done and goal == "leave" then
+    -- (only when the 45 s ran out: not when Auto leave was turned off or the script closed)
+    if not done and goal == "leave" and os.clock() >= giveUpAt and not State.unloaded then
         pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
         done = true
     end
@@ -2061,7 +2117,7 @@ task.spawn(function()
         task.wait(0.5)
         local now = os.clock()
         if (AutoFarm.autoStart or AutoFarm.autoSkip) and not inLobby() and not isResultsShowing() then
-            if AutoFarm.autoStart and not gameStarted() and now >= nextStart then
+            if AutoFarm.autoStart and not gameStarted() and getCurrentWave() <= 0 and now >= nextStart then
                 nextStart = now + 2
                 local via = fireFirst(Words.START_REMOTES)
                 local btn = labelButton({ "vote start", "start game", "vote to start", "start" })
@@ -2102,9 +2158,12 @@ function AutoFarmModule.CheckAutoSell()
     if wave < AutoFarm.sellAtWave then return end
     local folder = unitsFolder()
     if not folder then return end
-    local targetName = string.lower(AutoFarm.sellUnitName)
+    local targetName = string.lower(AutoFarm.sellUnitName):match("^%s*(.-)%s*$")
     for _, unit in ipairs(folder:GetChildren()) do
-        if string.lower(unit.Name):find(targetName, 1, true) and isMyUnit(unit) then
+        local stats = unit:FindFirstChild("_stats")
+        local id = stats and stats:FindFirstChild("id")
+        local same = string.lower(unit.Name) == targetName or (id and string.lower(tostring(id.Value)) == targetName)
+        if same and isMyUnit(unit) then
             local sellRemote = getAARemote("sell_unit_ingame")
             if sellRemote then
                 pcall(function() sellRemote:InvokeServer(unit) end)
@@ -2446,6 +2505,9 @@ local function readyIn(unit)
     if not cd or not age then return 0 end
     return math.max(0, cd - age)
 end
+-- (the unit skills loop below waits for the cooldown too)
+BuffRot.readyIn, BuffRot.observeCast = readyIn, observeCast
+function BuffRot.markCast(unit) ourCast[unit] = os.clock() end
 
 -- Buff effect on the team: numbers on our units that a buff changes (damage/buff multipliers).
 local function effectSnapshot()
@@ -2653,12 +2715,31 @@ function UnitAIModule.StartAbilities()
             if isGameRunning() then
                 for _, unit in ipairs(myUnitsWithAbility()) do
                     local held = AutoPlace.enabled and AutoPlace.smartFreeze and BuffRot.isControlSkill(unit)
-                    if inAttackState(unit) and not held then fireActiveAttack(unit) end
+                    BuffRot.observeCast(unit)
+                    if inAttackState(unit) and not held and BuffRot.readyIn(unit) <= 0 and not UnitAIModule.Costly(unit) then
+                        fireActiveAttack(unit)
+                        BuffRot.markCast(unit)
+                    end
                 end
             end
             task.wait(math.max(1, UnitAI.abilityCooldown))
         end
     end)
+end
+
+-- A skill that costs units or yen (sacrifice, sell, pay): left to the player. Read from the
+-- skill's name and any cost number in _stats (field names are a guess).
+Words.COSTLY_SKILL = { "sacrific", "consume", "devour" }
+function UnitAIModule.Costly(unit)
+    local stats = unit:FindFirstChild("_stats")
+    local act = stats and stats:FindFirstChild("active_attack")
+    local name = act and string.lower(tostring(act.Value)) or ""
+    for _, w in ipairs(Words.COSTLY_SKILL) do if name:find(w, 1, true) then return true end end
+    for _, n in ipairs({ "active_attack_cost", "active_cost", "skill_cost", "ability_cost" }) do
+        local v = stats and stats:FindFirstChild(n)
+        if v and (tonumber(v.Value) or 0) > 0 then return true end
+    end
+    return false
 end
 
 function UnitAIModule.StopAbilities()
@@ -2693,7 +2774,8 @@ end
 -- Learns the path from where enemies walk (saved per stage), scores spots beside it by how
 -- much path they cover, and places team slot 1..6 as soon as money allows. The team is read
 -- fresh every game, so changing units in game needs no setup.
-local AutoPlaceModule = { team = {}, status = "Off", problem = nil, placed = {}, full = {}, noSpot = {} }
+local AutoPlaceModule = { team = {}, status = "Off", problem = nil, placed = {}, full = {}, noSpot = {},
+    gameCaps = {}, failsBy = {} } -- limits found this game only (refusals / messages), refusals in a row per unit
 do
 local PATH_CELL = 2.5      -- path points closer than this are merged
 local SIDE_DIST = { 4, 5, 8, 12 } -- how far beside the path to try (4 for narrow rooftops, 12 reaches hills set back)
@@ -2704,7 +2786,6 @@ local DEFAULT_RANGE = 15
 local apGen = 0
 local badSpots = {}
 local candidates, candidatesFor = nil, -1
-local failsInRow = 0
 local recentBad = {}
 local unknownTries = 0
 
@@ -3084,6 +3165,85 @@ end
 
 local BUFF_REACH = 12
 
+-- A placed damage unit that hit nothing for 60 s while enemies walked inside its range (on
+-- the map plane) stands where it cannot reach them (Room 39: "DMG 0 | Takedowns 0" on a hill):
+-- no more yen goes into it. Read from its _stats damage / takedown value when the game has
+-- one (names are a guess: any that matches), else from whether its spot reaches a road point.
+AutoPlaceModule.DMG_STATS = { "damage_dealt", "total_damage", "damage_done", "dmg_dealt", "takedowns", "kills" }
+AutoPlaceModule.hits = setmetatable({}, { __mode = "k" })
+function AutoPlaceModule.HitTotal(u)
+    local st = u:FindFirstChild("_stats")
+    local total
+    for _, n in ipairs(AutoPlaceModule.DMG_STATS) do
+        local o = st and st:FindFirstChild(n)
+        local okA, attr = pcall(function() return u:GetAttribute(n) end)
+        local x = (o and o:IsA("ValueBase") and tonumber(o.Value)) or (okA and tonumber(attr)) or nil
+        if x then total = (total or 0) + x end
+    end
+    return total
+end
+local function unitReach(u)
+    local st = u:FindFirstChild("_stats")
+    local rv = st and st:FindFirstChild("range")
+    local id = st and st:FindFirstChild("id")
+    local def = AutoPlaceModule.UnitDef(id and tostring(id.Value) or u.Name) or {}
+    return (rv and tonumber(rv.Value)) or tonumber(def.range) or DEFAULT_RANGE
+end
+-- called every Auto Place tick: counts, per damage unit, the seconds enemies spent inside its
+-- range without its hit counter going up
+function AutoPlaceModule.WatchHits()
+    local now = os.clock()
+    local enemies = {}
+    local folder = unitsFolder()
+    for _, e in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(e) then
+            local p = rootPos(e)
+            if p then table.insert(enemies, p) end
+        end
+    end
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" then
+            local total = AutoPlaceModule.HitTotal(u)
+            local h = AutoPlaceModule.hits[u]
+            if not h then h = { total = total, quiet = 0, at = now } AutoPlaceModule.hits[u] = h end
+            if total and h.total and total > h.total then h.quiet = 0 end
+            h.total = total
+            local p, r = rootPos(u), unitReach(u)
+            local near = false
+            for _, e in ipairs(enemies) do
+                if p and (e.X - p.X) ^ 2 + (e.Z - p.Z) ^ 2 <= r * r then near = true break end
+            end
+            if near then h.quiet = h.quiet + math.min(2, now - h.at) end
+            h.at = now
+        end
+    end
+end
+function AutoPlaceModule.OutOfReach(u)
+    if unitRole(u) ~= "dps" then return false end
+    local h = AutoPlaceModule.hits[u] or {}
+    AutoPlaceModule.hits[u] = h
+    local out
+    if h.total ~= nil then
+        -- (with a hit counter, a unit gets upgrades only once it has hit something)
+        if h.total == 0 and h.quiet < 60 then return true end
+        out = h.quiet >= 60 and h.total == 0
+    else
+        -- no hit counter in this game: does its spot reach any road point?
+        local p, pts = rootPos(u), pathPoints()
+        if not p or #pts < 8 then return false end
+        local r = unitReach(u)
+        out = true
+        for _, q in ipairs(pts) do
+            if (q[1] - p.X) ^ 2 + (q[2] - p.Y) ^ 2 + (q[3] - p.Z) ^ 2 <= r * r then out = false break end
+        end
+    end
+    if out and not h.noted then
+        h.noted = true
+        AutoPlaceModule.Note(string.format("%s is out of range - not upgraded", unitType(u)))
+    end
+    return out
+end
+
 -- skip = how many good free spots to pass over (used to rotate while the price is unknown).
 -- role: "farm" takes the spots that cover the least road (farms earn anywhere), "buff"
 -- the spots next to the most damage units, anything else the spots covering the most road
@@ -3123,9 +3283,23 @@ local function bestSpot(skip, role, range, kind, aoe)
         local x, z, k = key:match("^(%-?%d+),(%-?%d+)|(.+)$")
         if x and k == kind then table.insert(refused, { tonumber(x), tonumber(z) }) end
     end
+    -- road points inside this unit's reach from c: the reach is 3D (a spot 37 studs above the
+    -- road on a tall rock reaches nothing with range 24), c.rise = height above the road
+    local attacks = role ~= "farm" and role ~= "buff" and role ~= "support"
+    local reach = (range and range > 0) and range or DEFAULT_RANGE
+    local function cover(c)
+        local flat = reach * reach - (c.rise or 0) ^ 2
+        if flat <= 0 then return 0 end
+        local n = 0
+        for _, q in ipairs(pts) do
+            local dx, dz = q[1] - c.x, q[3] - c.z
+            if dx * dx + dz * dz <= flat then n = n + 1 end
+        end
+        return n
+    end
     local free, nearRefused = {}, {}
     for _, c in ipairs(candidates) do
-        if not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) then
+        if not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) and not (attacks and cover(c) == 0) then
             local ok = true
             for _, p in ipairs(mine) do
                 local dx, dz = p.X - c.x, p.Z - c.z
@@ -3151,7 +3325,10 @@ local function bestSpot(skip, role, range, kind, aoe)
             return out
         end
         local nf, nr = named(free), named(nearRefused)
-        if trust == "name" or (trust ~= "height" and #nf + #nr > 0) then free, nearRefused = nf, nr end
+        -- (Room 39: a named hill that covered no road won over a good height-only one)
+        local function best(list) local m = 0 for _, c in ipairs(list) do m = math.max(m, cover(c)) end return m end
+        local comparable = not attacks or best(nf) >= 0.7 * best(free)
+        if trust == "name" or (trust ~= "height" and #nf + #nr > 0 and comparable) then free, nearRefused = nf, nr end
     end
     if #free == 0 then free = nearRefused end
     if role == "farm" then
@@ -3182,7 +3359,6 @@ local function bestSpot(skip, role, range, kind, aoe)
     end
     if role ~= "buff" and role ~= "support" then
         local r = (range and range > 0) and range or DEFAULT_RANGE
-        local r2 = r * r
         -- Fast clear: prefer spots near the enemy spawn (kills early, waves end sooner);
         -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
         local mode = AutoPlaceModule.Mode()
@@ -3190,6 +3366,7 @@ local function bestSpot(skip, role, range, kind, aoe)
         local scored = {}
         for _, c in ipairs(free) do
             local n, passes, inside = 0, 0, false
+            local r2 = r * r - (c.rise or 0) ^ 2
             for _, q in ipairs(pts) do
                 local dx, dz = q[1] - c.x, q[3] - c.z
                 local hit = dx * dx + dz * dz <= r2
@@ -3310,20 +3487,21 @@ function AutoPlaceModule.RefreshTeam()
     -- never placed because only units already on the map were known). Remember the last
     -- team read from game data and fill the missing slots from it.
     AutoPlace.lastTeam = AutoPlace.lastTeam or {}
-    local foundAny = false
-    for slot, t in pairs(team) do
-        AutoPlace.lastTeam[tostring(slot)] = { uuid = t.uuid, name = t.name }
-        foundAny = true
-    end
-    if foundAny then saveConfig() end
-    local inTeam = {}
-    for _, t in pairs(team) do inTeam[(tostring(t.uuid):gsub("[{}%s]", ""))] = true end
-    for k, v in pairs(AutoPlace.lastTeam) do
-        local slot = tonumber(k)
-        local key = (tostring(v.uuid):gsub("[{}%s]", ""))
-        if slot and not team[slot] and not inTeam[key] then
-            team[slot] = { uuid = v.uuid, name = v.name, fromLastTeam = true }
-            inTeam[key] = true
+    if next(team) then
+        -- (after a swap the old slots must not come back from memory)
+        local now, changed = {}, false
+        for slot, t in pairs(team) do now[tostring(slot)] = { uuid = t.uuid, name = t.name } end
+        for k, v in pairs(now) do
+            local old = AutoPlace.lastTeam[k]
+            if not old or old.uuid ~= v.uuid or old.name ~= v.name then changed = true end
+        end
+        for k in pairs(AutoPlace.lastTeam) do if not now[k] then changed = true end end
+        AutoPlace.lastTeam = now
+        if changed then saveConfig() end
+    else
+        for k, v in pairs(AutoPlace.lastTeam) do
+            local slot = tonumber(k)
+            if slot then team[slot] = { uuid = v.uuid, name = v.name, fromLastTeam = true } end
         end
     end
     local known = {}
@@ -3383,6 +3561,7 @@ function AutoPlaceModule.RefreshTeam()
     end
     AutoPlaceModule.team = team
     AutoPlaceModule.teamReadAt = os.clock()
+    pcall(AutoPlaceModule.MigrateSkip)
     if learned then saveConfig() end
     if AutoPlaceModule.refreshSkipUI then pcall(AutoPlaceModule.refreshSkipUI) end
     return team
@@ -3580,9 +3759,11 @@ local function tryPlace(t, spot)
     local count = #placedOf(t.uuid)
     local y = spot.groundY or groundAt(spot.x, spot.y, spot.z)
     local repliedAt
+    AutoPlaceModule.inFlight = true
     task.spawn(function()
         pcall(function() remote:InvokeServer(t.uuid, CFrame.new(spot.x, y, spot.z)) end)
         repliedAt = os.clock()
+        AutoPlaceModule.inFlight = nil
     end)
     -- Success = the unit shows up. A refusal is known once the server has answered and
     -- nothing appeared shortly after, so a refused spot costs well under a second.
@@ -3782,7 +3963,8 @@ local function upgradeStep(money, onlyRole, airOnly)
     local focus = ControlUp.focus(units, now)
     for _, u in ipairs(units) do
         local role = unitRole(u)
-        if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus) then
+        if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
+            and not AutoPlaceModule.OutOfReach(u) then
             local stats = u:FindFirstChild("_stats")
             local lvl = stats and stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
@@ -3834,7 +4016,8 @@ local function parseYen(text)
     return num and tonumber((num:gsub(",", ""))) or nil
 end
 
-function AutoPlaceModule.ReadHud()
+function AutoPlaceModule.ReadHud() return Scan.Cached("hud", AutoPlaceModule.ScanHud) end
+function AutoPlaceModule.ScanHud()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not gui then return nil, {} end
     local labels = {}
@@ -3927,7 +4110,8 @@ function AutoPlaceModule.BasePos(side)
     return ok and p or nil
 end
 
-function AutoPlaceModule.BaseHp()
+function AutoPlaceModule.BaseHp() return Scan.Cached("basehp", AutoPlaceModule.ScanBaseHp) end
+function AutoPlaceModule.ScanBaseHp()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not gui then return nil end
     -- several "a / b" labels sit at the top (unit counts like 240/200, wave counters): the
@@ -4041,7 +4225,7 @@ local function chooseNext(prices, danger)
             t.placedSample = copies[1]
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
-            local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99,
+            local target = math.min(AutoPlaceModule.SlotTarget(s, t), tonumber(AutoPlace.caps[t.name]) or AutoPlaceModule.gameCaps[t.name] or 99,
                 AutoPlaceModule.TraitMods(t.traits).cap or 99)
             -- slots set to 0 or found full with none down do not count as the strongest
             if role == "dps" and target > 0 and (placed > 0 or not AutoPlaceModule.full[t.uuid]) then
@@ -4144,9 +4328,10 @@ local function tick()
     if grew and #pathPoints() % 20 == 0 then saveConfig() end
     if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
     -- part of the team came only from units on the map (no traits/rolls): read again now and then
-    if os.clock() - (AutoPlaceModule.teamReadAt or 0) > 15 then
+    -- (once per game: getgc walks every table in memory, and the team often never shows up)
+    if os.clock() - (AutoPlaceModule.teamReadAt or 0) > 15 and not AutoPlaceModule.extraTeamRead then
         for _, t in pairs(AutoPlaceModule.team) do
-            if not t.fields then AutoPlaceModule.RefreshTeam() break end
+            if not t.fields then AutoPlaceModule.extraTeamRead = true AutoPlaceModule.RefreshTeam() break end
         end
     end
     if not next(AutoPlaceModule.team) then
@@ -4163,6 +4348,7 @@ local function tick()
             if type(a.costPath) == "string" then AutoPlace.moneyPath = a.costPath break end
         end
     end
+    pcall(AutoPlaceModule.WatchHits)
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
     -- money: the learned value, else AA's in-game yen (_stats.resource), else the screen
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
@@ -4198,6 +4384,8 @@ local function tick()
         danger = threat ~= nil
     end
     local slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, danger)
+    -- Place units myself (Home): the player places, the script only upgrades / sells
+    if AutoPlace.manual then t = nil end
     -- air quota not met but no air unit can go down now (no hill spot, at its limit): say so
     -- once and go on in the normal order, never stall
     if AutoPlaceModule.airNeed and t and role == "dps" and not AutoPlaceModule.AirCapable(t.name, 0) and not AutoPlaceModule.airFallbackNoted then
@@ -4217,6 +4405,7 @@ local function tick()
         local wait = upgradeStep(money, "dps")
         if wait then return wait end
         slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, false)
+        if AutoPlace.manual then t = nil end
     end
     -- (lost twice here: no farm upgrades until every damage unit is down)
     if not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and strongestDown
@@ -4243,7 +4432,7 @@ local function tick()
         if resting > 0 then
             AutoPlaceModule.status = string.format("No free spot for %d unit(s) - trying again soon", resting)
         else
-            AutoPlaceModule.status = AutoPlace.upgrade and "All units placed and fully upgraded" or "Everything placed"
+            AutoPlaceModule.status = AutoPlace.manual and "You place the units" or AutoPlace.upgrade and "All units placed and fully upgraded" or "Everything placed"
         end
         return 1
     end
@@ -4270,11 +4459,21 @@ local function tick()
         -- other units go first and try this one again later
         AutoPlaceModule.noSpot[t.uuid] = os.clock() + 20
         AutoPlaceModule.problem = string.format("no free %s spot for %s - trying the other units first", kind, t.name)
+        AutoPlaceModule.noSpotNoted = AutoPlaceModule.noSpotNoted or {}
+        if not AutoPlaceModule.noSpotNoted[stageKey() .. t.uuid] then
+            AutoPlaceModule.noSpotNoted[stageKey() .. t.uuid] = true
+            AutoPlaceModule.Note(string.format("no %s spot within %s's reach of the road - not placed", kind, t.name))
+        end
         return 0.1
+    end
+    if AutoPlaceModule.inFlight then
+        -- (the game has not answered the last placement yet: a second one could double it)
+        AutoPlaceModule.status = "Waiting for the game to answer the last placement"
+        return 0.2
     end
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     if tryPlace(t, spot) then
-        failsInRow, recentBad = 0, {}
+        AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
         t.spotRefused = 0
         AutoPlaceModule.problem = nil
         if kind == "hill" and spot.hillBy == "height" and AutoPlace.hillBy[stageKey()] ~= "height" then
@@ -4297,9 +4496,10 @@ local function tick()
         return 0.1
     end
     if why == "cap" then
+        -- the game's "max placement" message: full for this game only (a misread message
+        -- must not stick; the game data's spawn_cap is the saved limit)
         AutoPlaceModule.full[t.uuid] = true
-        AutoPlace.caps[t.name] = #placedOf(t.uuid)
-        saveConfig()
+        AutoPlaceModule.gameCaps[t.name] = math.max(1, #placedOf(t.uuid))
         return 0.1
     end
     if cost and money and money >= cost then
@@ -4307,24 +4507,24 @@ local function tick()
         local key = spotKey(spot, kind)
         badSpots[key] = true
         recentBad[#recentBad + 1] = key
-        failsInRow = failsInRow + 1
+        -- (counted per unit: another unit's refusals say nothing about this one)
+        AutoPlaceModule.failsBy[t.uuid] = (AutoPlaceModule.failsBy[t.uuid] or 0) + 1
         t.refused = (t.refused or 0) + 1
         if t.refused >= 8 and #placedOf(t.uuid) == 0 then
             -- refused on 8 spots and never placed: not in the equipped team any more
             AutoPlaceModule.full[t.uuid] = true
             AutoPlaceModule.Note(string.format("%s refused 8 times - left out (not equipped?)", t.name))
             for _, k in ipairs(recentBad) do badSpots[k] = nil end
-            recentBad, failsInRow = {}, 0
+            recentBad, AutoPlaceModule.failsBy[t.uuid] = {}, 0
             return 0.1
         end
-        if failsInRow >= 4 and not t.gameCap then
-            -- refused on 4 different spots with money in hand: this unit is at its limit,
-            -- and those spots were fine for other units
+        if AutoPlaceModule.failsBy[t.uuid] >= 4 and not t.gameCap and #placedOf(t.uuid) >= 1 then
+            -- refused on 4 different spots with money in hand: this unit is at its limit for
+            -- this game (never saved, never 0), and those spots were fine for other units
             AutoPlaceModule.full[t.uuid] = true
-            AutoPlace.caps[t.name] = #placedOf(t.uuid)
-            saveConfig()
+            AutoPlaceModule.gameCaps[t.name] = #placedOf(t.uuid)
             for _, k in ipairs(recentBad) do badSpots[k] = nil end
-            recentBad, failsInRow = {}, 0
+            recentBad, AutoPlaceModule.failsBy[t.uuid] = {}, 0
         end
         return 0.2
     end
@@ -4503,7 +4703,8 @@ function AutoPlaceModule.Start()
     task.spawn(freezeLoop, gen)
     task.spawn(AutoPlaceModule.TargetLoop, gen)
     AutoPlaceModule.flyWarned, AutoPlaceModule.flying = nil, nil
-    AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+    AutoPlaceModule.full, badSpots, unknownTries, recentBad = {}, {}, 0, {}
+    AutoPlaceModule.gameCaps, AutoPlaceModule.failsBy = {}, {}
     AutoPlaceModule.noSpot = {}
     task.spawn(function()
         local lastGame
@@ -4513,11 +4714,13 @@ function AutoPlaceModule.Start()
             local gameNow = started and started.Value
             if gameNow and not lastGame then
                 AutoPlaceModule.MapFingerprint(true)
-                AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+                AutoPlaceModule.full, badSpots, unknownTries, recentBad = {}, {}, 0, {}
+    AutoPlaceModule.gameCaps, AutoPlaceModule.failsBy = {}, {}
                 AutoPlaceModule.flyWarned, AutoPlaceModule.flying = nil, nil
                 AutoPlaceModule.seenN, AutoPlaceModule.seenFly, AutoPlaceModule.airFallbackNoted = 0, 0, nil
                 AutoPlaceModule.seen = setmetatable({}, { __mode = "k" })
                 AutoPlaceModule.noSpot = {}
+                AutoPlaceModule.extraTeamRead = nil
                 AutoPlaceModule.RefreshTeam()
             end
             lastGame = gameNow
@@ -4581,9 +4784,9 @@ function AutoPlaceModule.StatusText()
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
         if t then
-            local cap = tonumber(AutoPlace.caps[t.name])
+            local cap = tonumber(AutoPlace.caps[t.name]) or AutoPlaceModule.gameCaps[t.name]
             local role = AutoPlaceModule.RoleOf(t)
-            local target = math.min(AutoPlace.slots[s] or 0, cap or 99)
+            local target = math.min(AutoPlaceModule.SlotTarget(s, t), cap or 99)
             if role == "buff" then target = math.min(target, AutoPlaceModule.BuffNeed(t)) end
             local full = (cap and target == cap) and " (limit)" or ""
             local traitText = #(t.traits or {}) > 0 and (" {" .. table.concat(t.traits, ",") .. "}") or ""
@@ -5841,24 +6044,58 @@ function Webhook.BuildReport(kind)
     return { username = "moseeri hub", embeds = { embed } }
 end
 
--- Discord @ping for important events only (Mythic/Secret drop, bag full, disconnect / kick,
--- two losses in a row). The mention is "<@ID>" with allowed_mentions limited to that user
--- (parse = {}: never @everyone / roles). At most one ping per event type per 2 minutes.
+-- "Discord alerts" (Settings): one switch for every report / ping flag below.
+Webhook.ALERT_FLAGS = { "notifyComplete", "notifyFail", "pingMythic", "pingBagFull", "pingDisconnect", "pingLosses" }
+function Webhook.AlertsOn()
+    if #tostring(Webhook.url or "") < 10 then return false end
+    for _, k in ipairs(Webhook.ALERT_FLAGS) do if Webhook[k] then return true end end
+    return false
+end
+function Webhook.SetAlerts(on)
+    for _, k in ipairs(Webhook.ALERT_FLAGS) do Webhook[k] = on == true end
+end
+-- the URL box shows only the last 4 characters once a URL is set
+function Webhook.Masked()
+    local u = tostring(Webhook.url or "")
+    return #u >= 10 and ("****" .. u:sub(-4)) or u
+end
+function Webhook.SetUrl(text)
+    text = tostring(text or "")
+    if #Webhook.url >= 10 and text == Webhook.Masked() then return end -- our own masked text
+    local had = #Webhook.url >= 10
+    Webhook.url = text
+    -- a first URL turns the alerts on
+    if not had and #text >= 10 then
+        Webhook.SetAlerts(true)
+        pcall(function() setToggle(Controls.discordAlerts, true) end)
+    end
+    pcall(function() Controls.webhookUrl:UpdateText(Webhook.Masked()) end)
+    saveConfig()
+end
+
+-- Discord ping for important events only (Mythic/Secret drop, bag full, disconnect / kick,
+-- two losses in a row): "@here" (allowed_mentions parse "everyone" is what lets @here
+-- ping), or "<@ID>" for an old config that saved a user id. Normal reports mention nobody.
+-- At most one ping per event type per 2 minutes.
 Webhook.lastPing = {}
 function Webhook.PingFor(kind)
     local id = tostring(Webhook.pingId or ""):match("^%s*(%d+)%s*$")
-    if not id or #id < 5 then return nil end
+    if id and #id < 5 then id = nil end
     local on = ({ mythic = Webhook.pingMythic, bag = Webhook.pingBagFull, disconnect = Webhook.pingDisconnect, losses = Webhook.pingLosses })[kind]
     if on == false then return nil end
     local now = os.clock()
     if Webhook.lastPing[kind] and now - Webhook.lastPing[kind] < 120 then return nil end
     Webhook.lastPing[kind] = now
-    return id
+    return id or "here"
 end
 local function withPing(payload, kinds)
     for _, kind in ipairs(kinds or {}) do
         local id = Webhook.PingFor(kind)
-        if id then
+        if id == "here" then
+            payload.content = "@here"
+            payload.allowed_mentions = { parse = { "everyone" } }
+            return payload
+        elseif id then
             payload.content = "<@" .. id .. ">"
             payload.allowed_mentions = { parse = {}, users = { id } }
             return payload
@@ -5875,7 +6112,7 @@ function Webhook.SendReport(kind, pings)
     return httpPost(Webhook.url, HttpService:JSONEncode(withPing(payload, pings)))
 end
 
--- A short alert embed (Mythic drop, bag full, disconnect) with the ping when one is set.
+-- A short alert embed (Mythic drop, bag full, disconnect) with the ping.
 function Webhook.Alert(kind, title, text, color)
     if #Webhook.url < 10 then return false end
     local payload = { username = "moseeri hub", embeds = { {
@@ -5950,21 +6187,23 @@ end)
 -- Snapshot when a game starts, report when its result screen shows (once per game).
 task.spawn(function()
     local wasStarted, wasResults = false, false
-    local unitsBefore
+    local unitsBefore, reported
     while not State.unloaded do
         task.wait(1)
         local data = workspace:FindFirstChild("_DATA")
         local started = data and data:FindFirstChild("GameStarted")
         local isStarted = started and started.Value == true
         if isStarted and not wasStarted then
+            reported = false
             startSnap, gameWave = playerSnapshot(), 0
             firstSnap = firstSnap or startSnap
-            unitsBefore = Webhook.OwnedUnits()
+            unitsBefore = #Webhook.url >= 10 and Webhook.OwnedUnits() or nil
         end
         if isStarted then gameWave = math.max(gameWave, waveNow()) end
         wasStarted = isStarted
         local results = isResultsShowing()
-        if results and not wasResults and startSnap then
+        if results and not wasResults and startSnap and not reported then
+            reported = true -- (the result screen going away and back is the same game)
             local win = resultIsVictory()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
@@ -5985,7 +6224,7 @@ task.spawn(function()
             elseif bagTurnedFull and Webhook.pingBagFull ~= false then
                 Webhook.Alert("bag", "⛔ Bag full", "Your bag is full: new drops are lost until you make room.", 15548997)
             end
-            if Webhook.pingMythic ~= false then
+            if Webhook.pingMythic ~= false and unitsBefore then
                 local okR, drops = pcall(Webhook.RareDrops, unitsBefore)
                 if okR and #drops > 0 then
                     Webhook.Alert("mythic", "🌟 " .. drops[1], table.concat(drops, "\n"), 16766720)
@@ -6097,7 +6336,10 @@ end
 -- The run as the game holds it: the getgc table with a depth and room choices (or a shop).
 function DungeonRun.Read()
     local best, bestScore
-    if type(getgc) == "function" then
+    -- the table found last time is read again while it still looks like the run
+    local last = DungeonRun.runTable
+    if last and DungeonRun.score(last) >= 2 then best = last end
+    if not best and type(getgc) == "function" then
         pcall(function()
             for _, t in ipairs(getgc(true)) do
                 if type(t) == "table" then
@@ -6113,6 +6355,7 @@ function DungeonRun.Read()
             end
         end)
     end
+    DungeonRun.runTable = best
     if not best then return nil end
     local st = { table = best }
     pcall(function()
@@ -6420,6 +6663,133 @@ function ToolsModule.RefreshStats()
     ))
 end
 
+-- Performance options (Settings). They only change what is drawn: no part the placement
+-- raycasts hit is moved, destroyed or made non-queryable, and _road / _terrain / _BASES /
+-- _UNITS are never touched. Everything is pcall'd; turning an option off restores it.
+Tools.perf = { lowGraphics = false, hideEffects = false, noDecor = false, white = false, fpsCap = "Off" }
+Tools.perfSaved = { lit = {}, fx = setmetatable({}, { __mode = "k" }), decor = setmetatable({}, { __mode = "k" }) }
+Tools.fxClasses = { "ParticleEmitter", "Trail", "Beam", "Smoke", "Fire", "Sparkles" }
+function ToolsModule.HideEffect(d)
+    local saved = Tools.perfSaved.fx
+    pcall(function()
+        for _, cls in ipairs(Tools.fxClasses) do
+            if d:IsA(cls) then
+                if d.Enabled then saved[d] = true; d.Enabled = false end
+                return
+            end
+        end
+        if d:IsA("BillboardGui") then
+            -- damage numbers: a billboard whose text is just a number ("1,250", "3.4K")
+            task.delay(0, function()
+                pcall(function()
+                    local name = string.lower(d.Name)
+                    local numeric = name:find("damage", 1, true) or name:find("dmg", 1, true) or name:find("indicator", 1, true)
+                    for _, l in ipairs(d:GetDescendants()) do
+                        if l:IsA("TextLabel") and tostring(l.Text):match("^%s*%-?[%d,%.]+[kKmMbB]?%s*$") then numeric = true end
+                    end
+                    if numeric and d.Enabled and Tools.perf.hideEffects then saved[d] = true; d.Enabled = false end
+                end)
+            end)
+        end
+    end)
+end
+function ToolsModule.SetPerf(key, value)
+    local P, S = Tools.perf, Tools.perfSaved
+    P[key] = value
+    local on = value == true
+    if key == "lowGraphics" then
+        local lit = S.lit
+        pcall(function()
+            local rendering = settings().Rendering
+            if on then
+                if lit.quality == nil then lit.quality = rendering.QualityLevel end
+                rendering.QualityLevel = Enum.QualityLevel.Level01
+            elseif lit.quality ~= nil then
+                rendering.QualityLevel = lit.quality; lit.quality = nil
+            end
+        end)
+        pcall(function()
+            local L = game:GetService("Lighting")
+            if on then
+                if lit.shadows == nil then lit.shadows, lit.fogEnd = L.GlobalShadows, L.FogEnd end
+                L.GlobalShadows, L.FogEnd = false, 1e6
+                lit.effects = lit.effects or {}
+                for _, c in ipairs(L:GetChildren()) do
+                    if c:IsA("PostEffect") and c.Enabled then c.Enabled = false; lit.effects[c] = "enabled"
+                    elseif c:IsA("Atmosphere") or c:IsA("Sky") or c:IsA("Clouds") then c.Parent = nil; lit.effects[c] = "parent" end
+                end
+            else
+                if lit.shadows ~= nil then L.GlobalShadows, L.FogEnd = lit.shadows, lit.fogEnd; lit.shadows = nil end
+                for c, how in pairs(lit.effects or {}) do
+                    pcall(function() if how == "enabled" then c.Enabled = true else c.Parent = L end end)
+                end
+                lit.effects = nil
+            end
+        end)
+    elseif key == "hideEffects" then
+        if S.fxConn then pcall(function() S.fxConn:Disconnect() end); S.fxConn = nil end
+        if on then
+            for _, d in ipairs(workspace:GetDescendants()) do ToolsModule.HideEffect(d) end
+            local ok, conn = pcall(function() return workspace.DescendantAdded:Connect(ToolsModule.HideEffect) end)
+            if ok then S.fxConn = conn end
+        else
+            for d in pairs(S.fx) do pcall(function() d.Enabled = true end) end
+            S.fx = setmetatable({}, { __mode = "k" })
+        end
+    elseif key == "noDecor" then
+        local map = workspace:FindFirstChild("_map")
+        if on and map then
+            local KEEP = { _road = true, _terrain = true, _BASES = true, _UNITS = true }
+            for _, d in ipairs(map:GetDescendants()) do
+                pcall(function()
+                    if not d:IsA("BasePart") then return end
+                    local node = d
+                    while node and node ~= map do
+                        local n = string.lower(node.Name)
+                        if KEEP[node.Name] or n:find("road", 1, true) or n:find("path", 1, true) or n:find("ground", 1, true)
+                            or n:find("floor", 1, true) or n:find("terrain", 1, true) or n:find("base", 1, true) then return end
+                        node = node.Parent
+                    end
+                    if S.decor[d] == nil then S.decor[d] = d.LocalTransparencyModifier end
+                    d.LocalTransparencyModifier = 1
+                end)
+            end
+        elseif not on then
+            for d, old in pairs(S.decor) do pcall(function() d.LocalTransparencyModifier = old end) end
+            S.decor = setmetatable({}, { __mode = "k" })
+        end
+    elseif key == "white" then
+        pcall(function() RunService:Set3dRenderingEnabled(not on) end)
+        if S.whiteGui then pcall(function() S.whiteGui:Destroy() end); S.whiteGui = nil end
+        if on then
+            pcall(function()
+                local holder = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+                local g = Instance.new("ScreenGui")
+                g.Name = "MoseeriPowerSave"
+                g.IgnoreGuiInset, g.DisplayOrder = true, -1
+                local l = Instance.new("TextLabel")
+                l.Size, l.BackgroundColor3, l.TextColor3 = UDim2.new(1, 0, 1, 0), Color3.fromRGB(245, 245, 245), Color3.fromRGB(60, 60, 60)
+                l.TextSize, l.Text = 22, "moseeri hub: 3D off to save power — LeftControl to open menu"
+                l.Parent = g
+                g.Parent = holder
+                S.whiteGui = g
+            end)
+        end
+    elseif key == "fpsCap" then
+        local n = tonumber(value)
+        if type(setfpscap) == "function" and (n or S.capSet) then
+            pcall(setfpscap, n or 0)
+            S.capSet = n ~= nil
+        end
+    end
+end
+function ToolsModule.PerfOff()
+    for _, k in ipairs({ "lowGraphics", "hideEffects", "noDecor", "white" }) do
+        if Tools.perf[k] then local keep = Tools.perf[k]; ToolsModule.SetPerf(k, false); Tools.perf[k] = keep end
+    end
+    if Tools.perf.fpsCap ~= "Off" then local keep = Tools.perf.fpsCap; ToolsModule.SetPerf("fpsCap", "Off"); Tools.perf.fpsCap = keep end
+end
+
 --------------------------------------------------------------------------------
 -- UI
 --------------------------------------------------------------------------------
@@ -6456,12 +6826,17 @@ watchCamera()
 table.insert(State.connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchCamera))
 
 local tabGroup = Window:TabGroup()
--- Menu order: Home, Lobby, Dungeon, Event, Macro, Advanced, Settings (made here, filled below)
+-- Menu order: Home, Lobby, Dungeon, Event, Macro, Settings (made here, filled below)
 UIRef.tabs = {}
 for _, t in ipairs({ { "home", "Home" }, { "lobby", "Lobby" }, { "dungeon", "Dungeon" }, { "event", "Event" },
-    { "macro", "Macro" }, { "advanced", "Advanced" }, { "settings", "Settings" } }) do
+    { "macro", "Macro" }, { "settings", "Settings" } }) do
     UIRef.tabs[t[1]] = tabGroup:Tab({ Name = t[2], Image = "rbxassetid://10734950309" })
 end
+-- Home: "Play" (left), "More" (right)
+UIRef.play = UIRef.tabs.home:Section({ Side = "Left" })
+UIRef.more = UIRef.tabs.home:Section({ Side = "Right" })
+UIRef.play:Header({ Text = "Play" })
+UIRef.more:Header({ Text = "More" })
 -- Each tab is built inside its own do-block: Lua 5.1 allows only 200 active locals per
 -- function, and the section variables are not needed once a tab is built.
 local macroTab, refreshProfileUI
@@ -6471,7 +6846,7 @@ do
 macroTab = UIRef.tabs.macro
 
 local controlSection = macroTab:Section({ Side = "Left" })
-local fileSection = macroTab:Section({ Side = "Right" })
+local fileSection = macroTab:Section({ Side = "Left" })
 
 controlSection:Header({ Text = "Record & Play" })
 UIRef.statusParagraph = controlSection:Paragraph({ Header = "Status", Body = "" })
@@ -6500,14 +6875,13 @@ UIRef.playToggle = controlSection:Toggle({
     end,
 }, "PlayToggle")
 Controls.autoPlay = controlSection:Toggle({
-    Name = "Wait for wave start (auto play)",
+    Name = "Wait for wave start",
     Default = State.autoPlay,
     Callback = function(on) State.autoPlay = on; saveConfig() end,
 }, "AutoPlay")
 
-fileSection:Header({ Text = "Macro file" })
-UIRef.savedDropdown = fileSection:Dropdown({
-    Name = "Saved",
+UIRef.savedDropdown = controlSection:Dropdown({
+    Name = "Saved macros",
     Multi = false,
     Required = false,
     Options = {},
@@ -6516,8 +6890,8 @@ UIRef.savedDropdown = fileSection:Dropdown({
         ProfilesModule.Load(selected)
     end,
 }, "SavedMacros")
-UIRef.nameInput = fileSection:Input({
-    Name = "Name",
+UIRef.nameInput = controlSection:Input({
+    Name = "Macro name",
     Placeholder = "auto from stage",
     AcceptedCharacters = "All",
     Callback = function(text)
@@ -6527,8 +6901,58 @@ UIRef.nameInput = fileSection:Input({
         end
     end,
 }, "MacroName")
-fileSection:Button({ Name = "Save", Callback = ProfilesModule.Save })
-fileSection:Button({ Name = "Delete", Callback = ProfilesModule.DeleteCurrent })
+controlSection:Button({ Name = "Save", Callback = ProfilesModule.Save })
+controlSection:Button({ Name = "Delete", Callback = ProfilesModule.DeleteCurrent })
+Controls.speedMultiplier = controlSection:Slider({
+    Name = "Timed actions speed",
+    Minimum = 0.5,
+    Maximum = 5,
+    Default = AutoFarm.speedMultiplier,
+    Precision = 1,
+    Callback = function(v) AutoFarm.speedMultiplier = v; refreshAutoStatus(); saveConfig() end,
+}, "SpeedMul")
+Controls.leaveAtWave = controlSection:Slider({
+    Name = "Leave at wave",
+    Minimum = 0,
+    Maximum = 50,
+    Default = AutoFarm.leaveAtWave,
+    Callback = function(v) AutoFarm.leaveAtWave = v; refreshAutoStatus(); saveConfig() end,
+}, "LeaveWave")
+UIRef.autoSellToggle = controlSection:Toggle({
+    Name = "Sell unit at wave",
+    Default = AutoFarm.autoSell,
+    Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoSell")
+Controls.sellAtWave = controlSection:Slider({
+    Name = "Sell at wave",
+    Minimum = 0,
+    Maximum = 50,
+    Default = AutoFarm.sellAtWave,
+    Callback = function(v) AutoFarm.sellAtWave = v; refreshAutoStatus(); saveConfig() end,
+}, "SellWave")
+Controls.sellUnitName = controlSection:Input({
+    Name = "Unit to sell",
+    Placeholder = "e.g. Farmer",
+    Default = AutoFarm.sellUnitName,
+    AcceptedCharacters = "All",
+    Callback = function(text) AutoFarm.sellUnitName = text or ""; saveConfig() end,
+}, "SellUnitName")
+Controls.retryPlacements = controlSection:Toggle({
+    Name = "Place as soon as money allows",
+    Default = State.retryPlacements,
+    Callback = function(on) State.retryPlacements = on; saveConfig() end,
+}, "RetryPlacements")
+Controls.showAllMacros = controlSection:Toggle({
+    Name = "Show all stages",
+    Default = State.showAllMacros,
+    Callback = function(on)
+        State.showAllMacros = on
+        refreshSavedList(cleanName(State.macroName))
+        saveConfig()
+    end,
+}, "ShowAllMacros")
+
+fileSection:Header({ Text = "Import / export" })
 fileSection:Button({ Name = "Export", Callback = ProfilesModule.Export })
 fileSection:Button({ Name = "Import folder", Callback = ProfilesModule.ImportFolder })
 UIRef.pasteInput = fileSection:Input({
@@ -6540,228 +6964,73 @@ UIRef.pasteInput = fileSection:Input({
 
 end
 
--- Advanced tab: stage automation (was the Auto Farm tab)
+-- TAB: Home - one AUTO switch for the whole farming set, the mode, and one status line
 do
-local autoTab = UIRef.tabs.advanced
-AutoPlaceModule.farmTab = autoTab -- Auto Place sections are added to this tab further down
-
-local autoReplaySection = autoTab:Section({ Side = "Left" })
-local autoExtraSection = autoTab:Section({ Side = "Right" })
-
-autoReplaySection:Header({ Text = "Stage automation" })
-UIRef.autoStatusParagraph = autoReplaySection:Paragraph({ Header = "Status", Body = "All off" })
-
-UIRef.autoReplayToggle = autoReplaySection:Toggle({
-    Name = "Auto replay (same stage)",
-    Default = AutoFarm.autoReplay,
-    Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoReplay")
-UIRef.autoNextToggle = autoReplaySection:Toggle({
-    Name = "Auto next stage (on victory)",
-    Default = AutoFarm.autoNextStage,
-    Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoNext")
-UIRef.autoLeaveToggle = autoReplaySection:Toggle({
-    Name = "Auto leave (when you lose)",
-    Default = AutoFarm.autoLeave,
-    Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoLeave")
-Controls.autoStart = autoReplaySection:Toggle({
-    Name = "Auto vote start",
-    Default = AutoFarm.autoStart,
-    Callback = function(on) AutoFarm.autoStart = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoStart")
-Controls.autoSkip = autoReplaySection:Toggle({
-    Name = "Auto skip waves",
-    Default = AutoFarm.autoSkip,
-    Callback = function(on) AutoFarm.autoSkip = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoSkip")
-
-autoExtraSection:Header({ Text = "Wave controls" })
-Controls.leaveAtWave = autoExtraSection:Slider({
-    Name = "Leave at wave (0 = off)",
-    Minimum = 0,
-    Maximum = 50,
-    Default = AutoFarm.leaveAtWave,
-    Callback = function(v) AutoFarm.leaveAtWave = v; refreshAutoStatus(); saveConfig() end,
-}, "LeaveWave")
-UIRef.autoSellToggle = autoExtraSection:Toggle({
-    Name = "Auto sell unit at wave",
-    Default = AutoFarm.autoSell,
-    Callback = function(on) AutoFarm.autoSell = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoSell")
-Controls.sellAtWave = autoExtraSection:Slider({
-    Name = "Sell at wave (0 = off)",
-    Minimum = 0,
-    Maximum = 50,
-    Default = AutoFarm.sellAtWave,
-    Callback = function(v) AutoFarm.sellAtWave = v; refreshAutoStatus(); saveConfig() end,
-}, "SellWave")
-Controls.sellUnitName = autoExtraSection:Input({
-    Name = "Unit name to sell",
-    Placeholder = "e.g. Farmer",
-    Default = AutoFarm.sellUnitName,
-    AcceptedCharacters = "All",
-    Callback = function(text) AutoFarm.sellUnitName = text or ""; saveConfig() end,
-}, "SellUnitName")
-
-autoExtraSection:Header({ Text = "Playback" })
-Controls.speedMultiplier = autoExtraSection:Slider({
-    Name = "Speed multiplier",
-    Minimum = 0.5,
-    Maximum = 5,
-    Default = AutoFarm.speedMultiplier,
-    Precision = 1,
-    Callback = function(v) AutoFarm.speedMultiplier = v; refreshAutoStatus(); saveConfig() end,
-}, "SpeedMul")
-
-end
-
--- Advanced tab: unit abilities and buff rotation (was the Units tab)
-do
-local unitsTab = UIRef.tabs.advanced
-
-local abilitySection = unitsTab:Section({ Side = "Left" })
-
--- (check interval, buff gap, buff length and min units keep their saved / default values;
--- they are no longer on screen)
-abilitySection:Header({ Text = "Buffs and abilities" })
-UIRef.autoBuffToggle = abilitySection:Toggle({
-    Name = "Auto use buffs",
-    Default = false,
-    Callback = function(on)
-        UnitAI.autoBuff = on
-        if on then UnitAIModule.StartBuff() else UnitAIModule.StopBuff() end
-        refreshUnitStatus(); saveConfig()
-    end,
-}, "AutoBuff")
-UIRef.autoAbilitiesToggle = abilitySection:Toggle({
-    Name = "Auto use unit abilities",
-    Default = false,
-    Callback = function(on)
-        UnitAI.autoAbilities = on
-        if on then UnitAIModule.StartAbilities() else UnitAIModule.StopAbilities() end
-        refreshUnitStatus(); saveConfig()
-    end,
-}, "AutoAbilities")
-UIRef.unitStatusParagraph = abilitySection:Paragraph({ Header = "Status", Body = "Buffs off · abilities off" })
-AutoPlaceModule.buffTroubleshoot = function(section)
-    section:Header({ Text = "Troubleshooting" })
-    local learnedParagraph = section:Paragraph({ Header = "Learned", Body = "" })
-    UnitAIModule.refreshLearnedUI = function()
-        local kinds = {}
-        for kind, e in pairs(UnitAI.learned) do table.insert(kinds, kind .. " (" .. e.name .. ")") end
-        table.sort(kinds)
-        pcall(function() learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, ", ") or "nothing learned (uses use_active_attack)") end)
-    end
-    UnitAIModule.refreshLearnedUI()
-    section:Button({ Name = "Learn buff (then click the skill)", Callback = UnitAIModule.StartLearn })
-    section:Button({ Name = "Forget learned buffs", Callback = UnitAIModule.ForgetLearned })
-    section:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport })
-end
-
-end
-
--- Auto Place: sections on the Auto Farm tab (below the stage automation ones)
-do
-local placeTab = AutoPlaceModule.farmTab
--- left: what is used every game; right: options, then how many of each slot
-local placeMain = placeTab:Section({ Side = "Left" })
-local placeOptions = placeTab:Section({ Side = "Right" })
-
-placeMain:Header({ Text = "Auto Place" })
-local placeStatus = placeMain:Paragraph({ Header = "Status", Body = "Off" })
-AutoPlaceModule.refreshUI = function()
-    pcall(function() placeStatus:UpdateBody(AutoPlaceModule.StatusText()) end)
-end
-Controls.autoPlace = placeMain:Toggle({
-    Name = "Auto place units",
-    Default = false,
-    Callback = function(on)
-        AutoPlace.enabled = on
-        if on then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
-        AutoPlaceModule.refreshUI(); saveConfig()
-    end,
-}, "AutoPlace")
-placeMain:Divider()
--- One click sets every Auto Place / wave option for a way of playing.
-local PRESETS = {
-    ["Fast farm"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
-    ["Safe"] = { placeMode = "Safe", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = false },
-}
-AutoPlaceModule.PRESETS = PRESETS
-function AutoPlaceModule.ApplyPreset(name)
-    local p = PRESETS[name]
-    AutoPlace.preset = name
-    if p then
-        AutoPlace.placeMode, AutoPlace.upgrade = p.placeMode, p.upgrade
-        AutoPlace.sellFarmsLast, AutoPlace.smartFreeze = p.sellFarmsLast, p.smartFreeze
-        AutoFarm.autoStart, AutoFarm.autoSkip = p.autoStart, p.autoSkip
-        for c, v in pairs({ [Controls.autoPlaceUpgrade] = p.upgrade, [Controls.sellFarmsLast] = p.sellFarmsLast,
-            [Controls.smartFreeze] = p.smartFreeze, [Controls.autoStart] = p.autoStart, [Controls.autoSkip] = p.autoSkip }) do
-            pcall(function() setToggle(c, v) end)
+local home = UIRef.play
+-- AUTO on: Auto Place + Auto upgrade + buff rotation + unit skills + smart time stop + auto
+-- target + sell farms at the end + vote start + skip waves (per mode). The switches as they
+-- were before AUTO went on are kept (AutoPlace.homeKeep, saved in config) and come back when
+-- AUTO goes off.
+local KEEP = { { AutoPlace, "enabled" }, { AutoPlace, "upgrade" }, { AutoPlace, "smartFreeze" }, { AutoPlace, "autoTarget" },
+    { AutoPlace, "sellFarmsLast" }, { AutoFarm, "autoStart" }, { AutoFarm, "autoSkip" }, { AutoFarm, "autoReplay" },
+    { AutoFarm, "autoNextStage" }, { AutoFarm, "autoLeave" }, { UnitAI, "autoBuff" }, { UnitAI, "autoAbilities" } }
+function AutoPlaceModule.HomeAuto(on)
+    local mode = AutoPlace.preset == "Safe" and "Safe" or "Fast farm"
+    local p = AutoPlaceModule.PRESETS[mode] or {}
+    if on then
+        if not AutoPlace.homeKeep then
+            AutoPlace.homeKeep = {}
+            for _, k in ipairs(KEEP) do AutoPlace.homeKeep[k[2]] = k[1][k[2]] == true end
         end
-        pcall(function() Controls.placeMode:UpdateSelection(p.placeMode) end)
-        pcall(function() if Controls.homeMode then Controls.homeMode:UpdateSelection(name) end end)
-        pcall(refreshAutoStatus)
-        notify("Preset " .. name .. ": " .. p.placeMode .. " placement, skip waves " .. (p.autoSkip and "on" or "off"))
+        AutoPlace.upgrade, AutoPlace.smartFreeze, AutoPlace.autoTarget, AutoPlace.sellFarmsLast = true, true, true, true
+        AutoFarm.autoStart, AutoFarm.autoSkip = true, p.autoSkip == true
+        UnitAI.autoBuff, UnitAI.autoAbilities = true, true
+        UnitAIModule.StartBuff()
+        UnitAIModule.StartAbilities()
+        AutoPlaceModule.SetPlacing(true)
+    else
+        local keep = AutoPlace.homeKeep
+        AutoPlace.homeKeep = nil
+        for _, k in ipairs(KEEP) do k[1][k[2]] = keep and keep[k[2]] == true or false end
+        if UnitAI.autoBuff then UnitAIModule.StartBuff() else UnitAIModule.StopBuff() end
+        if UnitAI.autoAbilities then UnitAIModule.StartAbilities() else UnitAIModule.StopAbilities() end
+        AutoPlaceModule.SetPlacing(AutoPlace.enabled)
     end
+    -- the switches still on screen show the same state (their callbacks only repeat it)
+    local wasReady = configReady
+    configReady = false
+    for _, cv in ipairs({ { Controls.autoStart, AutoFarm.autoStart }, { Controls.autoSkip, AutoFarm.autoSkip },
+        { UIRef.autoReplayToggle, AutoFarm.autoReplay }, { UIRef.autoNextToggle, AutoFarm.autoNextStage },
+        { UIRef.autoLeaveToggle, AutoFarm.autoLeave } }) do
+        if cv[1] then pcall(function() setToggle(cv[1], cv[2]) end) end
+    end
+    configReady = wasReady
+    pcall(refreshAutoStatus)
+    pcall(refreshUnitStatus)
     saveConfig()
+    notify(on and ("AUTO on (" .. mode .. ")") or "AUTO off: your own switches are back")
 end
-Controls.preset = placeMain:Dropdown({
-    Name = "Preset",
-    Multi = false,
-    Required = true,
-    Options = { "Custom", "Fast farm", "Safe" },
-    Default = AutoPlace.preset,
-    Callback = function(v)
-        if type(v) ~= "string" or v == AutoPlace.preset then return end
-        AutoPlaceModule.ApplyPreset(v)
+Controls.homeAuto = home:Toggle({
+    Name = "AUTO",
+    Default = false,
+    Callback = function(on)
+        if syncing or not configReady then return end
+        AutoPlaceModule.HomeAuto(on)
     end,
-}, "AutoPlacePreset")
-Controls.autoTarget = placeMain:Toggle({
-    Name = "Auto target (First / Strongest)",
-    Default = AutoPlace.autoTarget,
-    Callback = function(on) AutoPlace.autoTarget = on; saveConfig() end,
-}, "AutoPlaceTarget")
-
-placeOptions:Header({ Text = "Options" })
-Controls.autoPlaceUpgrade = placeOptions:Toggle({
-    Name = "Auto upgrade",
-    Default = AutoPlace.upgrade,
-    Callback = function(on) AutoPlace.upgrade = on; saveConfig() end,
-}, "AutoPlaceUpgrade")
-Controls.placeMode = placeOptions:Dropdown({
-    Name = "Where to put damage units",
-    Multi = false,
-    Required = true,
-    Options = { "Balanced", "Fast clear", "Safe" },
-    Default = AutoPlace.placeMode,
-    Callback = function(v)
-        if type(v) ~= "string" then return end
-        AutoPlace.placeMode = v
-        saveConfig()
+}, "HomeAuto")
+-- the player places the units; AUTO still upgrades them, buffs, uses skills, freezes, targets
+Controls.placeMyself = home:Toggle({
+    Name = "Place units myself",
+    Default = AutoPlace.manual == true,
+    Callback = function(on)
+        AutoPlace.manual = on
+        saveConfig(); pcall(AutoPlaceModule.refreshUI)
     end,
-}, "AutoPlaceMode")
-Controls.smartFreeze = placeOptions:Toggle({
-    Name = "Time stop / freeze skills at the best moment",
-    Default = AutoPlace.smartFreeze,
-    Callback = function(on) AutoPlace.smartFreeze = on; saveConfig() end,
-}, "AutoPlaceFreeze")
-Controls.sellFarmsLast = placeOptions:Toggle({
-    Name = "Sell farm units on the last wave",
-    Default = AutoPlace.sellFarmsLast,
-    Callback = function(on) AutoPlace.sellFarmsLast = on; saveConfig() end,
-}, "AutoPlaceSellFarms")
-Controls.showDetails = placeOptions:Toggle({
-    Name = "Show full status",
-    Default = AutoPlace.showDetails,
-    Callback = function(on) AutoPlace.showDetails = on; saveConfig(); AutoPlaceModule.refreshUI() end,
-}, "AutoPlaceDetails")
+}, "PlaceMyself")
 
--- "Don't place": the team's units by name; a picked unit's slot gets 0 (never placed), the
--- others 8 (up to the game limit). Saved as AutoPlace.slots like the old per-slot sliders,
--- so a saved 0 shows as picked. The names follow the team each time it is read.
+-- "Skip these units": team units by name that are never placed (AutoPlace.skip, saved by
+-- name so it follows the unit when the team order changes). Old configs kept a 0 per slot:
+-- AutoPlaceModule.MigrateSkip turns those into names once the slot's unit is known.
 function AutoPlaceModule.TeamNames()
     local names, bySlot = {}, {}
     for s = 1, 6 do
@@ -6774,10 +7043,31 @@ function AutoPlaceModule.TeamNames()
     end
     return names, bySlot
 end
+function AutoPlaceModule.MigrateSkip()
+    local _, bySlot = AutoPlaceModule.TeamNames()
+    local changed = false
+    for s = 1, 6 do
+        if (tonumber(AutoPlace.slots[s]) or 8) <= 0 and bySlot[s] then
+            AutoPlace.skip[bySlot[s]] = true
+            AutoPlace.slots[s] = 8
+            changed = true
+        end
+    end
+    if changed then saveConfig() end
+end
+-- how many of slot s (unit t) to place: 0 when skipped, else the slot's number (8 = up to the limit)
+function AutoPlaceModule.SlotTarget(s, t)
+    if t and AutoPlace.skip[tostring(t.name)] then return 0 end
+    return tonumber(AutoPlace.slots[s]) or 8
+end
 function AutoPlaceModule.refreshSkipUI()
     if not Controls.dontPlace then return end
-    local names, bySlot = AutoPlaceModule.TeamNames()
+    local names = AutoPlaceModule.TeamNames()
     local picked = {}
+    for _, name in ipairs(names) do
+        if AutoPlace.skip[name] then picked[name] = true end
+    end
+    local _, bySlot = AutoPlaceModule.TeamNames()
     for s, name in pairs(bySlot) do
         if (tonumber(AutoPlace.slots[s]) or 8) <= 0 then picked[name] = true end
     end
@@ -6794,8 +7084,8 @@ function AutoPlaceModule.refreshSkipUI()
     end)
     syncing = was
 end
-Controls.dontPlace = placeOptions:Dropdown({
-    Name = "Don't place",
+Controls.dontPlace = home:Dropdown({
+    Name = "Skip these units",
     Multi = true,
     Required = false,
     Options = (AutoPlaceModule.TeamNames()),
@@ -6807,70 +7097,12 @@ Controls.dontPlace = placeOptions:Dropdown({
         for k, v in pairs(type(value) == "table" and value or {}) do
             if v == true then picked[tostring(k)] = true elseif type(v) == "string" then picked[v] = true end
         end
-        local _, bySlot = AutoPlaceModule.TeamNames()
-        for s = 1, 6 do
-            if bySlot[s] then AutoPlace.slots[s] = picked[bySlot[s]] and 0 or 8 end
-        end
+        AutoPlace.skip = picked
+        -- (a slot left at 0 by an old config is now a name above)
+        for s = 1, 6 do if (tonumber(AutoPlace.slots[s]) or 8) <= 0 then AutoPlace.slots[s] = 8 end end
         saveConfig()
     end,
 }, "AutoPlaceDontPlace")
-end
-
--- Advanced tab, last: buff troubleshooting (learn a buff skill, buff report)
-AutoPlaceModule.buffTroubleshoot(UIRef.tabs.advanced:Section({ Side = "Left" }))
-
--- TAB: Home - one AUTO switch for the whole farming set, the mode, and one status line
-do
-local home = UIRef.tabs.home:Section({ Side = "Left" })
-home:Header({ Text = "Auto farm" })
--- AUTO on: Auto Place + Auto upgrade + buff rotation + unit abilities + smart time stop +
--- auto target + auto vote start + auto skip (per mode); Auto replay / next stage come back
--- as they were when AUTO was last turned off. AUTO off: all of them stop.
-function AutoPlaceModule.HomeAuto(on)
-    local mode = AutoPlace.preset == "Safe" and "Safe" or "Fast farm"
-    local p = AutoPlaceModule.PRESETS[mode] or {}
-    if on then
-        AutoPlace.upgrade, AutoPlace.smartFreeze, AutoPlace.autoTarget = true, true, true
-        AutoFarm.autoStart, AutoFarm.autoSkip = true, p.autoSkip == true
-        local keep = AutoPlaceModule.homeKeep
-        if keep then AutoFarm.autoReplay, AutoFarm.autoNextStage = keep.replay, keep.next end
-        UnitAI.autoBuff, UnitAI.autoAbilities, AutoPlace.enabled = true, true, true
-        UnitAIModule.StartBuff()
-        UnitAIModule.StartAbilities()
-        AutoPlaceModule.Start()
-    else
-        AutoPlaceModule.homeKeep = { replay = AutoFarm.autoReplay, next = AutoFarm.autoNextStage }
-        AutoFarm.autoReplay, AutoFarm.autoNextStage = false, false
-        AutoFarm.autoStart, AutoFarm.autoSkip = false, false
-        UnitAI.autoBuff, UnitAI.autoAbilities = false, false
-        UnitAIModule.StopBuff()
-        UnitAIModule.StopAbilities()
-        AutoPlaceModule.Stop()
-    end
-    -- the other tabs' switches show the same state (their callbacks only repeat it)
-    local wasReady = configReady
-    configReady = false
-    for c, v in pairs({ [Controls.autoPlace] = AutoPlace.enabled, [Controls.autoPlaceUpgrade] = AutoPlace.upgrade,
-        [Controls.smartFreeze] = AutoPlace.smartFreeze, [Controls.autoTarget] = AutoPlace.autoTarget,
-        [Controls.autoStart] = AutoFarm.autoStart, [Controls.autoSkip] = AutoFarm.autoSkip,
-        [UIRef.autoReplayToggle] = AutoFarm.autoReplay, [UIRef.autoNextToggle] = AutoFarm.autoNextStage,
-        [UIRef.autoBuffToggle] = UnitAI.autoBuff, [UIRef.autoAbilitiesToggle] = UnitAI.autoAbilities }) do
-        pcall(function() setToggle(c, v) end)
-    end
-    configReady = wasReady
-    pcall(refreshAutoStatus)
-    pcall(refreshUnitStatus)
-    saveConfig()
-    notify(on and ("AUTO on (" .. mode .. ")") or "AUTO off: farming stopped")
-end
-Controls.homeAuto = home:Toggle({
-    Name = "AUTO",
-    Default = false,
-    Callback = function(on)
-        if syncing or not configReady then return end
-        AutoPlaceModule.HomeAuto(on)
-    end,
-}, "HomeAuto")
 Controls.homeMode = home:Dropdown({
     Name = "Mode",
     Multi = false,
@@ -6883,6 +7115,31 @@ Controls.homeMode = home:Dropdown({
     end,
 }, "HomeMode")
 UIRef.homeStatus = home:Paragraph({ Header = "Now", Body = "Waiting for a game" })
+UIRef.autoReplayToggle = home:Toggle({
+    Name = "Auto replay",
+    Default = AutoFarm.autoReplay,
+    Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoReplay")
+UIRef.autoNextToggle = home:Toggle({
+    Name = "Auto next stage",
+    Default = AutoFarm.autoNextStage,
+    Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoNext")
+UIRef.autoLeaveToggle = home:Toggle({
+    Name = "Auto leave on loss",
+    Default = AutoFarm.autoLeave,
+    Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoLeave")
+Controls.autoStart = home:Toggle({
+    Name = "Vote start",
+    Default = AutoFarm.autoStart,
+    Callback = function(on) AutoFarm.autoStart = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoStart")
+Controls.autoSkip = home:Toggle({
+    Name = "Skip waves",
+    Default = AutoFarm.autoSkip,
+    Callback = function(on) AutoFarm.autoSkip = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoSkip")
 function AutoPlaceModule.StageLine()
     local stage = Stage.Pretty()
     if not stage then return "Lobby" end
@@ -6898,6 +7155,69 @@ AutoPlaceModule.refreshHome = function()
     pcall(function() UIRef.homeStatus:UpdateBody(AutoPlaceModule.HomeLine()) end)
 end
 end
+
+-- Auto Place: presets (Mode on Home) and Home > More (full status). Auto upgrade, damage
+-- unit spots, smart freeze, sell farms at the end and auto target have no switch of their
+-- own: AUTO turns them on and Mode picks the spots (Fast farm = Fast clear, Safe = Safe).
+do
+-- the Auto Place loop on / off (AUTO on Home drives it; "Place units myself" only stops
+-- new units from being placed - upgrades, freeze and targeting go on)
+function AutoPlaceModule.SetPlacing(on)
+    AutoPlace.enabled = on
+    if on then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
+    pcall(AutoPlaceModule.refreshUI); saveConfig()
+end
+-- One click sets every Auto Place / wave option for a way of playing.
+local PRESETS = {
+    ["Fast farm"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
+    ["Safe"] = { placeMode = "Safe", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = false },
+}
+AutoPlaceModule.PRESETS = PRESETS
+function AutoPlaceModule.ApplyPreset(name)
+    local p = PRESETS[name]
+    AutoPlace.preset = name
+    if p then
+        AutoPlace.placeMode, AutoPlace.upgrade = p.placeMode, p.upgrade
+        AutoPlace.sellFarmsLast, AutoPlace.smartFreeze = p.sellFarmsLast, p.smartFreeze
+        AutoFarm.autoStart, AutoFarm.autoSkip = p.autoStart, p.autoSkip
+        for _, cv in ipairs({ { Controls.autoStart, p.autoStart }, { Controls.autoSkip, p.autoSkip } }) do
+            if cv[1] then pcall(function() setToggle(cv[1], cv[2]) end) end
+        end
+        pcall(function() if Controls.homeMode then Controls.homeMode:UpdateSelection(name) end end)
+        pcall(refreshAutoStatus)
+        notify("Mode " .. name .. ": " .. p.placeMode .. " placement, skip waves " .. (p.autoSkip and "on" or "off"))
+    end
+    saveConfig()
+end
+Controls.showDetails = UIRef.more:Toggle({
+    Name = "Show full status",
+    Default = AutoPlace.showDetails,
+    Callback = function(on) AutoPlace.showDetails = on; saveConfig(); pcall(AutoPlaceModule.refreshUI) end,
+}, "AutoPlaceDetails")
+local placeStatus = UIRef.more:Paragraph({ Header = "Placing", Body = "Off" })
+AutoPlaceModule.refreshUI = function()
+    pcall(function() placeStatus:UpdateBody(AutoPlaceModule.StatusText()) end)
+end
+end
+
+-- Home > More: buff troubleshooting (buff rotation and unit skills have no switch of their
+-- own: AUTO turns them on; check interval, buff gap, buff length and min units keep their
+-- saved / default values)
+do
+local section = UIRef.more
+section:Button({ Name = "Learn buff", Callback = UnitAIModule.StartLearn })
+local learnedParagraph = section:Paragraph({ Header = "Learned", Body = "" })
+UnitAIModule.refreshLearnedUI = function()
+    local kinds = {}
+    for kind, e in pairs(UnitAI.learned) do table.insert(kinds, kind .. " (" .. e.name .. ")") end
+    table.sort(kinds)
+    pcall(function() learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, ", ") or "nothing learned (uses use_active_attack)") end)
+end
+UnitAIModule.refreshLearnedUI()
+section:Button({ Name = "Forget learned buffs", Callback = UnitAIModule.ForgetLearned })
+section:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport })
+end
+
 
 -- TAB: Lobby and Event - planned, waiting for game data
 do
@@ -6917,7 +7237,6 @@ local setSection = dungeonTab:Section({ Side = "Right" })
 
 dataSection:Header({ Text = "Dungeon data" })
 UIRef.dungeonStatus = dataSection:Paragraph({ Header = "Run", Body = DungeonRun.WAITING })
-dataSection:Button({ Name = "Refresh dungeon data", Callback = function() DungeonRun.Refresh() end })
 dataSection:Button({ Name = "Copy dungeon report", Callback = function() pcall(DungeonRun.Report) end })
 dataSection:Paragraph({ Header = "", Body = "In a run, on the room choice (and in a shop):\npress Copy dungeon report and send it.\nThe bot acts only on room / item ids it finds\nin the game's data; it never quits a run." })
 Controls.dungeonAuto = dataSection:Toggle({
@@ -6965,37 +7284,27 @@ end
 do
 local settingsTab = UIRef.tabs.settings
 
-local profileSection = settingsTab:Section({ Side = "Left" })
-local optionsSection = settingsTab:Section({ Side = "Left" })
+local generalSection = settingsTab:Section({ Side = "Left" })
 local webhookSection = settingsTab:Section({ Side = "Left" })
+local profileSection = settingsTab:Section({ Side = "Left" })
+Controls.perfSection = settingsTab:Section({ Side = "Right" })
 local toolsSection = settingsTab:Section({ Side = "Right" })
-local logSection = settingsTab:Section({ Side = "Right" })
 
-profileSection:Header({ Text = "Config profile" })
-local profileStatus = profileSection:Paragraph({ Header = "Active profile", Body = "" })
+profileSection:Header({ Text = "Profiles" })
 local profileNameText = Profile.name
 local profileDropdown
 
+-- the active profile is the dropdown's value
 refreshProfileUI = function()
-    pcall(function()
-        profileStatus:UpdateBody((Profile.name ~= "" and Profile.name or "(none)")
-            .. "\nEvery change auto-saves and is restored\nwhen you run the script again.")
-    end)
     if profileDropdown then
         pcall(function()
             profileDropdown:ClearOptions()
             profileDropdown:InsertOptions(ConfigProfiles.List())
+            if Profile.name ~= "" then profileDropdown:UpdateSelection(Profile.name) end
         end)
     end
 end
 
-Controls.profileName = profileSection:Input({
-    Name = "Profile name",
-    Placeholder = "e.g. Namak farm",
-    Default = Profile.name,
-    AcceptedCharacters = "All",
-    Callback = function(text) profileNameText = text or "" end,
-}, "ProfileName")
 profileDropdown = profileSection:Dropdown({
     Name = "Saved profiles",
     Multi = false,
@@ -7006,6 +7315,13 @@ profileDropdown = profileSection:Dropdown({
         if type(value) == "string" then profileNameText = value end
     end,
 }, "ProfileList")
+Controls.profileName = profileSection:Input({
+    Name = "Profile name",
+    Placeholder = "e.g. Namak farm",
+    Default = Profile.name,
+    AcceptedCharacters = "All",
+    Callback = function(text) profileNameText = text or "" end,
+}, "ProfileName")
 profileSection:Button({
     Name = "Save profile",
     Callback = function()
@@ -7028,22 +7344,8 @@ profileSection:Button({
     end,
 })
 
-optionsSection:Header({ Text = "Macro options" })
-Controls.retryPlacements = optionsSection:Toggle({
-    Name = "Retry placements until money spent",
-    Default = State.retryPlacements,
-    Callback = function(on) State.retryPlacements = on; saveConfig() end,
-}, "RetryPlacements")
-Controls.showAllMacros = optionsSection:Toggle({
-    Name = "Saved list: show all stages",
-    Default = State.showAllMacros,
-    Callback = function(on)
-        State.showAllMacros = on
-        refreshSavedList(cleanName(State.macroName))
-        saveConfig()
-    end,
-}, "ShowAllMacros")
-UIRef.antiAfkToggle = optionsSection:Toggle({
+generalSection:Header({ Text = "General" })
+UIRef.antiAfkToggle = generalSection:Toggle({
     Name = "Anti-AFK",
     Default = false,
     Callback = function(on)
@@ -7053,69 +7355,70 @@ UIRef.antiAfkToggle = optionsSection:Toggle({
     end,
 }, "AntiAfk")
 
-webhookSection:Header({ Text = "Discord webhook" })
+webhookSection:Header({ Text = "Discord" })
 Controls.webhookUrl = webhookSection:Input({
     Name = "Webhook URL",
     Placeholder = "https://discord.com/api/webhooks/...",
-    Default = Webhook.url,
+    Default = Webhook.Masked(),
     AcceptedCharacters = "All",
-    Callback = function(text) Webhook.url = text or ""; saveConfig() end,
+    Callback = function(text) Webhook.SetUrl(text) end,
 }, "WebhookUrl")
-Controls.notifyComplete = webhookSection:Toggle({
-    Name = "Send report when you win",
-    Default = Webhook.notifyComplete,
-    Callback = function(on) Webhook.notifyComplete = on; saveConfig() end,
-}, "WebhookComplete")
-Controls.notifyFail = webhookSection:Toggle({
-    Name = "Send report when you lose",
-    Default = Webhook.notifyFail,
-    Callback = function(on) Webhook.notifyFail = on; saveConfig() end,
-}, "WebhookFail")
-Controls.pingId = webhookSection:Input({
-    Name = "Discord user ID to ping",
-    Placeholder = "digits only, empty = no ping",
-    Default = Webhook.pingId,
-    AcceptedCharacters = "Numeric",
-    Callback = function(text) Webhook.pingId = (tostring(text or ""):gsub("%D", "")); saveConfig() end,
-}, "PingUserId")
-for _, p in ipairs({ { "pingMythic", "Ping on Mythic / Secret drop", "PingMythic" }, { "pingBagFull", "Ping when the bag is full", "PingBagFull" },
-    { "pingDisconnect", "Ping on disconnect / kick", "PingDisconnect" }, { "pingLosses", "Ping after 2 losses in a row", "PingLosses" } }) do
-    Controls[p[1]] = webhookSection:Toggle({
-        Name = p[2],
-        Default = Webhook[p[1]] ~= false,
-        Callback = function(on) Webhook[p[1]] = on; saveConfig() end,
-    }, p[3])
-end
+-- one switch for win / loss reports and the four important pings (flags kept in config)
+Controls.discordAlerts = webhookSection:Toggle({
+    Name = "Discord alerts",
+    Default = Webhook.AlertsOn(),
+    Callback = function(on)
+        if syncing then return end
+        Webhook.SetAlerts(on); saveConfig()
+    end,
+}, "DiscordAlerts")
 webhookSection:Button({
-    Name = "Send test report",
+    Name = "Send test",
     Callback = function()
         if Webhook.SendReport("test") then notify("Test report sent to Discord.")
         else notify("Could not send: check the webhook URL (and that this executor has request).") end
     end,
 })
 
--- Auto Place tools (moved here from the Auto Farm tab)
-AutoPlaceModule.toolsUI = settingsTab:Section({ Side = "Right" })
-AutoPlaceModule.toolsUI:Header({ Text = "Tools" })
-AutoPlaceModule.toolsUI:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
-AutoPlaceModule.toolsUI:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
-AutoPlaceModule.toolsUI:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
-AutoPlaceModule.toolsUI:Button({ Name = "Save unit catalog", Callback = function() pcall(AutoPlaceModule.SaveCatalog) end })
-toolsSection:Header({ Text = "Session stats" })
-UIRef.statsText = toolsSection:Paragraph({ Header = "Stats", Body = "" })
-toolsSection:Button({ Name = "Refresh stats", Callback = ToolsModule.RefreshStats })
-
-logSection:Header({ Text = "Debug" })
-UIRef.actionsParagraph = logSection:Paragraph({ Header = "Last actions", Body = "Nothing recorded yet." })
-logSection:Button({ Name = "Copy full log", Callback = RecordingModule.CopyLog })
-logSection:Button({ Name = "Scan game", Callback = Scan.Run })
-logSection:Button({ Name = "Refresh saved list", Callback = function() refreshSavedList(cleanName(State.macroName)) end })
+-- Performance: all off by default, saved in config (Tools.perf)
+Controls.perfSection:Header({ Text = "Performance" })
+for _, p in ipairs({ { "lowGraphics", "Low graphics", "PerfLowGraphics" }, { "hideEffects", "Hide effects", "PerfHideEffects" },
+    { "noDecor", "Hide map decor", "PerfNoDecor" }, { "white", "White screen", "PerfWhiteScreen" } }) do
+    Controls["perf_" .. p[1]] = Controls.perfSection:Toggle({
+        Name = p[2],
+        Default = false,
+        Callback = function(on)
+            if on == (Tools.perf[p[1]] == true) then return end
+            ToolsModule.SetPerf(p[1], on); saveConfig()
+        end,
+    }, p[3])
+end
+Controls.perf_fpsCap = Controls.perfSection:Dropdown({
+    Name = "FPS cap",
+    Multi = false,
+    Required = true,
+    Options = { "Off", "60", "30", "15" },
+    Default = "Off",
+    Callback = function(v)
+        if type(v) ~= "string" or v == Tools.perf.fpsCap then return end
+        ToolsModule.SetPerf("fpsCap", v); saveConfig()
+    end,
+}, "PerfFpsCap")
+toolsSection:Header({ Text = "Tools" })
+toolsSection:Button({ Name = "Copy game report", Callback = AutoPlaceModule.MapReport })
+toolsSection:Button({ Name = "Save unit catalog", Callback = function() pcall(AutoPlaceModule.SaveCatalog) end })
+toolsSection:Button({ Name = "Copy full log", Callback = RecordingModule.CopyLog })
+toolsSection:Button({ Name = "Reset learned data", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
 end
 
 --------------------------------------------------------------------------------
 -- Runtime: game start, stage detect, heartbeat, auto farm wave checks
 --------------------------------------------------------------------------------
 local function onGameStarted()
+    -- the stage can change between games (Next stage, a new room): read it again
+    Stage.data = nil
+    State.stage = Stage.detect() or State.stage
+    pcall(refreshStatus)
     if State.recording and not State.startOffset then
         State.startOffset = os.clock() - State.startedAt
     end
@@ -7212,6 +7515,7 @@ end))
 local function shutdown()
     if State.unloaded then return end
     saveConfig()
+    pcall(ToolsModule.PerfOff)
     configReady = false
     State.unloaded = true
     State.recording = false
@@ -7279,11 +7583,8 @@ applyRuntimeFeatures = function()
     setControl(Controls.autoPlay, State.autoPlay)
     setControl(Controls.retryPlacements, State.retryPlacements)
     setControl(Controls.showAllMacros, State.showAllMacros)
-    setControl(Controls.webhookUrl, Webhook.url)
-    setControl(Controls.notifyComplete, Webhook.notifyComplete)
-    setControl(Controls.notifyFail, Webhook.notifyFail)
-    setControl(Controls.pingId, Webhook.pingId)
-    for _, k in ipairs({ "pingMythic", "pingBagFull", "pingDisconnect", "pingLosses" }) do setControl(Controls[k], Webhook[k] ~= false) end
+    setControl(Controls.webhookUrl, Webhook.Masked())
+    setControl(Controls.discordAlerts, Webhook.AlertsOn())
     setControl(Controls.shrineEnabled, DungeonRun.acceptShrines)
     setControl(Controls.dungeonRareEnd, DungeonRun.openRareAtEnd)
     setControl(Controls.dungeonContinueDeath, DungeonRun.autoContinueDeath)
@@ -7300,16 +7601,21 @@ applyRuntimeFeatures = function()
     Tools.antiAfk = pendingToggles.antiAfk == true
     setControl(UIRef.antiAfkToggle, Tools.antiAfk)
     if Tools.antiAfk then ToolsModule.StartAntiAfk() else ToolsModule.StopAntiAfk() end
+    local perf = pendingToggles.perf or {}
+    for _, k in ipairs({ "lowGraphics", "hideEffects", "noDecor", "white" }) do setControl(Controls["perf_" .. k], perf[k] == true) end
+    if perf.fpsCap == "60" or perf.fpsCap == "30" or perf.fpsCap == "15" then
+        pcall(function() Controls.perf_fpsCap:UpdateSelection(perf.fpsCap) end)
+    end
     setControl(Controls.autoPlaceUpgrade, AutoPlace.upgrade)
     pcall(function() Controls.placeMode:UpdateSelection(AutoPlace.placeMode) end)
     setControl(Controls.smartFreeze, AutoPlace.smartFreeze)
     setControl(Controls.sellFarmsLast, AutoPlace.sellFarmsLast)
     setControl(Controls.autoTarget, AutoPlace.autoTarget)
     setControl(Controls.showDetails, AutoPlace.showDetails)
-    pcall(function() Controls.preset:UpdateSelection(AutoPlace.preset) end)
+    pcall(AutoPlaceModule.MigrateSkip)
     pcall(AutoPlaceModule.refreshSkipUI)
     AutoPlace.enabled = pendingToggles.autoPlace == true
-    setControl(Controls.autoPlace, AutoPlace.enabled)
+    setControl(Controls.placeMyself, AutoPlace.manual == true)
     if AutoPlace.enabled then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
     setControl(Controls.homeAuto, AutoPlace.enabled)
     pcall(function() Controls.homeMode:UpdateSelection(AutoPlace.preset == "Safe" and "Safe" or "Fast farm") end)
@@ -7350,7 +7656,7 @@ refreshUnitStatus()
 DungeonRun.Refresh(false)
 ToolsModule.RefreshStats()
 UIRef.tabs.home:Select()
-notify("moseeri hub loaded — 7 tabs.")
+notify("moseeri hub loaded — 6 tabs.")
 return {
     Recording = RecordingModule,
     Playback = PlaybackModule,
