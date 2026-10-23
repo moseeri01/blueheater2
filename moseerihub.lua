@@ -2146,7 +2146,8 @@ task.spawn(function()
                 if btn then clickButton(btn) end
                 AutoFarm.lastStart = via or (btn and "button") or "nothing found"
             end
-            if AutoFarm.autoSkip and gameStarted() and now >= nextSkip then
+            -- (Fool's Hunt: no skipping - the time between waves is what pays for the upgrades)
+            if AutoFarm.autoSkip and gameStarted() and now >= nextSkip and not State.eventMode then
                 nextSkip = now + 3
                 local via = fireFirst(Words.SKIP_REMOTES, true)
                 local btn = labelButton({ "skip wave", "skip" })
@@ -3602,6 +3603,7 @@ function AutoPlaceModule.RefreshTeam()
     local team = {}
     if AutoPlaceModule.EventMode() then
         -- (never saved as lastTeam: these copies vanish when the game ends)
+        State.eventMode = true
         local hot = AutoPlaceModule.HotbarTeam()
         for _, t in pairs(hot) do
             local def = AutoPlaceModule.UnitDef(t.name)
@@ -7776,7 +7778,33 @@ end
 -- a "Good" card helps us and adds nothing. The vote call (select_roguelike_option) was never
 -- seen with its arguments: the ways below are tried in turn; a way whose result matched the
 -- pick twice is kept (cfg.voteWay).
-Lobby.VOTE_WAYS = { "index", "index0", "title", "option" }
+Lobby.VOTE_WAYS = { "gui", "index", "index0", "title", "option" }
+
+-- The button for a text on screen (a card's title, a spell's name): the label's nearest
+-- button ancestor, else a button inside the label's card (3 levels up). Clicking it lets the
+-- game send its own call, with the right arguments.
+function Lobby.ButtonFor(text, root)
+    local want = string.lower(tostring(text)):gsub("^%s+", ""):gsub("%s+$", "")
+    root = root or Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(root and root:GetDescendants() or {}) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and not isOwnGui(d) then
+            local plain = string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if plain == want then
+                local node = d
+                for _ = 1, 6 do
+                    if node:IsA("GuiButton") then return node end
+                    node = node.Parent
+                    if not node or node:IsA("LayerCollector") then break end
+                end
+                local card = d.Parent and d.Parent.Parent and d.Parent.Parent.Parent or d.Parent
+                for _, b in ipairs(card and card:GetDescendants() or {}) do
+                    if b:IsA("GuiButton") and isOnScreen(b) and b.Name ~= "Delete" then return b end
+                end
+            end
+        end
+    end
+    return nil
+end
 
 -- Share of our damage by type (physical / magic / true ...), from the placed units' data.
 function Lobby.DamageShare()
@@ -7836,14 +7864,24 @@ end
 function Lobby.OnCardOptions(seconds, options)
     if not Lobby.cfg.eventCards or type(options) ~= "table" or #options == 0 then return end
     local remote = getAARemote("select_roguelike_option")
-    if not remote then return end
     local i, why = Lobby.PickCard(options)
     local way = Lobby.cfg.voteWay ~= "" and Lobby.cfg.voteWay or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
     local arg = (way == "index0" and i - 1) or (way == "title" and options[i].title) or (way == "option" and options[i]) or i
     Lobby.pendingVote = { title = options[i].title, way = way }
     AutoPlaceModule.Note(string.format("card: %s (%s, way %s)", tostring(options[i].title), why, way))
-    -- (sent without waiting: a call with the wrong arguments got no answer in the real game)
-    task.spawn(pcall, function() remote:InvokeServer(arg) end)
+    task.spawn(pcall, function()
+        if way == "gui" then
+            -- the card on screen, clicked (the game sends its own vote)
+            for _ = 1, 15 do
+                local b = Lobby.ButtonFor(options[i].title)
+                if b then clickButton(b) return end
+                task.wait(0.3)
+            end
+        elseif remote then
+            -- (sent without waiting: a call with the wrong arguments got no answer in the real game)
+            remote:InvokeServer(arg)
+        end
+    end)
 end
 
 function Lobby.OnCardResult(picked, state)
@@ -7869,7 +7907,42 @@ end
 -- strongest damage unit, Clone on the most upgraded one, Astral Summon when rich; never
 -- Refund / Ritual / Merge / Astral Gate. use_ingame_spell's arguments were never seen either:
 -- a way counts as working when the spell leaves the hand (cfg.spellWay).
-Lobby.SPELL_WAYS = { "id_unit", "index_unit", "id", "index" }
+Lobby.SPELL_WAYS = { "gui", "id_unit", "index_unit", "id", "index" }
+-- names on the bar (IngameSpells data) and the ones that only take a slot from new units
+Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
+    gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
+Lobby.DROP_SPELLS = { sell_refund = true, sacrifice = true, ritual = true, gate = true }
+
+-- The bar slot showing a spell (by its name on the card).
+function Lobby.SpellSlot(id)
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local bar = gui and gui:FindFirstChild("spawn_units")
+    bar = bar and bar:FindFirstChild("Lives")
+    bar = bar and bar:FindFirstChild("Frame")
+    bar = bar and bar:FindFirstChild("Units")
+    local want = string.lower(Lobby.SPELL_NAMES[id] or id)
+    for _, slot in ipairs(bar and bar:GetChildren() or {}) do
+        for _, d in ipairs(slot:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "") == want then
+                return slot
+            end
+        end
+    end
+    return nil
+end
+
+-- Taps a unit on the map (its spot on screen), as the player does after picking a spell.
+function Lobby.TapUnit(u)
+    local cam = workspace.CurrentCamera
+    local p = rootPos(u)
+    if not cam or not p then return false end
+    local v, onScreen = cam:WorldToViewportPoint(p)
+    if not onScreen then return false end
+    VirtualInputManager:SendMouseButtonEvent(v.X, v.Y, 0, true, game, 0)
+    task.wait(0.05)
+    VirtualInputManager:SendMouseButtonEvent(v.X, v.Y, 0, false, game, 0)
+    return true
+end
 Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "upgraded" },
     summon = { cost = 10000, reserve = 2000 } }
 function Lobby.OnSpells(list)
@@ -7893,9 +7966,20 @@ end
 function Lobby.SpellStep(money)
     if not Lobby.cfg.eventSpells or not money then return end
     local remote = getAARemote("use_ingame_spell")
-    if not remote or os.clock() - (Lobby.spellAt or -1e9) < 12 then return end
+    if os.clock() - (Lobby.spellAt or -1e9) < 12 then return end
     for idx, id in ipairs(Lobby.spells or {}) do
         local spec = Lobby.SPELLS[id]
+        -- spells that only take a slot from the next random unit: dropped with their X
+        if Lobby.DROP_SPELLS[id] then
+            local slot = Lobby.SpellSlot(id)
+            local x = slot and slot:FindFirstChild("Delete", true)
+            if x then
+                Lobby.spellAt = os.clock()
+                clickButton(x)
+                AutoPlaceModule.Note("spell dropped: " .. id)
+                return
+            end
+        end
         if spec and money >= spec.cost + (spec.reserve or 0) then
             local target, best
             for _, u in ipairs(ownedUnits()) do
@@ -7914,7 +7998,17 @@ function Lobby.SpellStep(money)
             -- sent without waiting: a call in a shape the game does not take got no answer, and
             -- waiting for it stopped Auto Place for the rest of the game (real game, 2026-10-24)
             task.spawn(pcall, function()
-                if way:find("_unit$") and target then remote:InvokeServer(key, target) else remote:InvokeServer(key) end
+                if way == "gui" then
+                    -- the spell's slot, then the unit, tapped like a player
+                    local slot = Lobby.SpellSlot(id)
+                    if slot then
+                        clickButton(slot:IsA("GuiButton") and slot or slot:FindFirstChildWhichIsA("GuiButton", true))
+                        task.wait(0.5)
+                        if target then Lobby.TapUnit(target) end
+                    end
+                elseif remote then
+                    if way:find("_unit$") and target then remote:InvokeServer(key, target) else remote:InvokeServer(key) end
+                end
             end)
             AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
             return
