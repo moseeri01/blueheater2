@@ -8019,7 +8019,11 @@ function Lobby.SpellStep(money)
 end
 
 -- (each connected on its own: one missing event must not leave the others unheard)
-for name, fn in pairs({ show_roguelike_options = function(sec, o) pcall(Lobby.OnCardOptions, sec, o) end,
+for name, fn in pairs({ show_roguelike_options = function(sec, o)
+        Lobby.cardInfo = "options seen"
+        local ok, err = pcall(Lobby.OnCardOptions, sec, o)
+        if not ok then Lobby.cardInfo = "error: " .. clip(tostring(err), 80) end
+    end,
     show_roguelike_vote_result = function(p, st) pcall(Lobby.OnCardResult, p, st) end,
     ingame_spells = function(l) pcall(Lobby.OnSpells, l) end }) do
     task.spawn(pcall, function()
