@@ -2728,17 +2728,37 @@ function AutoPlaceModule.RoleFromDef(name)
 end
 
 -- Damage per second per ¥ from the definition (higher = better value); 0 when unknown.
-function AutoPlaceModule.Value(name, cost)
-    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(name)
-    local dmg = def and tonumber(def.damage)
-    if not dmg or not cost or cost <= 0 then return 0 end
-    return dmg / math.max(0.5, tonumber(def.attack_cooldown) or 1) / cost
+-- A team unit's real numbers: a placed copy's own _stats when there is one (already includes
+-- its random rolls), else the definition scaled by the rolls read from the team data.
+function AutoPlaceModule.Stats(t)
+    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(t.name) or {}
+    local rolls = t.rolls or {}
+    local s = {
+        damage = (tonumber(def.damage) or 0) * (rolls.potency_stat or 1),
+        cooldown = math.max(0.5, tonumber(def.attack_cooldown) or 1) / math.max(0.1, rolls.speed_stat or 1),
+        range = (tonumber(def.range) or DEFAULT_RANGE) * (rolls.range_stat or 1),
+    }
+    local placed = t.placedSample
+    local st = placed and placed.Parent and placed:FindFirstChild("_stats")
+    if st then
+        local function num(n) local v = st:FindFirstChild(n) return v and tonumber(v.Value) end
+        s.damage = num("damage") or s.damage
+        s.cooldown = num("attack_cooldown") or s.cooldown
+        s.range = num("range") or s.range
+    end
+    if s.range <= 0 then s.range = DEFAULT_RANGE end
+    return s
 end
 
-function AutoPlaceModule.Range(name)
-    local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(name)
-    local r = def and tonumber(def.range)
-    return (r and r > 0) and r or DEFAULT_RANGE
+-- Damage per second per ¥ (higher = better value); 0 for units that do not attack.
+function AutoPlaceModule.Value(t, cost)
+    if not cost or cost <= 0 then return 0 end
+    local s = AutoPlaceModule.Stats(t)
+    return s.damage / s.cooldown / cost
+end
+
+function AutoPlaceModule.Range(t)
+    return AutoPlaceModule.Stats(t).range
 end
 
 -- Role of a unit already on the map: the game's definition first, else its own stats;
@@ -2856,7 +2876,16 @@ function AutoPlaceModule.RefreshTeam()
                 if type(v) == "table" and rawget(v, "uuid") and rawget(v, "equipped_slot") and rawget(v, "unit_id") then
                     local slot = tonumber(rawget(v, "equipped_slot"))
                     if slot and slot >= 1 and slot <= 6 then
-                        team[slot] = { uuid = tostring(rawget(v, "uuid")), name = tostring(rawget(v, "unit_id")) }
+                        -- this copy's random rolls (speed_stat, potency_stat, range_stat, ...)
+                        local rolls, keys = {}, {}
+                        for k, val in pairs(v) do
+                            local key = tostring(k)
+                            table.insert(keys, key)
+                            if type(val) == "number" and string.lower(key):find("stat", 1, true) then rolls[key] = val end
+                        end
+                        table.sort(keys)
+                        team[slot] = { uuid = tostring(rawget(v, "uuid")), name = tostring(rawget(v, "unit_id")),
+                            rolls = rolls, fields = table.concat(keys, ",") }
                     end
                 end
             end
@@ -3117,14 +3146,73 @@ function AutoPlaceModule.RoleOf(t)
     return nil
 end
 
+-- Danger: the base HP bar at the top of the screen ("90.0/90.0") went down, i.e. enemies
+-- got through. Stays on for 20 s after the last drop.
+local dangerUntil, lastHp = 0, nil
+
+local function basePos(side)
+    local bases = workspace:FindFirstChild("_BASES")
+    local b = bases and bases:FindFirstChild(side)
+    local base = b and b:FindFirstChild("base")
+    if not base then return nil end
+    local ok, p = pcall(function() return base:GetPivot().Position end)
+    return ok and p or nil
+end
+
+function AutoPlaceModule.BaseHp()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return nil end
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("TextLabel") and isOnScreen(d) and not isOwnGui(d) then
+            local cur, max = tostring(d.Text):match("^%s*(%d+%.?%d*)%s*/%s*(%d+%.?%d*)%s*$")
+            if cur and d.AbsolutePosition.Y < 200 then return tonumber(cur), tonumber(max) end
+        end
+    end
+    return nil
+end
+
+function AutoPlaceModule.EnemyProgress()
+    local goal, start = basePos("player"), basePos("pve")
+    if not goal or not start then return 0 end
+    local total = math.sqrt((start.X - goal.X) ^ 2 + (start.Z - goal.Z) ^ 2)
+    if total < 1 then return 0 end
+    local best = 0
+    local folder = unitsFolder()
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(u) then
+            local p = rootPos(u)
+            if p then
+                local d = math.sqrt((p.X - goal.X) ^ 2 + (p.Z - goal.Z) ^ 2)
+                best = math.max(best, 1 - d / total)
+            end
+        end
+    end
+    return best
+end
+
+function AutoPlaceModule.Danger()
+    local now = os.clock()
+    local hp = AutoPlaceModule.BaseHp()
+    if hp then
+        if lastHp and hp < lastHp - 1e-6 then dangerUntil = now + 20 end
+        lastHp = hp
+    end
+    -- (enemy distance to our base is NOT used: winding roads pass near the base early and
+    -- kept danger on all game; a base HP drop is the reliable sign)
+    return now < dangerUntil
+end
+
 -- Picks the next unit from the WHOLE team: first one cheap damage unit (to hold wave 1),
--- then every farm, then the rest spread evenly with damage before buffs.
-local function chooseNext(prices)
+-- then every farm, then the rest spread evenly with damage before buffs. In danger, the
+-- best-value damage unit first and nothing else (returns "upgrade" when none is left).
+local function chooseNext(prices, danger)
     local list, dpsPlaced = {}, 0
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
         if t then
-            local placed = #placedOf(t.uuid)
+            local copies = placedOf(t.uuid)
+            local placed = #copies
+            t.placedSample = copies[1]
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
             local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99)
@@ -3135,6 +3223,17 @@ local function chooseNext(prices)
         end
     end
     if #list == 0 then return nil end
+    if danger then
+        local best
+        for _, e in ipairs(list) do
+            if e.role == "dps" then
+                e.value = AutoPlaceModule.Value(e.t, e.cost ~= math.huge and e.cost or nil)
+                if not best or e.value > best.value or (e.value == best.value and e.cost < best.cost) then best = e end
+            end
+        end
+        if best then return best.slot, best.t, best.role, dpsPlaced end
+        return nil, nil, "upgrade", dpsPlaced
+    end
     local function cheapest(role)
         local best
         for _, e in ipairs(list) do
@@ -3145,7 +3244,7 @@ local function chooseNext(prices)
     -- one cheap damage unit, then the farms, then support (cheaper upgrades before upgrading)
     local pick = (dpsPlaced == 0 and cheapest("dps")) or cheapest("farm") or cheapest("support")
     if not pick then
-        for _, e in ipairs(list) do e.value = AutoPlaceModule.Value(e.t.name, e.cost ~= math.huge and e.cost or nil) end
+        for _, e in ipairs(list) do e.value = AutoPlaceModule.Value(e.t, e.cost ~= math.huge and e.cost or nil) end
         table.sort(list, function(a, b)
             local ra, rb = a.placed / math.max(1, a.target), b.placed / math.max(1, b.target)
             if math.abs(ra - rb) > 1e-6 then return ra < rb end
@@ -3180,8 +3279,16 @@ local function tick()
     end
     local hudMoney, hudPrices = AutoPlaceModule.ReadHud()
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)) or hudMoney
-    local slot, t, role, dpsPlaced = chooseNext(hudPrices)
-    if AutoPlace.upgrade and (dpsPlaced or 0) > 0 and (not t or (role ~= "farm" and role ~= "support")) then
+    local danger = AutoPlaceModule.Danger()
+    AutoPlaceModule.danger = danger
+    local slot, t, role, dpsPlaced = chooseNext(hudPrices, danger)
+    if danger and not t then
+        -- enemies are getting through and no damage unit is left to place: upgrade damage
+        local wait = upgradeStep(money, "dps")
+        if wait then return wait end
+        slot, t, role, dpsPlaced = chooseNext(hudPrices, false)
+    end
+    if not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and (not t or (role ~= "farm" and role ~= "support")) then
         -- once one damage unit and every farm are down, farm upgrades pay for themselves
         -- quickly (speedwagon 200 -> 500 per wave), so they come before spreading more units
         local wait = upgradeStep(money, "farm")
@@ -3203,7 +3310,7 @@ local function tick()
         return 0.1
     end
     local unknown = not (cost and money)
-    local range = AutoPlaceModule.Range(t.name)
+    local range = AutoPlaceModule.Range(t)
     local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range) or bestSpot(0, role, range)
     if not spot then
         AutoPlaceModule.problem = "no free spot beside the path - the path may still be short"
@@ -3292,6 +3399,7 @@ end
 
 function AutoPlaceModule.StatusText()
     local lines = { "Status: " .. AutoPlaceModule.status }
+    if AutoPlaceModule.danger then table.insert(lines, "DANGER: enemies getting through - damage units first") end
     local team = {}
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
@@ -3316,7 +3424,16 @@ function AutoPlaceModule.MapReport()
     AutoPlaceModule.RefreshTeam()
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
-        if t then table.insert(lines, string.format("slot %d: %s uuid %s cost %s", s, t.name, clip(t.uuid, 14), tostring(t.cost))) end
+        if t then
+            local rolls = {}
+            for k, v in pairs(t.rolls or {}) do table.insert(rolls, string.format("%s=%.3f", k, v)) end
+            table.sort(rolls)
+            local st = AutoPlaceModule.Stats(t)
+            table.insert(lines, string.format("slot %d: %s uuid %s cost %s role %s | rolls %s | dmg %.0f every %.2fs range %.1f",
+                s, t.name, clip(t.uuid, 14), tostring(t.cost), tostring(AutoPlaceModule.RoleOf(t)),
+                #rolls > 0 and table.concat(rolls, " ") or "none", st.damage, st.cooldown, st.range))
+            table.insert(lines, "  team data fields: " .. clip(t.fields or "-", 300))
+        end
     end
     table.insert(lines, "money value: " .. tostring(AutoPlace.moneyPath) .. " = " .. tostring(AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath)))
     local top = {}
@@ -3345,6 +3462,9 @@ function AutoPlaceModule.MapReport()
         end
     end
     table.insert(lines, string.format("enemies now: %d %s", enemies, sample or ""))
+    local hpNow, hpMax = AutoPlaceModule.BaseHp()
+    table.insert(lines, string.format("base hp read from screen: %s / %s (danger mode needs this), leading enemy %.0f%% of the way",
+        tostring(hpNow), tostring(hpMax), AutoPlaceModule.EnemyProgress() * 100))
     table.insert(lines, string.format("path points: %d", #pathPoints()))
     local spot = #pathPoints() >= 8 and bestSpot()
     if spot then table.insert(lines, string.format("best spot: (%.1f, %.1f, %.1f) covers %d path points", spot.x, spot.y, spot.z, spot.score)) end
