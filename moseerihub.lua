@@ -91,7 +91,7 @@ local UnitAI = {
 -- Auto Place state: places the team along the path the enemies walk.
 local AutoPlace = {
     enabled = false,
-    upgrade = false,
+    upgrade = true,               -- "Auto upgrade": every upgrade (farms, damage) is done by Auto Place
     slots = { 8, 8, 8, 8, 8, 8 }, -- how many of each team slot to place (0 = none)
     moneyPath = nil,              -- tracked value that pays for units, found on the first placement
     paths = {},                   -- [stage] = { {x,y,z}, ... } learned from enemy movement
@@ -105,6 +105,9 @@ local AutoPlace = {
     lastTeam = {},                -- [slot] = { uuid, name } last read from game data (used when it is not readable)
     smartFreeze = true,           -- freeze skills (Shadowgirl timestop) only at the best moment
     sellFarmsLast = true,         -- sell farm units on the last wave and spend the yen on damage
+    autoTarget = true,            -- damage units target "first", single-target ones "strongest" while a boss is out
+    priorityMethod = nil,         -- how change_priority worked last time: "direct" | "capital" | "cycle"
+    hillBy = {},                  -- [stage] = "height" (spots above the road took hill units) | "name" (only parts named hill/cliff/...)
 }
 
 -- Dungeon Bot state
@@ -242,6 +245,8 @@ local function buildConfigData()
             lastTeam = next(AutoPlace.lastTeam or {}) and AutoPlace.lastTeam or nil,
             smartFreeze = AutoPlace.smartFreeze,
             sellFarmsLast = AutoPlace.sellFarmsLast,
+            autoTarget = AutoPlace.autoTarget, priorityMethod = AutoPlace.priorityMethod,
+            hillBy = next(AutoPlace.hillBy or {}) and AutoPlace.hillBy or nil,
         },
     }
 end
@@ -307,6 +312,9 @@ local function applyConfigData(data)
     AutoPlace.preset = pick(ap.preset, "string", AutoPlace.preset)
     AutoPlace.showDetails = pick(ap.showDetails, "boolean", AutoPlace.showDetails)
     AutoPlace.sellFarmsLast = pick(ap.sellFarmsLast, "boolean", AutoPlace.sellFarmsLast)
+    AutoPlace.autoTarget = pick(ap.autoTarget, "boolean", AutoPlace.autoTarget)
+    AutoPlace.priorityMethod = pick(ap.priorityMethod, "string", AutoPlace.priorityMethod)
+    if type(ap.hillBy) == "table" then AutoPlace.hillBy = ap.hillBy end
     if type(ap.lastTeam) == "table" then
         AutoPlace.lastTeam = {}
         for k, v in pairs(ap.lastTeam) do
@@ -2733,8 +2741,8 @@ local function samplePath()
     return grew
 end
 
--- Ground under a point: height, and whether it is a hill (the part hit is named/inside
--- something called "hill", or it stands well above the road beside it).
+-- Ground under a point: height, "hill" / "ground" when the part hit (or a parent) is named
+-- like one (hill, cliff, mountain, rock, elevated / ground), and the part itself.
 local function groundHit(x, y, z)
     local ok, hit = pcall(function()
         -- skip units, the invisible _barrier walls, the ignore folder and any part that can be
@@ -2763,12 +2771,13 @@ local function groundHit(x, y, z)
         local node = hit.Instance
         while node and node ~= workspace do
             local n = string.lower(node.Name)
-            if n:find("hill", 1, true) then tag = "hill" break end
+            if n:find("hill", 1, true) or n:find("cliff", 1, true) or n:find("mountain", 1, true)
+                or n:find("rock", 1, true) or n:find("elevated", 1, true) then tag = "hill" break end
             if n:find("ground", 1, true) then tag = "ground" break end
             node = node.Parent
         end
     end)
-    return hit.Position.Y, tag
+    return hit.Position.Y, tag, hit.Instance
 end
 
 local function groundAt(x, y, z)
@@ -2793,12 +2802,15 @@ local function buildCandidates(pts)
                     if d2 <= DEFAULT_RANGE * DEFAULT_RANGE then score = score + 1 end
                 end
                 if nearest >= MIN_FROM_PATH * MIN_FROM_PATH then
-                    local gy, tag = groundHit(x, p[2], z)
+                    local gy, tag, part = groundHit(x, p[2], z)
                     -- nothing under it, or well below the road (past a rooftop / ledge edge, as on
                     -- Fiend City where the road runs over roofs): not a place to stand
                     if gy and not (roadY and gy < roadY - 3) then
+                        -- (well above the road with no hill name: a hill, or a roof / tree / wall;
+                        -- hillBy says which, so those spots can be distrusted per stage)
                         local kind = tag or ((roadY and gy > roadY + 2.5) and "hill" or "ground")
-                        table.insert(list, { x = x, y = p[2], z = z, score = score, groundY = gy, kind = kind })
+                        table.insert(list, { x = x, y = p[2], z = z, score = score, groundY = gy, kind = kind,
+                            hillBy = kind == "hill" and (tag and "name" or "height") or nil, part = part, rise = roadY and gy - roadY })
                     end
                 end
             end
@@ -3007,6 +3019,18 @@ local function bestSpot(skip, role, range, kind, aoe)
                 table.insert(near and nearRefused or free, c)
             end
         end
+    end
+    if kind == "hill" then
+        -- hill units: spots on parts named like a hill first; height-only spots (roofs, trees
+        -- and walls look the same) only when none is named, or once one took a hill unit here
+        local trust = (AutoPlace.hillBy or {})[stageKey()]
+        local function named(list)
+            local out = {}
+            for _, c in ipairs(list) do if c.hillBy == "name" then table.insert(out, c) end end
+            return out
+        end
+        local nf, nr = named(free), named(nearRefused)
+        if trust == "name" or (trust ~= "height" and #nf + #nr > 0) then free, nearRefused = nf, nr end
     end
     if #free == 0 then free = nearRefused end
     if role == "farm" then
@@ -3312,6 +3336,29 @@ function AutoPlaceModule.IsAoe(name)
     return false
 end
 
+-- Flying enemies can only be hit by hill units and hybrid units (wiki, UPD 20.4).
+-- [unit id] = upgrade level from which a ground unit becomes hybrid (several do at some
+-- level); the game's field for it is not known yet, so this stays empty until it is.
+AutoPlaceModule.AirFromLevel = {}
+function AutoPlaceModule.AirCapable(name, level)
+    local def = AutoPlaceModule.UnitDef(name)
+    if def and (def.hill_unit == true or def.hybrid_placement == true) then return true end
+    local from = AutoPlaceModule.AirFromLevel[name]
+    return from ~= nil and (level or 0) >= from
+end
+
+-- Number of flying enemies on the map (_stats.Flying 1 / true).
+function AutoPlaceModule.Flying()
+    local folder = unitsFolder()
+    local n = 0
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        local st = u:FindFirstChild("_stats")
+        local fl = st and st:FindFirstChild("Flying")
+        if fl and (fl.Value == true or (tonumber(fl.Value) or 0) > 0) and isEnemy(u) then n = n + 1 end
+    end
+    return n
+end
+
 local function normUuid(u) return (tostring(u):gsub("[{}%s]", "")) end
 
 local function placedOf(uuid)
@@ -3540,7 +3587,9 @@ local function upgradeStep(money, onlyRole)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
     local RANK = { farm = 1, dps = 2, support = 2 }
-    local pick, pickLevel, pickRank, pickCost, pickScore, pickRole
+    local pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir
+    -- flying enemies on the map: damage units that can hit them (after this upgrade) go first
+    local air = AutoPlaceModule.flying ~= nil
     local now = os.clock()
     local units = ownedUnits()
     local focus = ControlUp.focus(units, now)
@@ -3554,8 +3603,10 @@ local function upgradeStep(money, onlyRole)
             if can then
                 local rank = RANK[role] or 2
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
-                if not pick or rank < pickRank or (rank == pickRank and score > pickScore) then
-                    pick, pickLevel, pickRank, pickCost, pickScore, pickRole = u, level, rank, cost, score, role
+                local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
+                if not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
+                    or (rank == pickRank and isAir == pickAir and score > pickScore) then
+                    pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir = u, level, rank, cost, score, role, isAir
                 end
             end
         end
@@ -3574,7 +3625,7 @@ local function upgradeStep(money, onlyRole)
     end
     if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
         AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
-            BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
+            pickAir and ", hits flying enemies" or BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
     elseif not (pickCost and money and money < pickCost) then
         -- refused with the money in hand: leave this unit for 30 s instead of retrying forever
         upgradeFails[pick] = now + 30
@@ -3790,7 +3841,7 @@ end
 -- In danger, the best-value damage unit first and nothing else (returns "upgrade" when none
 -- is left). 5th result: the team's strongest damage unit (best damage per ¥) is on the map.
 local function chooseNext(prices, danger)
-    local list, dpsPlaced = {}, 0
+    local list, dpsPlaced, airPlaced = {}, 0, 0
     local strongest, strongestDown
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
@@ -3800,6 +3851,7 @@ local function chooseNext(prices, danger)
             t.placedSample = copies[1]
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
+            if role == "dps" and AutoPlaceModule.AirCapable(t.name, math.huge) then airPlaced = airPlaced + placed end
             local target = math.min(AutoPlace.slots[s] or 0, tonumber(AutoPlace.caps[t.name]) or 99,
                 AutoPlaceModule.TraitMods(t.traits).cap or 99)
             -- slots set to 0 or found full with none down do not count as the strongest
@@ -3823,18 +3875,26 @@ local function chooseNext(prices, danger)
     if #list == 0 then return nil, nil, nil, dpsPlaced, strongestDown end
     -- damage unit with the most damage per ¥ (traits and rolls included); cheaper on a tie,
     -- so with no prices known yet this is the cheapest one
+    -- (flying enemies on the map: the best one that can hit them, when one is left to place)
     local function bestDps()
         local best
+        local air = AutoPlaceModule.flying ~= nil
         for _, e in ipairs(list) do
             if e.role == "dps" then
                 e.value = AutoPlaceModule.Value(e.t, e.cost ~= math.huge and e.cost or nil)
-                if not best or e.value > best.value or (e.value == best.value and e.cost < best.cost) then best = e end
+                e.air = air and AutoPlaceModule.AirCapable(e.t.name, 0)
+                if not best or (e.air and not best.air) or (e.air == best.air
+                    and (e.value > best.value or (e.value == best.value and e.cost < best.cost))) then best = e end
             end
         end
         return best
     end
     if danger then
         local best = bestDps()
+        -- flying enemies and every unit that can hit them is down: upgrade those, not more ground units
+        if best and AutoPlaceModule.flying and not best.air and airPlaced > 0 then
+            return nil, nil, "upgrade", dpsPlaced, strongestDown
+        end
         if best then return best.slot, best.t, best.role, dpsPlaced, strongestDown end
         return nil, nil, "upgrade", dpsPlaced, strongestDown
     end
@@ -3861,7 +3921,31 @@ local function chooseNext(prices, danger)
     return pick.slot, pick.t, pick.role, dpsPlaced, strongestDown
 end
 
+-- A spot refused with the money in hand. Hill units refused 3 times on height-only "hill"
+-- spots on this stage: those are roofs / trees, use named hills only from now on. A unit
+-- refused 6 times in a row rests 20 s so the rest of the team (buffs, farms, upgrades) goes on.
+AutoPlaceModule.heightRefusals = {}
+function AutoPlaceModule.SpotRefused(t, spot, kind)
+    local key = stageKey()
+    if kind == "hill" and spot.hillBy == "height" and AutoPlace.hillBy[key] ~= "height" then
+        local n = (AutoPlaceModule.heightRefusals[key] or 0) + 1
+        AutoPlaceModule.heightRefusals[key] = n
+        if n >= 3 and AutoPlace.hillBy[key] ~= "name" then
+            AutoPlace.hillBy[key] = "name"
+            saveConfig()
+            AutoPlaceModule.Note(string.format("%s refused on raised spots 3 times: they are roofs here, named hills only", t.name))
+        end
+    end
+    t.spotRefused = (t.spotRefused or 0) + 1
+    if t.spotRefused >= 6 then
+        t.spotRefused = 0
+        AutoPlaceModule.noSpot[t.uuid] = os.clock() + 20
+        AutoPlaceModule.Note(string.format("%s refused on 6 spots in a row - the others go first for 20 s", t.name))
+    end
+end
+
 local function tick()
+    AutoPlaceModule.idleMoney = nil
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
     if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
     local grew = samplePath()
@@ -3895,10 +3979,27 @@ local function tick()
     local danger = AutoPlaceModule.Danger()
     if danger and not AutoPlaceModule.danger then AutoPlaceModule.Note("base took damage: damage units first for 20 s") end
     AutoPlaceModule.danger = danger
+    -- flying enemies: only hill / hybrid units hit them, so those come first (bestDps, upgradeStep)
+    local flyingNow = AutoPlaceModule.Flying()
+    local flying = flyingNow > 0 and "flying enemies on the map" or nil
+    if flying and not AutoPlaceModule.flying then
+        local any = false
+        for _, tm in pairs(AutoPlaceModule.team) do
+            if AutoPlaceModule.AirCapable(tm.name, math.huge) then any = true end
+        end
+        if any then
+            AutoPlaceModule.Note("flying enemies on the map: hill / hybrid units first")
+        elseif not AutoPlaceModule.flyWarned then
+            AutoPlaceModule.flyWarned = true
+            AutoPlaceModule.Note("flying enemies: no hill or hybrid unit in the team")
+        end
+    end
+    AutoPlaceModule.flying = flying
+    if flying and AutoPlaceModule.flyWarned then AutoPlaceModule.problem = "flying enemies: no hill or hybrid unit in the team" end
     if not danger then
         -- strong enemies on the map: put the money into damage now, before they reach the base
-        local threat = AutoPlaceModule.Threat()
-        if threat and threat ~= AutoPlaceModule.threat then AutoPlaceModule.Note(threat .. ": damage units first") end
+        local threat = AutoPlaceModule.Threat() or flying
+        if threat and threat ~= AutoPlaceModule.threat and threat ~= flying then AutoPlaceModule.Note(threat .. ": damage units first") end
         AutoPlaceModule.threat = threat
         danger = threat ~= nil
     end
@@ -3919,6 +4020,8 @@ local function tick()
         local wait = upgradeStep(money, "farm")
         if wait then return wait end
     end
+    -- nothing left to place and upgrades off while the yen piles up: say so (short status)
+    AutoPlaceModule.idleMoney = (not t and not AutoPlace.upgrade and money and money >= 2000) and money or nil
     if not t then
         -- units waiting for a free spot are not "placed": say so instead
         local resting = 0
@@ -3964,7 +4067,12 @@ local function tick()
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     if tryPlace(t, spot) then
         failsInRow, recentBad = 0, {}
+        t.spotRefused = 0
         AutoPlaceModule.problem = nil
+        if kind == "hill" and spot.hillBy == "height" and AutoPlace.hillBy[stageKey()] ~= "height" then
+            AutoPlace.hillBy[stageKey()] = "height"
+            saveConfig()
+        end
         local why = (danger and "danger, best damage per ¥") or (role == "farm" and "farm pays for the rest")
             or (role == "buff" and string.format("buff rotation needs %d", AutoPlaceModule.BuffNeed(t)))
             or (role == "support" and "support before upgrades") or "damage"
@@ -3975,6 +4083,7 @@ local function tick()
     if why == "money" then return 0.5 end
     -- below the game's own limit a "limit" message cannot be about this unit
     if why == "cap" and t.gameCap and #placedOf(t.uuid) < t.gameCap then why = "spot" end
+    if why == "spot" or (why == nil and cost and money and money >= cost) then AutoPlaceModule.SpotRefused(t, spot, kind) end
     if why == "spot" then
         badSpots[spotKey(spot, kind)] = true
         return 0.1
@@ -4095,10 +4204,97 @@ local function freezeLoop(gen)
     end
 end
 
+-- Sets a unit's targeting (_stats.priority) through change_priority and checks it took.
+-- The remote's arguments are not known: (unit, "strongest"), then (unit, "Strongest"), then
+-- (unit) alone up to 7 times as a cycle through First / Closest / ... / Last. The way that
+-- worked is remembered (AutoPlace.priorityMethod) and tried first next time.
+function AutoPlaceModule.SetPriority(unit, want)
+    local remote = getAARemote("change_priority")
+    local st = unit:FindFirstChild("_stats")
+    local v = st and st:FindFirstChild("priority")
+    if not remote or not v then return false end
+    local function is() return string.lower(tostring(v.Value)) == want end
+    if is() then return true end
+    local function call(mode)
+        local before = tostring(v.Value)
+        pcall(function()
+            if mode then remote:InvokeServer(unit, mode) else remote:InvokeServer(unit) end
+        end)
+        for _ = 1, 5 do -- the new value can replicate a moment after the reply
+            if tostring(v.Value) ~= before then break end
+            task.wait(0.1)
+        end
+        return is()
+    end
+    local ways = {
+        direct = function() return call(want) end,
+        capital = function() return call(want:sub(1, 1):upper() .. want:sub(2)) end,
+        cycle = function()
+            for _ = 1, 7 do
+                if call(nil) then return true end
+            end
+            return false
+        end,
+    }
+    local order = { "direct", "capital", "cycle" }
+    local known = AutoPlace.priorityMethod
+    if ways[known] then
+        for i, m in ipairs(order) do if m == known then table.remove(order, i) break end end
+        table.insert(order, 1, known)
+    end
+    for _, m in ipairs(order) do
+        if ways[m]() then
+            if AutoPlace.priorityMethod ~= m then AutoPlace.priorityMethod = m; saveConfig() end
+            return true
+        end
+    end
+    return false
+end
+
+-- One targeting fix per call: damage units on "first"; while a boss is out, single-target
+-- ones on "strongest" (area units keep "first", they hit the boss anyway). At most one try
+-- per unit every 3 s; a unit where every way failed twice is left alone.
+AutoPlaceModule.prioTries = setmetatable({}, { __mode = "k" })
+function AutoPlaceModule.TargetStep()
+    local boss = AutoPlaceModule.Threat() == "boss on the map"
+    local now = os.clock()
+    for _, u in ipairs(ownedUnits()) do
+        local st = u:FindFirstChild("_stats")
+        local v = st and st:FindFirstChild("priority")
+        if v and not isSummon(u) and unitRole(u) == "dps" then
+            local name = unitType(u)
+            local want = (boss and AutoPlaceModule.IsAoe(name) == false) and "strongest" or "first"
+            local tr = AutoPlaceModule.prioTries[u] or { at = -1e9, fails = 0 }
+            AutoPlaceModule.prioTries[u] = tr
+            if string.lower(tostring(v.Value)) ~= want and tr.fails < 2 and now - tr.at >= 3 then
+                tr.at = now
+                if AutoPlaceModule.SetPriority(u, want) then
+                    AutoPlaceModule.Note(string.format("target: %s -> %s (%s)", name, want, boss and "boss on the map" or "normal"))
+                else
+                    tr.fails = tr.fails + 1
+                    if tr.fails >= 2 then AutoPlaceModule.Note(string.format("could not change the target of %s - left as it is", name)) end
+                end
+                return
+            end
+        end
+    end
+end
+
+function AutoPlaceModule.TargetLoop(gen)
+    while AutoPlace.enabled and gen == apGen and not State.unloaded do
+        if AutoPlace.autoTarget and isGameRunning() and not isResultsShowing() then
+            pcall(AutoPlaceModule.TargetStep)
+        end
+        task.wait(0.5)
+    end
+end
+
 function AutoPlaceModule.Start()
     apGen = apGen + 1
     local gen = apGen
     task.spawn(freezeLoop, gen)
+    task.spawn(AutoPlaceModule.TargetLoop, gen)
+    AutoPlaceModule.flyWarned, AutoPlaceModule.flying = nil, nil
     AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
     AutoPlaceModule.noSpot = {}
     task.spawn(function()
@@ -4109,6 +4305,7 @@ function AutoPlaceModule.Start()
             local gameNow = started and started.Value
             if gameNow and not lastGame then
                 AutoPlaceModule.full, badSpots, failsInRow, unknownTries, recentBad = {}, {}, 0, 0, {}
+                AutoPlaceModule.flyWarned, AutoPlaceModule.flying = nil, nil
                 AutoPlaceModule.noSpot = {}
                 AutoPlaceModule.RefreshTeam()
             end
@@ -4141,6 +4338,9 @@ end
 -- Short status: what it is doing, the two strongest units and the last two actions.
 local function shortStatus()
     local lines = { "Status: " .. AutoPlaceModule.status }
+    if AutoPlaceModule.idleMoney then
+        table.insert(lines, string.format("Idle money: %d ¥ – turn on Auto upgrade", math.floor(AutoPlaceModule.idleMoney)))
+    end
     if AutoPlaceModule.danger then table.insert(lines, "DANGER: damage units first") end
     if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
     local rank = {}
@@ -4302,6 +4502,39 @@ function AutoPlaceModule.MapReport()
     local top = {}
     for _, c in ipairs(workspace:GetChildren()) do table.insert(top, c.Name) end
     table.insert(lines, "workspace: " .. clip(table.concat(top, ", "), 400))
+    pcall(function()
+        -- hill spots and what the ray hits there, so we learn what real hills are called
+        local hills, sorted = {}, {}
+        for _, c in ipairs(candidates or (#pathPoints() >= 8 and buildCandidates(pathPoints())) or {}) do
+            if c.kind == "hill" then table.insert(sorted, c) end
+        end
+        -- up to 3 named hills (the ones hill units get first), then the best height-only ones
+        local named = 0
+        for _, c in ipairs(sorted) do if c.hillBy == "name" then named = named + 1 end end
+        local keepNamed = math.max(3, 5 - (#sorted - named))
+        table.sort(sorted, function(a, b)
+            if (a.hillBy == "name") ~= (b.hillBy == "name") then return a.hillBy == "name" end
+            return a.score > b.score
+        end)
+        for i, c in ipairs(sorted) do
+            if #hills < 5 and (c.hillBy ~= "name" or i <= keepNamed) then
+                table.insert(hills, string.format("(%d,%d) +%.1f %s %s", math.floor(c.x + 0.5), math.floor(c.z + 0.5), c.rise or 0,
+                    c.hillBy or "?", c.part and clip(c.part:GetFullName(), 80) or "?"))
+            end
+        end
+        table.insert(lines, string.format("hill spots (best 5, height above road, by name/height, part): %s | here: %s, height refusals %d",
+            #hills > 0 and table.concat(hills, "; ") or "none", tostring(AutoPlace.hillBy[stageKey()] or "not learned"),
+            AutoPlaceModule.heightRefusals[stageKey()] or 0))
+        local under = {}
+        for _, u in ipairs(ownedUnits()) do
+            if AutoPlaceModule.PlacementKind({ name = unitType(u) }) == "hill" then
+                local p, gy, tag, part = rootPos(u), nil, nil, nil
+                if p then gy, tag, part = groundHit(p.X, p.Y, p.Z) end
+                table.insert(under, string.format("%s on %s (y %.1f)", unitType(u), part and clip(part:GetFullName(), 80) or "nothing", gy or 0))
+            end
+        end
+        if #under > 0 then table.insert(lines, "our hill units stand on: " .. table.concat(under, "; ")) end
+    end)
     local bases = workspace:FindFirstChild("_BASES")
     if bases then
         local names = {}
@@ -5712,19 +5945,26 @@ end
 -- Auto Place: sections on the Auto Farm tab (below the stage automation ones)
 do
 local placeTab = AutoPlaceModule.farmTab
+-- left: what is used every game; right: options, then how many of each slot
 local placeMain = placeTab:Section({ Side = "Left" })
+local placeOptions = placeTab:Section({ Side = "Right" })
 local placeSlots = placeTab:Section({ Side = "Right" })
 
-placeMain:Header({ Text = "Auto place along the enemy path" })
+placeMain:Header({ Text = "Auto Place" })
 local placeStatus = placeMain:Paragraph({ Header = "Status", Body = "Off" })
 AutoPlaceModule.refreshUI = function()
     pcall(function() placeStatus:UpdateBody(AutoPlaceModule.StatusText()) end)
 end
-Controls.showDetails = placeMain:Toggle({
-    Name = "Show full status",
-    Default = AutoPlace.showDetails,
-    Callback = function(on) AutoPlace.showDetails = on; saveConfig(); AutoPlaceModule.refreshUI() end,
-}, "AutoPlaceDetails")
+Controls.autoPlace = placeMain:Toggle({
+    Name = "Auto place units",
+    Default = false,
+    Callback = function(on)
+        AutoPlace.enabled = on
+        if on then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
+        AutoPlaceModule.refreshUI(); saveConfig()
+    end,
+}, "AutoPlace")
+placeMain:Divider()
 -- One click sets every Auto Place / wave option for a way of playing.
 local PRESETS = {
     ["Fast farm"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
@@ -5758,21 +5998,19 @@ Controls.preset = placeMain:Dropdown({
         AutoPlaceModule.ApplyPreset(v)
     end,
 }, "AutoPlacePreset")
-Controls.autoPlace = placeMain:Toggle({
-    Name = "Auto place units",
-    Default = false,
-    Callback = function(on)
-        AutoPlace.enabled = on
-        if on then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
-        AutoPlaceModule.refreshUI(); saveConfig()
-    end,
-}, "AutoPlace")
-Controls.autoPlaceUpgrade = placeMain:Toggle({
-    Name = "Upgrade after everything is placed",
+Controls.autoTarget = placeMain:Toggle({
+    Name = "Auto target (First / Strongest)",
+    Default = AutoPlace.autoTarget,
+    Callback = function(on) AutoPlace.autoTarget = on; saveConfig() end,
+}, "AutoPlaceTarget")
+
+placeOptions:Header({ Text = "Options" })
+Controls.autoPlaceUpgrade = placeOptions:Toggle({
+    Name = "Auto upgrade",
     Default = AutoPlace.upgrade,
     Callback = function(on) AutoPlace.upgrade = on; saveConfig() end,
 }, "AutoPlaceUpgrade")
-Controls.placeMode = placeMain:Dropdown({
+Controls.placeMode = placeOptions:Dropdown({
     Name = "Where to put damage units",
     Multi = false,
     Required = true,
@@ -5784,23 +6022,23 @@ Controls.placeMode = placeMain:Dropdown({
         saveConfig()
     end,
 }, "AutoPlaceMode")
-Controls.smartFreeze = placeMain:Toggle({
+Controls.smartFreeze = placeOptions:Toggle({
     Name = "Time stop / freeze skills at the best moment",
     Default = AutoPlace.smartFreeze,
     Callback = function(on) AutoPlace.smartFreeze = on; saveConfig() end,
 }, "AutoPlaceFreeze")
-Controls.sellFarmsLast = placeMain:Toggle({
+Controls.sellFarmsLast = placeOptions:Toggle({
     Name = "Sell farm units on the last wave",
     Default = AutoPlace.sellFarmsLast,
     Callback = function(on) AutoPlace.sellFarmsLast = on; saveConfig() end,
 }, "AutoPlaceSellFarms")
-placeMain:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
-placeMain:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
-placeMain:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
-placeMain:Button({ Name = "Save unit catalog", Callback = function() pcall(AutoPlaceModule.SaveCatalog) end })
-placeMain:Paragraph({ Header = "", Body = "Watches where enemies walk (saved per stage),\nthen places your team beside the path where\nit covers the most road, as soon as money\nallows. Uses whatever team you have equipped." })
+Controls.showDetails = placeOptions:Toggle({
+    Name = "Show full status",
+    Default = AutoPlace.showDetails,
+    Callback = function(on) AutoPlace.showDetails = on; saveConfig(); AutoPlaceModule.refreshUI() end,
+}, "AutoPlaceDetails")
 
-placeSlots:Header({ Text = "How many per team slot (0 = none)" })
+placeSlots:Header({ Text = "Units per slot" })
 Controls.placeSlots = {}
 for s = 1, 6 do
     Controls.placeSlots[s] = placeSlots:Slider({
@@ -5811,7 +6049,7 @@ for s = 1, 6 do
         Callback = function(v) AutoPlace.slots[s] = v; saveConfig() end,
     }, "PlaceSlot" .. s)
 end
-placeSlots:Paragraph({ Header = "", Body = "Slots follow your in-game team order and are\nfilled from slot 1 down. 8 = as many as the\ngame allows. Buff units placed here join the\nbuff rotation on the Units page." })
+placeSlots:Paragraph({ Header = "", Body = "Team order, slot 1 first; 8 = game limit." })
 end
 
 -- TAB 4: Dungeon
@@ -5966,6 +6204,13 @@ webhookSection:Button({
     end,
 })
 
+-- Auto Place tools (moved here from the Auto Farm tab)
+AutoPlaceModule.toolsUI = settingsTab:Section({ Side = "Right" })
+AutoPlaceModule.toolsUI:Header({ Text = "Tools" })
+AutoPlaceModule.toolsUI:Button({ Name = "Refresh team", Callback = function() AutoPlaceModule.RefreshTeam(); AutoPlaceModule.refreshUI() end })
+AutoPlaceModule.toolsUI:Button({ Name = "Forget path and unit limits", Callback = function() AutoPlaceModule.ForgetPath(); AutoPlaceModule.refreshUI() end })
+AutoPlaceModule.toolsUI:Button({ Name = "Copy game data report", Callback = AutoPlaceModule.MapReport })
+AutoPlaceModule.toolsUI:Button({ Name = "Save unit catalog", Callback = function() pcall(AutoPlaceModule.SaveCatalog) end })
 toolsSection:Header({ Text = "Session stats" })
 UIRef.statsText = toolsSection:Paragraph({ Header = "Stats", Body = "" })
 toolsSection:Button({ Name = "Refresh stats", Callback = ToolsModule.RefreshStats })
@@ -6164,6 +6409,7 @@ applyRuntimeFeatures = function()
     pcall(function() Controls.placeMode:UpdateSelection(AutoPlace.placeMode) end)
     setControl(Controls.smartFreeze, AutoPlace.smartFreeze)
     setControl(Controls.sellFarmsLast, AutoPlace.sellFarmsLast)
+    setControl(Controls.autoTarget, AutoPlace.autoTarget)
     setControl(Controls.showDetails, AutoPlace.showDetails)
     pcall(function() Controls.preset:UpdateSelection(AutoPlace.preset) end)
     for s = 1, 6 do setControl(Controls.placeSlots and Controls.placeSlots[s], AutoPlace.slots[s]) end
