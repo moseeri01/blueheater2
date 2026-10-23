@@ -3469,14 +3469,14 @@ AutoPlaceModule.loadUnix = os.time()
 -- unit_id, _creation_time, ... }) every 10 s; unit_removed_temporary when one goes);
 -- badTemp: copies the game refused to place
 AutoPlaceModule.liveTemp, AutoPlaceModule.goneTemp, AutoPlaceModule.badTemp, AutoPlaceModule.tempVersion = {}, {}, {}, 0
-AutoPlaceModule.usedModel = setmetatable({}, { __mode = "v" })
+AutoPlaceModule.usedSlot = {}
 task.spawn(pcall, function()
     local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
     local function uuidOf(v) return type(v) == "table" and v.uuid and tostring(v.uuid) or (type(v) == "string" and v or nil) end
     stc:WaitForChild("unit_added_temporary", 5).OnClientEvent:Connect(function(data)
         local uuid = uuidOf(data)
         if uuid and type(data) == "table" and data.unit_id then
-            AutoPlaceModule.liveTemp[uuid] = { id = tostring(data.unit_id), made = tonumber(data._creation_time) or os.time() }
+            AutoPlaceModule.liveTemp[uuid] = { id = tostring(data.unit_id), made = tonumber(data._creation_time) or os.time(), seen = os.clock() }
             AutoPlaceModule.goneTemp[uuid] = nil
             AutoPlaceModule.tempVersion = AutoPlaceModule.tempVersion + 1
         end
@@ -3512,8 +3512,16 @@ function AutoPlaceModule.HotbarTeam()
         local model = world and world:FindFirstChildOfClass("Model")
         if model then
             local priceLabel = slot:FindFirstChild("Cost") and slot.Cost:FindFirstChild("text")
-            -- (a slot whose copy was placed shows the same model until a new copy replaces it)
-            if AutoPlaceModule.usedModel[s] ~= model then
+            -- (a slot whose copy was placed may keep showing that unit: skipped until the game
+            -- announces a newer copy of it)
+            local used = AutoPlaceModule.usedSlot[s]
+            local stale = used and used.id == (model.Name:gsub(":.*$", ""))
+            if stale then
+                for _, info in pairs(AutoPlaceModule.liveTemp) do
+                    if info.id == used.id and (info.seen or 0) > used.at then stale = false end
+                end
+            end
+            if not stale then
                 slots[s] = { id = (model.Name:gsub(":.*$", "")), model = model,
                     price = priceLabel and tonumber((tostring(priceLabel.Text):gsub("[^%d]", ""))) }
                 sig[#sig + 1] = s .. "=" .. slots[s].id
@@ -3536,11 +3544,18 @@ function AutoPlaceModule.HotbarTeam()
     end
     -- (once the game announced copies this run, only those count: memory also holds old ones)
     if #found == 0 and type(getgc) == "function" then
+        -- (units already on the map have their own tables too: never one of those)
+        local onMap = {}
+        for _, u in ipairs(ownedUnits()) do
+            local st = u:FindFirstChild("_stats")
+            local id = st and st:FindFirstChild("uuid")
+            if id then onMap[tostring(id.Value)] = true end
+        end
         pcall(function()
             for _, v in ipairs(getgc(true)) do
                 if type(v) == "table" and rawget(v, "uuid") and rawget(v, "unit_id") and rawget(v, "equipped_slot") == nil then
                     local made = tonumber(rawget(v, "_creation_time"))
-                    if made and made >= AutoPlaceModule.loadUnix - 1800 then
+                    if made and made >= AutoPlaceModule.loadUnix - 1800 and not onMap[tostring(rawget(v, "uuid"))] then
                         table.insert(found, { id = tostring(rawget(v, "unit_id")), uuid = tostring(rawget(v, "uuid")), made = made })
                     end
                 end
@@ -4736,7 +4751,7 @@ local function tick()
         -- counted from the map; the bar is read again on the next tick)
         if t.temp then
             AutoPlaceModule.full[t.uuid], AutoPlaceModule.badTemp[t.uuid] = true, true
-            if t.slot then AutoPlaceModule.usedModel[t.slot] = t.model end
+            if t.slot then AutoPlaceModule.usedSlot[t.slot] = { id = t.name, at = os.clock() } end
             AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
         end
         AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
@@ -7672,9 +7687,15 @@ function Lobby.Loop()
                 local hp, hpMax = AutoPlaceModule.ScanBaseHp()
                 local money = readCostValue("LP._stats.resource")
                 Lobby.live = Lobby.live or {}
-                table.insert(Lobby.live, string.format("%s money %s base %s/%s units %d try %s candy %s | %s", os.date("%H:%M:%S"),
+                local slots, live = {}, 0
+                for s = 1, 6 do
+                    local t = AutoPlaceModule.team[s]
+                    if t then table.insert(slots, s .. "=" .. t.name .. ":" .. tostring(t.uuid):sub(2, 5)) end
+                end
+                for _ in pairs(AutoPlaceModule.liveTemp) do live = live + 1 end
+                table.insert(Lobby.live, string.format("%s money %s base %s/%s units %d try %s candy %s live %d team %s | %s", os.date("%H:%M:%S"),
                     tostring(money and math.floor(money)), tostring(hp), tostring(hpMax), #ownedUnits(), tostring(AutoPlaceModule.lastTry),
-                    tostring(Lobby.candy), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
+                    tostring(Lobby.candy), live, table.concat(slots, ","), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
                 if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
             end)
