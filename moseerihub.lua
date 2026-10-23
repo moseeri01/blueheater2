@@ -3470,6 +3470,7 @@ AutoPlaceModule.loadUnix = os.time()
 -- badTemp: copies the game refused to place
 AutoPlaceModule.liveTemp, AutoPlaceModule.goneTemp, AutoPlaceModule.badTemp, AutoPlaceModule.tempVersion = {}, {}, {}, 0
 AutoPlaceModule.usedSlot = {}
+AutoPlaceModule.EVENT_CAP = 20
 task.spawn(pcall, function()
     local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
     local function uuidOf(v) return type(v) == "table" and v.uuid and tostring(v.uuid) or (type(v) == "string" and v or nil) end
@@ -4662,6 +4663,9 @@ local function tick()
     local slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, danger)
     -- Place units myself (Home): the player places, the script only upgrades / sells
     if AutoPlace.manual then t = nil end
+    -- Fool's Hunt: 20 units at most on the map (seen in the real game); then the money goes into
+    -- upgrades instead of refused placements
+    if t and AutoPlaceModule.hotbarAt and #ownedUnits() >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) then t = nil end
     -- air quota not met but no air unit can go down now (no hill spot, at its limit): say so
     -- once and go on in the normal order, never stall
     if AutoPlaceModule.airNeed and t and role == "dps" and not AutoPlaceModule.AirCapable(t.name, 0) and not AutoPlaceModule.airFallbackNoted then
@@ -4756,6 +4760,7 @@ local function tick()
         -- counted from the map; the bar is read again on the next tick)
         if t.temp then
             AutoPlaceModule.full[t.uuid], AutoPlaceModule.badTemp[t.uuid] = true, true
+            AutoPlaceModule.capFails = 0
             if t.slot then AutoPlaceModule.usedSlot[t.slot] = { id = t.name, at = os.clock() } end
             AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
         end
@@ -4798,6 +4803,11 @@ local function tick()
         t.refused = (t.refused or 0) + 1
         -- an event copy not announced by the game this run (a replay leaves the last game's in
         -- memory) and refused twice: try the next copy of that unit
+        -- (event: refused three times in a row with this many units down = the map is full)
+        if t.temp then
+            AutoPlaceModule.capFails = (AutoPlaceModule.capFails or 0) + 1
+            if AutoPlaceModule.capFails >= 3 and #ownedUnits() > 0 then AutoPlaceModule.capSeen = #ownedUnits() end
+        end
         if t.temp and t.refused >= 2 and not AutoPlaceModule.liveTemp[t.uuid] then
             AutoPlaceModule.badTemp[t.uuid], AutoPlaceModule.hotbarSig = true, nil
             AutoPlaceModule.RefreshTeam()
