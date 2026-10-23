@@ -4459,6 +4459,8 @@ local function chooseNext(prices, danger)
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
             local target = math.min(AutoPlaceModule.SlotTarget(s, t), tonumber(AutoPlace.caps[t.name]) or AutoPlaceModule.gameCaps[t.name] or 99,
                 AutoPlaceModule.TraitMods(t.traits).cap or 99)
+            -- an event copy is one unit: placed once, then its slot frees for the next random one
+            if t.temp then target = math.min(target, 1) end
             -- slots set to 0 or found full with none down do not count as the strongest
             if role == "dps" and target > 0 and (placed > 0 or not AutoPlaceModule.full[t.uuid]) then
                 local cost = t.cost or prices[s]
@@ -4710,6 +4712,8 @@ local function tick()
     end
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     if tryPlace(t, spot) then
+        -- (event: the copy left the bar; read the bar again on the next tick)
+        if t.temp then AutoPlaceModule.hotbarAt = 0 end
         AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
         t.spotRefused = 0
         AutoPlaceModule.problem = nil
