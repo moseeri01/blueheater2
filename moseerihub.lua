@@ -552,7 +552,8 @@ describeValue = function(v, depth, limits)
     if t == "Vector3" then return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z) end
     if t == "Vector2" then return string.format("(%.1f, %.1f)", v.X, v.Y) end
     if t == "CFrame" then return string.format("@(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z) end
-    if t == "Instance" then return v.Name end
+    -- (the full path: a unit on the map and a model in the game's own folders can share a name)
+    if t == "Instance" then local ok, p = pcall(function() return v:GetFullName() end) return ok and p or v.Name end
     if t == "table" then return describeTable(v, depth, limits) end
     return t
 end
@@ -7917,22 +7918,44 @@ end
 
 -- How much a card hurts us (0 = nothing): enemy health and speed directly, resistance only
 -- for the damage types we deal (true damage ignores it), shields and death bombs a little.
+Lobby.AVOID = 10
 function Lobby.CardCost(opt, share)
     local cost = 0
     for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
         local t, a = tostring(e.type), tonumber(e.amount) or 0
         if t == "candy_multiplier" then
             -- (the reward, not a cost)
-        elseif t == "enemy_stat_mul" then cost = cost + a
-        -- (+25% speed = 20% less time in range, about +25% health: a bit worse for leaks)
-        elseif t == "enemy_speedup" then cost = cost + 1.2 * a
-        elseif t == "enemy_resistance_specific" then cost = cost + 1.5 * (a / 100) * (share[tostring(e.damage_type)] or 0)
+        -- (owner 2026-10-24: never Enemy Health, Enemy Speed or armor against the damage we deal
+        -- while another card is there: AVOID puts them behind every other one)
+        elseif t == "enemy_stat_mul" then cost = cost + Lobby.AVOID + a
+        elseif t == "enemy_speedup" then cost = cost + Lobby.AVOID + 1.2 * a
+        elseif t == "enemy_resistance_specific" then
+            local mine = share[tostring(e.damage_type)] or 0
+            cost = cost + 1.5 * (a / 100) * mine + (mine >= 0.3 and Lobby.AVOID or 0)
+        -- (regen once is fine, more of it stacks up: each one taken costs more)
+        elseif t == "enemy_regen" then cost = cost + 100 * a * (1 + (Lobby.regenTaken or 0))
         elseif t == "enemy_shield" then cost = cost + 0.1 * a
         elseif t == "enemy_bomb" then cost = cost + 0.2
         elseif opt.option_type == "Bad" then cost = cost + 0.6
         end
     end
     return cost
+end
+
+-- How much a Good card helps: damage first, then range, then attack speed (owner 2026-10-24);
+-- Yen (resource_gain) never: the owner cut it - damage and range help more. nil = not taken.
+function Lobby.CardGain(opt)
+    local gain = 0
+    for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
+        local t, stat, a = tostring(e.type), tostring(e.stat), math.abs(tonumber(e.amount) or 0)
+        if t == "resource_gain" then return nil
+        elseif t == "stat_mul" and stat == "damage" then gain = gain + 1.0 * a
+        elseif t == "stat_mul" and stat == "range" then gain = gain + 0.9 * a
+        elseif t == "stat_mul" and stat == "attack_cooldown" then gain = gain + 0.8 * a
+        else gain = gain + 0.3 * a
+        end
+    end
+    return gain
 end
 
 -- The card to pick: "Most coins" takes the Bad card that hurts least (each adds 0.3 to the
@@ -7942,10 +7965,12 @@ function Lobby.PickCard(options)
     local share = Lobby.DamageShare()
     local hp, hpMax = AutoPlaceModule.ScanBaseHp()
     local hurt = hp and hpMax and hpMax > 0 and hp / hpMax < 0.8
-    local bestBad, bestBadCost, good
+    local bestBad, bestBadCost, good, goodGain
     for i, o in ipairs(options) do
         if type(o) == "table" then
-            if o.option_type == "Good" then good = good or i
+            if o.option_type == "Good" then
+                local g = Lobby.CardGain(o)
+                if g and (not good or g > goodGain) then good, goodGain = i, g end
             else
                 local c = Lobby.CardCost(o, share)
                 if not bestBad or c < bestBadCost then bestBad, bestBadCost = i, c end
@@ -8017,6 +8042,11 @@ end
 
 function Lobby.OnCardResult(picked, state)
     if type(state) == "table" then Lobby.candy = tonumber(state.candy_multiplier) or Lobby.candy end
+    if type(picked) == "table" then
+        for _, e in ipairs(Lobby.AsList(type(picked.effects) == "table" and picked.effects or {})) do
+            if e.type == "enemy_regen" then Lobby.regenTaken = (Lobby.regenTaken or 0) + 1 end
+        end
+    end
     local p = Lobby.pendingVote
     Lobby.pendingVote = nil
     Lobby.cardInfo = string.format("%s -> got %s", tostring(Lobby.cardInfo), type(picked) == "table" and tostring(picked.title) or "?")
@@ -8147,6 +8177,8 @@ end
 
 function Lobby.SpellSaving(money)
     if not Lobby.cfg.eventSpells or not State.eventMode or not money then return nil end
+    -- (only once a spell has gone through: saving for one the game ignores held 8k+ unused)
+    if not Lobby.SpellWayOk(Lobby.cfg.spellWay) then return nil end
     local dps, topLevel = 0, 0
     for _, u in ipairs(ownedUnits()) do
         local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
@@ -8209,7 +8241,15 @@ function Lobby.SpellStep(money)
             -- sent without waiting: a call in a shape the game does not take got no answer, and
             -- waiting for it stopped Auto Place for the rest of the game (real game, 2026-10-24)
             -- (taps on the unit missed: the game sent the spell with no target - real game 2026-10-24)
-            if remote then task.spawn(pcall, function() remote:InvokeServer(slot.Name, target) end) end
+            -- (the game's answer is noted: the same-looking call from the owner's hand went through,
+            -- the script's got ignored - real game 2026-10-24)
+            if remote then
+                task.spawn(pcall, function()
+                    local a, b = remote:InvokeServer(slot.Name, target)
+                    AutoPlaceModule.Note(string.format("spell answer %s: %s %s (slot %s, %s)", id, tostring(a), tostring(b),
+                        tostring(slot.Name), target and target:GetFullName() or "no target"))
+                end)
+            end
             AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
             return
         end
