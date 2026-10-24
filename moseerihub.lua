@@ -3442,6 +3442,17 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
         local mode = AutoPlaceModule.Mode()
         local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
+        -- (Fool's Hunt: a copy goes next to one of its own kind, inside its reach, so Merge can fold
+        -- them - spread over the map, three fujitoras never could)
+        local kin = {}
+        if State.eventMode and AutoPlaceModule.placingName then
+            for _, u in ipairs(ownedUnits()) do
+                if unitType(u) == AutoPlaceModule.placingName then
+                    local p = AutoPlaceModule.RootPos(u)
+                    if p then kin[#kin + 1] = p end
+                end
+            end
+        end
         local scored = {}
         for _, c in ipairs(free) do
             local n, passes, inside = 0, 0, false
@@ -3467,6 +3478,9 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 if mode == "Fast clear" and not back then n = n * nearSpawn ^ 2
                 elseif mode == "Safe" then n = n * (1 - nearSpawn) ^ 2
                 else n = n * (1 - nearSpawn) end
+            end
+            for _, p in ipairs(kin) do
+                if (p.X - c.x) ^ 2 + (p.Z - c.z) ^ 2 <= (r * 0.6) ^ 2 then n = n * 1.5 break end
             end
             table.insert(scored, { c = c, n = n })
         end
@@ -4432,6 +4446,11 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     local focus = ControlUp.focus(units, now)
     local fuse = ControlUp.fusionFocus(units)
     local summonerDown = AutoPlaceModule.SummonerDown(units)
+    local topOf = {}
+    for _, o in ipairs(units) do
+        local k = unitType(o) or ""
+        topOf[k] = math.max(topOf[k] or 0, AutoPlaceModule.StatNum(o, "upgrade") or 0)
+    end
     for _, u in ipairs(units) do
         local role = unitRole(u)
         -- (owner: a Never unit is not upgraded either - akainu and Cream get slower with upgrades)
@@ -4472,6 +4491,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 -- took the money and the mains stayed low - a lost game 2026-10-24)
                 if State.eventMode and rank == 2 and score > 0 then
                     local kind = unitType(u) or ""
+                    -- (the leading copy of a kind first: fujitora x3 all at level 2 helps less than one at 6)
+                    if level < (topOf[kind] or 0) then score = score * 0.3 end
                     -- (from wave 8 the units that hit flyers count as mains too: two metal_knights sat at
                     -- level 0 and a flyer took the game at wave 12)
                     local airMain = AutoPlaceModule.WaveNumber() >= 8 and AutoPlaceModule.AirCapable(kind, math.huge)
@@ -4726,8 +4747,9 @@ function AutoPlaceModule.FarmPays(u, level, cost)
     local now = level == 0 and tonumber(def.farm_amount) or (type(up[level]) == "table" and tonumber(up[level].farm_amount))
     local nextAmount = tonumber(up[level + 1].farm_amount)
     if not now or not nextAmount or nextAmount <= now then return true end
-    -- (Fool's Hunt: the owner upgrades the farms to the top)
-    if State.eventMode then return true end
+    -- (Fool's Hunt: farms to the top early, none after wave 10 - a bulma maxed at ~39k by wave 13
+    -- left the damage units at levels 0-2 and the game was lost)
+    if State.eventMode then return AutoPlaceModule.WaveNumber() < 10 end
     local left = AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber()
     return cost / (nextAmount - now) <= left / 2
 end
@@ -5205,6 +5227,7 @@ local function tick()
     local kind = AutoPlaceModule.PlacementKind(t)
     local aoe = AutoPlaceModule.IsAoe(t.name)
     local back = AutoPlaceModule.IsTrap(t.name) and AutoPlaceModule.AirCapable(t.name, 0)
+    AutoPlaceModule.placingName = t.name
     local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range, kind, aoe, back) or bestSpot(0, role, range, kind, aoe, back)
     if not spot then
         -- no spot of this kind (e.g. a hill unit on a map without free hills): let the
@@ -7026,6 +7049,8 @@ pcall(function()
         local text = type(msg) == "string" and msg or ""
         if text == "" then pcall(function() text = gs:GetErrorMessage() end) end
         if text == "" or Webhook.disconnectSent then return end
+        -- (Fool's Hunt: leaving right after a game ended is the replay teleport, not a kick)
+        if State.eventMode and os.clock() - (Webhook.endedAt or -1e9) < 120 then return end
         Webhook.disconnectSent = true
         if Webhook.pingDisconnect ~= false then pcall(Webhook.Alert, "disconnect", "⚠️ Disconnected", clip(text, 300), 15105570) end
     end
@@ -7057,6 +7082,7 @@ task.spawn(function()
         local results = isResultsShowing()
         if results and not wasResults and startSnap and not reported then
             reported = true -- (the result screen going away and back is the same game)
+            Webhook.endedAt = os.clock()
             local win = Webhook.ResultWin()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
@@ -7089,7 +7115,8 @@ task.spawn(function()
             elseif bagTurnedFull and Webhook.pingBagFull ~= false then
                 Webhook.Alert("bag", "⛔ Bag full", "Your bag is full: new drops are lost until you make room.", 15548997)
             end
-            if Webhook.pingMythic ~= false and unitsBefore then
+            -- (not in Fool's Hunt: its random copies are not drops - every one was announced)
+            if Webhook.pingMythic ~= false and unitsBefore and not State.eventMode then
                 local okR, drops = pcall(Webhook.RareDrops, unitsBefore)
                 if okR and #drops > 0 then
                     Webhook.Alert("mythic", "🌟 " .. drops[1], table.concat(drops, "\n"), 16766720)
