@@ -146,8 +146,8 @@ local Lobby = {
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
         eventBrain = true, maxSpellsHeld = 2,
-        eventAlways = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "vanilla_ice_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "tengen_2_evolved", "archer_evolved", "konan_unit_evolved" },
-        eventNever = { "armin", "stain_evolved", "narberal_evolved", "jiraiya_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "emilia", "natsu_evolved", "caesarclown_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
+        eventAlways = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "tengen_2_evolved", "archer_evolved", "konan_unit_evolved" },
+        eventNever = { "armin", "stain_evolved", "narberal_evolved", "jiraiya_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "emilia", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
 }
 
@@ -4325,6 +4325,15 @@ function AutoPlaceModule.DropCopy(t, why)
     AutoPlaceModule.Note(string.format("copy cleared: %s (%s)", t.name, why))
 end
 
+AutoPlaceModule.SUMMON_BUFF = { giselle_evolved = true, giselle = true }
+function AutoPlaceModule.SummonerDown(units)
+    for _, o in ipairs(units) do
+        local def = AutoPlaceModule.UnitDef(unitType(o) or "") or {}
+        if def.spawn_unit or def.spawn_script or tostring(def.primary_attack_no_upgrades or ""):find("elyssia") then return true end
+    end
+    return false
+end
+
 -- Does this placed unit carry the trait (team data by uuid: traits = {{trait = "unique", tier = 1}})?
 function AutoPlaceModule.HasTrait(u, name)
     local uuid = u:FindFirstChild("_stats") and u._stats:FindFirstChild("uuid")
@@ -4366,7 +4375,9 @@ end
 local function upgradeStep(money, onlyRole, airOnly, noWait)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
-    local RANK = { farm = 1, dps = 2, support = 2 }
+    -- (owner 2026-10-24: the always-on aura unit (hoshino: team damage +7% -> +15%, upgrades
+    -- 10% -> 20% cheaper) is upgraded to the top early, with the farms; rotation buffers never)
+    local RANK = { farm = 1, dps = 2, support = 1 }
     local pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir
     -- flying enemies on the map: damage units that can hit them (after this upgrade) go first
     local air = AutoPlaceModule.airNeed == true
@@ -4376,7 +4387,9 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     local fuse = ControlUp.fusionFocus(units)
     for _, u in ipairs(units) do
         local role = unitRole(u)
-        if role ~= "buff" and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
+        -- (owner: a Never unit is not upgraded either - akainu and Cream get slower with upgrades)
+        local never = State.eventMode and AutoPlaceModule.InList(Lobby.cfg.eventNever, unitType(u))
+        if role ~= "buff" and not never and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
             and not AutoPlaceModule.OutOfReach(u) then
             local stats = u:FindFirstChild("_stats")
             local lvl = stats and stats:FindFirstChild("upgrade")
@@ -4400,6 +4413,9 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 if rank == 2 and fuse[u] then score = math.max(score, 1e-6) end
                 -- (owner 2026-10-24: the Unique-trait unit is upgraded first, to the top)
                 if rank == 2 and score > 0 and AutoPlaceModule.HasTrait(u, "unique") then score = score * 1e6 end
+                -- (owner: giselle also raises summons' damage - worth twice its own gain while a
+                -- summoner such as elyssia is down)
+                if AutoPlaceModule.SUMMON_BUFF[unitType(u) or ""] and AutoPlaceModule.SummonerDown(units) then score = score * 2 end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
@@ -4792,7 +4808,7 @@ end
 -- one, saving for it when it cannot be paid yet. Farms, buff units and flyer hitters while short
 -- go first. Returns seconds to wait, or nil and the copy to place.
 -- strongest first (simulator: damage per map place at full upgrade; judar first - owner)
-AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "vanilla_ice_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "tengen_2_evolved", "archer_evolved", "konan_unit_evolved" }
+AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "tengen_2_evolved", "archer_evolved", "konan_unit_evolved" }
 AutoPlaceModule.ROSTER = { "akainu_evolved", "aokiji_evolved", "archer_evolved", "armin", "avdol_evolved", "bee_girl_evolved", "caesarclown_evolved", "cid_evolved", "daki_evolved", "demiurge_evolved", "emilia", "escanor_evolved", "esdeath_evolved", "frieren_evolved", "fujitora_evolved", "ghostkun_evolved", "gildarts_evolved", "gilgamesh_evolved", "goku_ssj3_evolved", "gremmy_evolved", "guts_berserker", "gyutaro_evolved", "hakari_evolved", "hidan_unit_evolved", "illya_evolved", "jiraiya_evolved", "josuke_2_evolved", "judar_evolved", "julius_evolved", "koichi_evolved", "konan_unit_evolved", "law_2_evolved", "medea_evolved", "meliodas_evolved", "metal_knight_evolved", "monet_evolved", "narberal_evolved", "naruto_6tails", "natsu_evolved", "pucci_heaven", "saber_evolved", "sabo_evolved", "sakamoto_evolved", "shalltear_evolved", "shigaraki_evolved", "stain_evolved", "sukuna", "tatsumaki_evolved", "tengen_2_evolved", "usopp_ts_evolved", "vanilla_ice_evolved" }
 function AutoPlaceModule.InList(list, name)
     for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
@@ -8631,6 +8647,7 @@ function Lobby.SpellStep(money)
     if not Lobby.cfg.eventSpells or not money then return end
     local remote = getAARemote("use_ingame_spell")
     if os.clock() - (Lobby.spellAt or -1e9) < 4 then return end
+    if Lobby.SpellCap() then return end
     for _, id in ipairs(Lobby.spells or {}) do
         local spec = Lobby.SPELLS[id]
         -- spells that only take a slot from the next random unit: dropped with their X
@@ -8678,23 +8695,27 @@ function Lobby.SpellStep(money)
             return
         end
     end
-    -- (owner: spells waiting for money or a target must not fill the bar - a bar full of them
-    -- gets no new units; above the limit the least useful one is cleared)
+end
+
+-- (owner: spells waiting for money or a target must not fill the bar - a bar full of them gets
+-- no new units; above the limit the least useful one is cleared. Checked FIRST each time: at the
+-- end of the spell step it was never reached while a Refund kept finding someone to try - five
+-- Refunds filled the bar in a real game)
+function Lobby.SpellCap()
     local held = Lobby.spells or {}
-    if #held > (tonumber(Lobby.cfg.maxSpellsHeld) or 2) then
-        local worst, worstP
-        for _, id in ipairs(held) do
-            local p = Lobby.SPELL_KEEP[id] or 0
-            if not worst or p < worstP then worst, worstP = id, p end
-        end
-        local slot = worst and Lobby.SpellSlot(worst)
-        local x = slot and slot:FindFirstChild("Delete", true)
-        if x then
-            Lobby.spellAt = os.clock()
-            Lobby.TapGui(x)
-            AutoPlaceModule.Note("spell dropped: " .. worst .. " (more than " .. tostring(Lobby.cfg.maxSpellsHeld or 2) .. " waiting)")
-        end
+    if #held <= (tonumber(Lobby.cfg.maxSpellsHeld) or 2) then return false end
+    local worst, worstP
+    for _, id in ipairs(held) do
+        local p = Lobby.SPELL_KEEP[id] or 0
+        if not worst or p < worstP then worst, worstP = id, p end
     end
+    local slot = worst and Lobby.SpellSlot(worst)
+    local x = slot and slot:FindFirstChild("Delete", true)
+    if not x then return false end
+    Lobby.spellAt = os.clock()
+    Lobby.TapGui(x)
+    AutoPlaceModule.Note("spell dropped: " .. worst .. " (more than " .. tostring(Lobby.cfg.maxSpellsHeld or 2) .. " waiting)")
+    return true
 end
 -- which spell to keep when too many wait (higher = kept)
 Lobby.SPELL_KEEP = { ritual = 7, clone = 6, random_buff = 5, summon = 4, sacrifice = 3, sell_refund = 2, gate = 1 }
