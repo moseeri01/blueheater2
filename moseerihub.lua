@@ -4233,6 +4233,31 @@ function AutoPlaceModule.EventWeak(t, role)
     return mine < all[math.floor(#all / 2) + 1] * AutoPlaceModule.WEAK_SHARE
 end
 
+-- Fool's Hunt: a copy of a unit already at its own limit (bulma 1, speedwagon 3) cannot be
+-- placed; trying it again and again held the money for 30 s at a time in a real game.
+function AutoPlaceModule.EventCapped(t)
+    if not State.eventMode or not t or not t.temp then return false end
+    local def = AutoPlaceModule.UnitDef(t.name)
+    local cap = def and tonumber(def.spawn_cap)
+    if not cap then return false end
+    local n, base = 0, AutoPlaceModule.BaseId(t.name)
+    for _, u in ipairs(ownedUnits()) do
+        if AutoPlaceModule.BaseId(unitType(u) or "") == base then n = n + 1 end
+    end
+    return n >= cap
+end
+
+-- Clears a Fool's Hunt copy with its X on the bar: the slot rolls a new one.
+function AutoPlaceModule.DropCopy(t, why)
+    local bar = Lobby.SpellSlotBar and Lobby.SpellSlotBar()
+    local x = bar and bar:FindFirstChild(tostring(t.slot))
+    x = x and x:FindFirstChild("Delete", true)
+    AutoPlaceModule.badTemp[t.uuid] = true
+    AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
+    if x then Lobby.TapGui(x) end
+    AutoPlaceModule.Note(string.format("copy cleared: %s (%s)", t.name, why))
+end
+
 -- Best damage gained per ¥ from upgrading any placed damage unit (0 when none can be upgraded).
 function AutoPlaceModule.BestUpgradeScore()
     local best, now = 0, os.clock()
@@ -4278,6 +4303,9 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             -- a farm upgrade must pay back in time (friend's Infinity Mansion loss: ~60k in farms
             -- by wave 9, Bulma at 6, the damage units barely upgraded)
             if can and role == "farm" and not AutoPlaceModule.FarmPays(u, level, cost) then can = false end
+            -- (spare money only: an upgrade it cannot pay must not block one it can - a farm's
+            -- 6500 upgrade held 30k unused in a real game)
+            if can and noWait and cost and money and cost > money then can = false end
             if can then
                 local rank = RANK[role] or 2
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
@@ -4803,14 +4831,11 @@ local function tick()
     end
     local cost = t.cost or hudPrices[slot]
     if AutoPlaceModule.EventWeak(t, role) then
-        -- (cleared with its X: the bar rolls a new copy into the slot)
-        local bar = Lobby.SpellSlotBar and Lobby.SpellSlotBar()
-        local x = bar and bar:FindFirstChild(tostring(t.slot))
-        x = x and x:FindFirstChild("Delete", true)
-        AutoPlaceModule.badTemp[t.uuid] = true
-        AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
-        if x then Lobby.TapGui(x) end
-        AutoPlaceModule.Note(string.format("weak copy cleared: %s (far below the team)", t.name))
+        AutoPlaceModule.DropCopy(t, "far below the team")
+        return 0.5
+    end
+    if AutoPlaceModule.EventCapped(t) then
+        AutoPlaceModule.DropCopy(t, "its unit is at the limit")
         return 0.5
     end
     -- Fool's Hunt: copies come one at a time, so money past this copy's price would sit unused
@@ -4910,6 +4935,14 @@ local function tick()
         if t.temp then
             AutoPlaceModule.capFails = (AutoPlaceModule.capFails or 0) + 1
             if AutoPlaceModule.capFails >= 3 and #ownedUnits() > 0 then AutoPlaceModule.capSeen = #ownedUnits() end
+        end
+        -- (below the map's unit limit only: at the limit every copy is refused)
+        if t.temp and t.refused >= 3 and AutoPlaceModule.liveTemp[t.uuid] and State.eventMode
+            and #ownedUnits() < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 1 then
+            for _, k in ipairs(recentBad) do badSpots[k] = nil end
+            recentBad = {}
+            AutoPlaceModule.DropCopy(t, "refused 3 times with the money in hand")
+            return 0.2
         end
         if t.temp and t.refused >= 2 and not AutoPlaceModule.liveTemp[t.uuid] then
             AutoPlaceModule.badTemp[t.uuid], AutoPlaceModule.hotbarSig = true, nil
