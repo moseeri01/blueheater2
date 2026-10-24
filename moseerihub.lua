@@ -4384,7 +4384,8 @@ AutoPlaceModule.SUMMON_BUFF = { giselle_evolved = true, giselle = true }
 -- is left over and then upgraded to the top (its skill speeds up the team's attacks)
 -- (jiraiya and emilia slow the enemies: placed, never upgraded)
 -- (owner: before judar comes, bee_girl and sakamoto are both upgraded; then judar only)
-AutoPlaceModule.EARLY_CARRY = { bee_girl_evolved = true, sakamoto_evolved = true }
+-- (Siren / monet carries instead when no bee_girl came - owner)
+AutoPlaceModule.EARLY_CARRY = { bee_girl_evolved = true, sakamoto_evolved = true, monet_evolved = true }
 -- (nagumo cuts HP: placed whenever it comes, no upgrades - owner 2026-10-24)
 AutoPlaceModule.UP_CAP = { saber_evolved = 2, jiraiya_evolved = 0, emilia = 0, nagumo_evolved = 0 }
 AutoPlaceModule.UP_FIRST = { pucci_heaven = true }
@@ -4476,6 +4477,11 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             end
         end
     end
+    -- (owner: before wave 10, no damage upgrade unless the carry is a main or an early carry -
+    -- medea, archer, gyutaro were upgraded for nothing while the enemies were still easy)
+    local carryKind = carry and unitType(carry) or ""
+    local earlyNoCarry = State.eventMode and AutoPlaceModule.WaveNumber() < 10
+        and not (AutoPlaceModule.EARLY_CARRY[carryKind] or (AutoPlaceModule.InList(AutoPlaceModule.RANK, carryKind) and not AutoPlaceModule.UP_CAP[carryKind]))
     local topOf = {}
     for _, o in ipairs(units) do
         local k = unitType(o) or ""
@@ -4535,6 +4541,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
                     -- skip: only units that hit flyers this time
+                elseif State.eventMode and rank == 2 and earlyNoCarry then
+                    -- skip: early game with no main / early carry down - money goes to farms and the mains to come
                 elseif State.eventMode and carry and rank == 2 and u ~= carry
                     and not (unitType(carry) ~= "judar_evolved" and AutoPlaceModule.EARLY_CARRY[unitType(u) or ""]) then
                     -- skip: the carry goes to the top first
