@@ -4716,7 +4716,9 @@ local function tick()
             if not t.fields then AutoPlaceModule.extraTeamRead = true AutoPlaceModule.RefreshTeam() break end
         end
     end
-    if not next(AutoPlaceModule.team) then
+    -- (Fool's Hunt: a bar with no unit copy on it is normal - nothing to place, the money goes
+    -- into upgrades; stopping here held 40k unused with 13 units down until the loss)
+    if not next(AutoPlaceModule.team) and not State.eventMode then
         AutoPlaceModule.problem = "team not found yet - place one unit by hand, or press Refresh team"
         return 2
     end
@@ -4803,6 +4805,8 @@ local function tick()
         if wait then return wait end
         slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, false)
         if AutoPlace.manual then t = nil end
+        -- (the same map limit as the first pick: this second one went past it, 22 refusals)
+        if t and AutoPlaceModule.hotbarAt and #ownedUnits() >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) then t = nil end
     end
     -- (lost twice here: no farm upgrades until every damage unit is down)
     if not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and strongestDown
@@ -4918,6 +4922,11 @@ local function tick()
     if why == "spot" then
         badSpots[spotKey(spot, kind)] = true
         return 0.1
+    end
+    -- (Fool's Hunt: "max placement" for a copy under its own unit limit = the map's unit limit;
+    -- not learning that sent every new copy in to be refused)
+    if why == "cap" and t.temp and State.eventMode and not AutoPlaceModule.EventCapped(t) and #ownedUnits() > 0 then
+        AutoPlaceModule.capSeen = #ownedUnits()
     end
     if why == "cap" then
         -- the game's "max placement" message: full for this game only (a misread message
