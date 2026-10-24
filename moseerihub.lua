@@ -4800,7 +4800,16 @@ function AutoPlaceModule.FarmPays(u, level, cost)
     if not now or not nextAmount or nextAmount <= now then return true end
     -- (Fool's Hunt: farms to the top early, none after wave 10 - a bulma maxed at ~39k by wave 13
     -- left the damage units at levels 0-2 and the game was lost)
-    if State.eventMode then return AutoPlaceModule.WaveNumber() < 10 end
+    -- (a hard stop at wave 10 left a bulma placed late at level 0 with 26k in hand at wave 21:
+    -- an upgrade is bought whenever it pays back 1.5x before wave 30)
+    if State.eventMode then
+        local def = AutoPlaceModule.UnitDef(unitType(u))
+        local up = def and (def.upgrade or def.upgrades)
+        local nowAmt = level == 0 and tonumber(def and def.farm_amount) or (type(up) == "table" and type(up[level]) == "table" and tonumber(up[level].farm_amount))
+        local nextAmt = type(up) == "table" and type(up[level + 1]) == "table" and tonumber(up[level + 1].farm_amount)
+        if not (nowAmt and nextAmt and nextAmt > nowAmt) then return AutoPlaceModule.WaveNumber() < 10 end
+        return (nextAmt - nowAmt) * (30 - AutoPlaceModule.WaveNumber()) >= 1.5 * cost
+    end
     local left = AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber()
     return cost / (nextAmount - now) <= left / 2
 end
