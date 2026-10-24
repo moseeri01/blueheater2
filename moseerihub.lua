@@ -146,7 +146,7 @@ local Lobby = {
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
         eventBrain = true, maxSpellsHeld = 2,
-        eventAlways = { "judar_evolved", "cid_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
+        eventAlways = { "judar_evolved", "cid_evolved", "homura_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
         eventNever = { "armin", "stain_evolved", "narberal_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
 }
@@ -3389,13 +3389,11 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         return scored[skip + 1] and scored[skip + 1].c
     end
     if (role == "buff" or role == "support") and (#helpers > 0 or #farms > 0) then
-        -- buff: next to the most damage units. support (also cheapens upgrades, e.g.
-        -- hoshino): next to the farms it will cheapen, then damage units, within its range
+        -- buff and support (hoshino's aura): next to the most damage units - owner 2026-10-24
         local reach = (range and range > 0 and range ~= DEFAULT_RANGE) and range or BUFF_REACH
         local scored = {}
         for _, c in ipairs(free) do
             local near = countNear(helpers, c, reach)
-            if role == "support" then near = near + 2 * countNear(farms, c, reach) end
             -- buff units inside each other's reach: each one is buffed when it casts, so its
             -- own buff comes out stronger (Erwin chain), then it reaches the damage units
             if role == "buff" then near = near + 1.5 * countNear(buffers, c, reach) end
@@ -4380,9 +4378,9 @@ end
 local function upgradeStep(money, onlyRole, airOnly, noWait)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
-    -- (owner 2026-10-24: the always-on aura unit (hoshino: team damage +7% -> +15%, upgrades
-    -- 10% -> 20% cheaper) is upgraded to the top early, with the farms; rotation buffers never)
-    local RANK = { farm = 1, dps = 2, support = 1 }
+    -- (owner 2026-10-24: the always-on aura unit (hoshino) is placed early and upgraded to the top
+    -- once the damage units are; rotation buffers never)
+    local RANK = { farm = 1, dps = 2, support = 3 }
     local pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir
     -- flying enemies on the map: damage units that can hit them (after this upgrade) go first
     local air = AutoPlaceModule.airNeed == true
@@ -4816,8 +4814,8 @@ end
 -- go first. Returns seconds to wait, or nil and the copy to place.
 -- owner's picks 2026-10-24, first placed first: judar (cid when no judar), sakamoto, nagumo (cuts
 -- HP), saber (early carry), frieren and monet (flyers, slow), jiraiya and emilia (slow, no upgrades)
-AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" }
-AutoPlaceModule.ROSTER = { "akainu_evolved", "aokiji_evolved", "archer_evolved", "armin", "avdol_evolved", "bee_girl_evolved", "caesarclown_evolved", "cid_evolved", "daki_evolved", "demiurge_evolved", "emilia", "escanor_evolved", "esdeath_evolved", "frieren_evolved", "fujitora_evolved", "ghostkun_evolved", "gildarts_evolved", "gilgamesh_evolved", "goku_ssj3_evolved", "gremmy_evolved", "guts_berserker", "gyutaro_evolved", "hakari_evolved", "hidan_unit_evolved", "illya_evolved", "jiraiya_evolved", "josuke_2_evolved", "judar_evolved", "julius_evolved", "koichi_evolved", "konan_unit_evolved", "law_2_evolved", "medea_evolved", "meliodas_evolved", "metal_knight_evolved", "monet_evolved", "nagumo_evolved", "nagumo_evolved", "narberal_evolved", "naruto_6tails", "natsu_evolved", "pucci_heaven", "saber_evolved", "sabo_evolved", "sakamoto_evolved", "shalltear_evolved", "shigaraki_evolved", "stain_evolved", "sukuna", "tatsumaki_evolved", "tengen_2_evolved", "usopp_ts_evolved", "vanilla_ice_evolved" }
+AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "homura_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" }
+AutoPlaceModule.ROSTER = { "akainu_evolved", "aokiji_evolved", "archer_evolved", "armin", "avdol_evolved", "bee_girl_evolved", "caesarclown_evolved", "cid_evolved", "daki_evolved", "demiurge_evolved", "emilia", "escanor_evolved", "esdeath_evolved", "frieren_evolved", "fujitora_evolved", "ghostkun_evolved", "gildarts_evolved", "gilgamesh_evolved", "goku_ssj3_evolved", "gremmy_evolved", "guts_berserker", "gyutaro_evolved", "hakari_evolved", "hidan_unit_evolved", "homura_evolved", "illya_evolved", "jiraiya_evolved", "josuke_2_evolved", "judar_evolved", "julius_evolved", "koichi_evolved", "konan_unit_evolved", "law_2_evolved", "medea_evolved", "meliodas_evolved", "metal_knight_evolved", "monet_evolved", "nagumo_evolved", "nagumo_evolved", "narberal_evolved", "naruto_6tails", "natsu_evolved", "pucci_heaven", "saber_evolved", "sabo_evolved", "sakamoto_evolved", "shalltear_evolved", "shigaraki_evolved", "stain_evolved", "sukuna", "tatsumaki_evolved", "tengen_2_evolved", "usopp_ts_evolved", "vanilla_ice_evolved" }
 function AutoPlaceModule.InList(list, name)
     for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
     return false
