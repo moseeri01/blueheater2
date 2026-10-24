@@ -3496,7 +3496,8 @@ task.spawn(pcall, function()
     stc:WaitForChild("unit_added_temporary", 5).OnClientEvent:Connect(function(data)
         local uuid = uuidOf(data)
         if uuid and type(data) == "table" and data.unit_id then
-            AutoPlaceModule.liveTemp[uuid] = { id = tostring(data.unit_id), made = tonumber(data._creation_time) or os.time(), seen = os.clock() }
+            AutoPlaceModule.liveTemp[uuid] = { id = tostring(data.unit_id), made = tonumber(data._creation_time) or os.time(), seen = os.clock(),
+                shiny = data.shiny == true, rolls = type(data.trait_stats) == "table" and data.trait_stats or nil }
             AutoPlaceModule.goneTemp[uuid] = nil
             AutoPlaceModule.tempVersion = AutoPlaceModule.tempVersion + 1
         end
@@ -3563,7 +3564,7 @@ function AutoPlaceModule.HotbarTeam()
     -- game's copies in memory: placing those is refused (money piled up to 28k in a real game)
     local found = {}
     for uuid, info in pairs(AutoPlaceModule.liveTemp) do
-        table.insert(found, { id = info.id, uuid = uuid, made = info.made + 1e9 })
+        table.insert(found, { id = info.id, uuid = uuid, made = info.made + 1e9, shiny = info.shiny, rolls = info.rolls })
     end
     -- (once the game announced copies this run, only those count: memory also holds old ones)
     if #found == 0 and type(getgc) == "function" then
@@ -3592,7 +3593,7 @@ function AutoPlaceModule.HotbarTeam()
             pool[key] = pool[key] or {}
             local dup = false
             for _, u in ipairs(pool[key]) do if u.uuid == f.uuid then dup = true end end
-            if not dup then table.insert(pool[key], { uuid = f.uuid, id = f.id }) end
+            if not dup then table.insert(pool[key], { uuid = f.uuid, id = f.id, shiny = f.shiny, rolls = f.rolls }) end
         end
     end
     local complete = true
@@ -3603,7 +3604,7 @@ function AutoPlaceModule.HotbarTeam()
                 local uuid = entry.uuid
                 if not used[uuid] then
                     used[uuid] = true
-                    team[s] = { uuid = uuid, name = entry.id, cost = sl.price, temp = true, traits = {}, rolls = {}, model = sl.model, slot = s }
+                    team[s] = { uuid = uuid, name = entry.id, cost = sl.price, temp = true, traits = {}, rolls = entry.rolls or {}, model = sl.model, slot = s, shiny = entry.shiny }
                     break
                 end
             end
@@ -4241,7 +4242,13 @@ end
 -- the unit data: judged at base strength they were X'd as "far below the team" and never got
 -- upgrades picked (real games 2026-10-24).
 AutoPlaceModule.GROWTH = 17
-AutoPlaceModule.FARMS_UNTIL = 9
+-- farms the owner keeps (2026-10-24): 3 speedwagons + 1 bulma, all upgraded to the top
+AutoPlaceModule.FARM_COUNT = { speedwagon = 3, bulma = 1 }
+function AutoPlaceModule.IsShiny(u)
+    local st = u:FindFirstChild("_stats")
+    local v = st and st:FindFirstChild("shiny")
+    return v ~= nil and v.Value == true
+end
 
 -- Fool's Hunt: damage per second a unit kind reaches fully upgraded (its definition), area
 -- attacks counted higher. Used to tell a strong random copy from a weak one.
@@ -4617,9 +4624,10 @@ function AutoPlaceModule.FarmPays(u, level, cost)
     local now = level == 0 and tonumber(def.farm_amount) or (type(up[level]) == "table" and tonumber(up[level].farm_amount))
     local nextAmount = tonumber(up[level + 1].farm_amount)
     if not now or not nextAmount or nextAmount <= now then return true end
-    -- (Fool's Hunt runs to wave 30: an upgrade must pay 1.5x its price before then - simulator)
-    local left = (State.eventMode and 30 or AutoPlaceModule.FARM_HORIZON) - AutoPlaceModule.WaveNumber()
-    return cost / (nextAmount - now) <= left / (State.eventMode and 1.5 or 2)
+    -- (Fool's Hunt: the owner upgrades the farms to the top)
+    if State.eventMode then return true end
+    local left = AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber()
+    return cost / (nextAmount - now) <= left / 2
 end
 
 function AutoPlaceModule.LastWave()
@@ -4793,11 +4801,22 @@ function AutoPlaceModule.EventChoose(money)
             local why
             local always = AutoPlaceModule.InList(Lobby.cfg.eventAlways, t.name)
             if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) then why = "on the never list"
-            elseif AutoPlaceModule.EventCapped(t) then why = "its unit is at the limit"
             elseif role == "farm" then
-                local same = 0
-                for _, u in ipairs(units) do if unitType(u) == t.name then same = same + 1 end end
-                if wave >= AutoPlaceModule.FARMS_UNTIL or (t.name == "speedwagon" and same >= 2) then why = "farm not needed now" end
+                -- (owner: 3 speedwagons + 1 bulma, upgraded to the top, any more X'd; a golden
+                -- (shiny) copy takes a normal one's place through a Refund)
+                local same, plain = 0, nil
+                for _, u in ipairs(units) do
+                    if unitType(u) == t.name then
+                        same = same + 1
+                        if not AutoPlaceModule.IsShiny(u) then plain = u end
+                    end
+                end
+                local cap = AutoPlaceModule.FARM_COUNT[t.name] or tonumber((AutoPlaceModule.UnitDef(t.name) or {}).spawn_cap) or 1
+                if same >= cap then
+                    if t.shiny and plain and Lobby.CastOn("sell_refund", plain) then return 1 end
+                    why = t.shiny and "golden farm but no Refund in hand" or "farms full"
+                end
+            elseif AutoPlaceModule.EventCapped(t) then why = "its unit is at the limit"
             elseif role == "buff" or role == "support" then
                 if buffs >= EV.buffUnits then why = "enough buff units" end
             elseif not always and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
@@ -5003,12 +5022,11 @@ local function tick()
         AutoPlaceModule.DropCopy(t, "its unit is at the limit")
         return 0.5
     end
-    -- (strategy search: 2 speedwagons + bulma placed until wave 9 paid off best; later or more
-    -- farms only take a place on the map)
+    -- (owner: 3 speedwagons + 1 bulma, any more only take a place on the map)
     if State.eventMode and t.temp and role == "farm" then
         local same = 0
         for _, u in ipairs(ownedUnits()) do if unitType(u) == t.name then same = same + 1 end end
-        if AutoPlaceModule.WaveNumber() >= AutoPlaceModule.FARMS_UNTIL or (t.name == "speedwagon" and same >= 2) then
+        if same >= (AutoPlaceModule.FARM_COUNT[t.name] or tonumber((AutoPlaceModule.UnitDef(t.name) or {}).spawn_cap) or 1) then
             AutoPlaceModule.DropCopy(t, "farm not needed now")
             return 0.5
         end
@@ -8568,6 +8586,18 @@ function Lobby.SpellSaving(money)
         if id == "ritual" and grown and money < 10000 and tried < 5 then return "Saving for Ritual" end
     end
     return nil
+end
+
+-- Uses a spell in hand on a unit now (Refund for a golden farm). True when it was sent.
+function Lobby.CastOn(id, target)
+    local remote = getAARemote("use_ingame_spell")
+    local slot = Lobby.SpellSlot(id)
+    if not (remote and slot) or os.clock() - (Lobby.spellAt or -1e9) < 4 then return false end
+    Lobby.spellAt = os.clock()
+    local key = Lobby.SpellKey(slot)
+    task.spawn(pcall, function() remote:InvokeServer(key, target) end)
+    AutoPlaceModule.Note(string.format("spell: %s on %s (making room for a golden copy)", id, unitType(target) or "?"))
+    return true
 end
 
 function Lobby.SpellStep(money)
