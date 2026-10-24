@@ -2187,7 +2187,8 @@ task.spawn(function()
                 AutoFarm.lastStart = via or (btn and "button") or "nothing found"
             end
             -- (Fool's Hunt: no skipping - the time between waves is what pays for the upgrades)
-            if AutoFarm.autoSkip and gameStarted() and now >= nextSkip and not State.eventMode then
+            -- (Fool's Hunt too since 2026-10-24: owner - skipping brings the money sooner and saves time)
+            if AutoFarm.autoSkip and gameStarted() and now >= nextSkip then
                 nextSkip = now + 3
                 local via = fireFirst(Words.SKIP_REMOTES, true)
                 local btn = labelButton({ "skip wave", "skip" })
