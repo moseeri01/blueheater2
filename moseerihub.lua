@@ -5054,7 +5054,7 @@ function AutoPlaceModule.EventChoose(money)
                 if buffs >= EV.buffUnits then why = "enough buff units" end
             -- (owner: only the units on the Always list - the rest just while fewer than 4 damage units
             -- are down, so the early waves are held)
-            elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 4 then why = "not on the Always list"
+            elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 8 then why = "not on the Always list"
             elseif not always and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
@@ -5124,10 +5124,8 @@ function AutoPlaceModule.EventChoose(money)
         -- (farms and the aura unit only when they can be paid now; a farm's 30000 must not hold the team)
         local wait = upgradeStep(m, "farm", nil, true) or upgradeStep(m, "support", nil, true) or upgradeStep(m, "dps")
         if wait then return wait end
-        if upV > 0 then
-            AutoPlaceModule.status = "Saving for the best upgrade"
-            return 0.3
-        end
+        -- (no "saving" without an upgrade that can actually be picked: with the carry maxed and no
+        -- other main, 20k sat unused until the loss - real game 2026-10-24)
     end
     if best and canPay(best) then return nil, best.t, best.role end
     AutoPlaceModule.status = best and "Waiting for money" or (atCap and "Unit limit reached - upgrading" or "Waiting for the next copy")
