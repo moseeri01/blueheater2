@@ -6574,7 +6574,10 @@ do
 local function httpPost(url, body)
     local req = (syn and syn.request) or (http and http.request) or request or http_request
     if type(req) ~= "function" then return false end
-    return pcall(req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+    local ok, res = pcall(req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+    -- (a refused message still came back without an error: the reply code says whether it arrived)
+    local code = ok and type(res) == "table" and tonumber(res.StatusCode) or nil
+    return ok and (not code or code < 300), code or (not ok and tostring(res)) or nil
 end
 
 local function commas(n)
@@ -6931,11 +6934,32 @@ local function withPing(payload, kinds)
     return payload
 end
 
+-- Discord refuses the whole message when one part is over its limit (field 1024, description
+-- 4096, title 256): a long Fool's Hunt report never arrived - every part is cut to fit.
+function Webhook.Fit(payload)
+    local function cut(v, n) v = tostring(v or "") return #v > n and (v:sub(1, n - 3) .. "...") or v end
+    for _, e in ipairs(type(payload) == "table" and payload.embeds or {}) do
+        if e.title then e.title = cut(e.title, 256) end
+        if e.description then e.description = cut(e.description, 4000) end
+        local fields = {}
+        for i, f in ipairs(e.fields or {}) do
+            if i <= 25 then fields[#fields + 1] = { name = cut(f.name, 256), value = cut(f.value ~= "" and f.value or "-", 1024), inline = f.inline } end
+        end
+        if e.fields then e.fields = fields end
+    end
+    return payload
+end
+
 function Webhook.SendReport(kind, pings)
     if #Webhook.url < 10 then return false end
     local ok, payload = pcall(Webhook.BuildReport, kind)
-    if not ok then return false end
-    return httpPost(Webhook.url, HttpService:JSONEncode(withPing(payload, pings)))
+    if not ok then
+        AutoPlaceModule.Note("webhook: report could not be built - " .. clip(tostring(payload), 80))
+        return false
+    end
+    local sent, why = httpPost(Webhook.url, HttpService:JSONEncode(withPing(Webhook.Fit(payload), pings)))
+    AutoPlaceModule.Note("webhook: " .. kind .. " report " .. (sent and "sent" or ("NOT sent - " .. clip(tostring(why), 60))))
+    return sent
 end
 
 -- A short alert embed (Mythic drop, bag full, disconnect) with the ping.
