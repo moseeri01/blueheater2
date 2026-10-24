@@ -148,7 +148,7 @@ local Lobby = {
         -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
-        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3, shareData = true, shareNoticed = false,
+        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3, shareData = true, shareNoticed = false, autoUpdate = true,
         eventAlways = { "judar_evolved", "cid_evolved", "bee_girl_evolved", "homura_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
         eventNever = { "armin", "stain_evolved", "narberal_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
@@ -7293,6 +7293,7 @@ task.spawn(function()
                 Webhook.Alert("bag", "⛔ Bag full", "Your bag is full: new drops are lost until you make room.", 15548997)
             end
             Webhook.reportPending = false
+            task.spawn(pcall, Lobby.AutoUpdate)
             -- (not in Fool's Hunt: its random copies are not drops - every one was announced)
             -- (owner 2026-10-24: removed - it listed Fool's Hunt copies and lobby units as drops)
             if false and Webhook.pingMythic ~= false and unitsBefore and not State.eventMode then
@@ -8432,6 +8433,24 @@ end
 -- apart. On by default, told once on the first run, off with the Event tab toggle. The webhook
 -- address is read from share_url.txt in the script's GitHub repo (the owner keeps it there).
 Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/share_url.txt"
+-- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
+-- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
+-- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
+Lobby.VERSION = "20261025-004320"
+Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
+function Lobby.AutoUpdate()
+    if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
+    local ok, src = pcall(function() return game:HttpGet(Lobby.SCRIPT_URL .. "?t=" .. tostring(os.time())) end)
+    if not (ok and type(src) == "string" and #src > 100000) then return end
+    local remote = src:match("Lobby%.VERSION = \"([^\"]+)\"")
+    if not remote or remote == Lobby.VERSION or remote == "dev" then return end
+    local fn = loadstring(src)
+    if type(fn) ~= "function" then return end
+    Lobby.updating = true
+    pcall(Lobby.ShareLog, "auto-update " .. Lobby.VERSION .. " -> " .. remote)
+    notify("moseeri hub: updating to " .. remote)
+    task.spawn(fn)
+end
 function Lobby.ShareId()
     if Lobby.shareId then return Lobby.shareId end
     local path = "AAMacro/share_id.txt"
@@ -9610,6 +9629,7 @@ event:Dropdown({ Name = "Card choice", Multi = false, Required = true, Options =
 event:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = set("eventSpells") }, "EventSpells")
 event:Toggle({ Name = "Event Auto Place", Default = Lobby.cfg.eventBrain ~= false, Callback = set("eventBrain") }, "EventBrain")
 event:Toggle({ Name = "Share game data", Default = Lobby.cfg.shareData ~= false, Callback = set("shareData") }, "EventShare")
+event:Toggle({ Name = "Auto update", Default = Lobby.cfg.autoUpdate ~= false, Callback = set("autoUpdate") }, "EventAutoUpdate")
 event:Paragraph({ Header = "Shared", Body = "Fool's Hunt results only: map, wave, win, cards, units (level, trait, golden). No name or account info." })
 task.delay(5, pcall, Lobby.ShareNotice)
 event:Dropdown({ Name = "Always place", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
