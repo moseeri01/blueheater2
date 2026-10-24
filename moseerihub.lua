@@ -5035,7 +5035,10 @@ function AutoPlaceModule.EventChoose(money)
             always = always or breaker
             -- (a main unit came this game: from now on the rest are not needed; with none, they hold the line)
             if always and not AutoPlaceModule.UP_CAP[t.name] then AutoPlaceModule.mainSeen = true end
-            if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name] then why = "on the never / skip list"
+            -- (under 4 damage units any damage copy goes down - Snowy Town was lost at wave 7 with 4 units;
+            -- Arlem only never: 5000 for a hit every 60 s)
+            local thin = role == "dps" and AutoPlaceModule.DamageCount(units) < 4 and t.name ~= "armin"
+            if (AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name]) and not thin then why = "on the never / skip list"
             -- (place-only units - nagumo, jiraiya, emilia: one of each; three nagumos took three places)
             elseif AutoPlaceModule.UP_CAP[t.name] == 0 and AutoPlaceModule.CountKind(units, t.name) >= 1 then why = "one is enough"
             elseif role == "farm" then
@@ -5059,7 +5062,7 @@ function AutoPlaceModule.EventChoose(money)
             -- (owner: only the units on the Always list - the rest just while fewer than 4 damage units
             -- are down, so the early waves are held)
             elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 8 then why = "not on the Always list"
-            elseif not always and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
+            elseif not always and not thin and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
             AutoPlaceModule.copySeen[t.uuid] = first
@@ -8903,7 +8906,9 @@ function Lobby.SpellTarget(spec)
                 local dps, hits = dpsNow(u)
                 -- (Ritual never takes a main unit: it sacrificed judar - owner 2026-10-24)
                 local mainU = AutoPlaceModule.InList(AutoPlaceModule.RANK, unitType(u)) and not AutoPlaceModule.UP_CAP[unitType(u) or ""]
-                local ok = hits and not bad[u] and (spec.target ~= "maxed" or Lobby.FullyUpgraded(u)) and not (spec.notMain and mainU)
+                -- (no buff or clone on a place-only unit - jiraiya got a Random Buff)
+                local placeOnly = AutoPlaceModule.UP_CAP[unitType(u) or ""] ~= nil
+                local ok = hits and not bad[u] and not placeOnly and (spec.target ~= "maxed" or Lobby.FullyUpgraded(u)) and not (spec.notMain and mainU)
                 -- (owner: Random Buff goes on the main units first, in the list's order)
                 local rank = 0
                 for i, n in ipairs(AutoPlaceModule.RANK) do if n == unitType(u) then rank = #AutoPlaceModule.RANK - i + 1 end end
