@@ -8734,7 +8734,7 @@ Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { 
     summon = { cost = 10000, reserve = 5000 }, gate = { cost = 2500 },
     sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" },
     -- (owner: Ritual around wave 20, with money left once the mains are maxed)
-    ritual = { cost = 10000, reserve = 3000, target = "strongest", fromWave = 18 } }
+    ritual = { cost = 10000, reserve = 3000, target = "strongest", notMain = true, fromWave = 18 } }
 function Lobby.OnSpells(list)
     list = Lobby.AsList(list)
     if type(list) ~= "table" then return end
@@ -8855,7 +8855,9 @@ function Lobby.SpellTarget(spec)
                 -- damage per second as the unit stands now (its own _stats: level, upgrades, trait,
                 -- earlier buffs), area attacks counted higher; Clone takes the most upgraded one
                 local dps, hits = dpsNow(u)
-                local ok = hits and not bad[u] and (spec.target ~= "maxed" or Lobby.FullyUpgraded(u))
+                -- (Ritual never takes a main unit: it sacrificed judar - owner 2026-10-24)
+                local mainU = AutoPlaceModule.InList(AutoPlaceModule.RANK, unitType(u)) and not AutoPlaceModule.UP_CAP[unitType(u) or ""]
+                local ok = hits and not bad[u] and (spec.target ~= "maxed" or Lobby.FullyUpgraded(u)) and not (spec.notMain and mainU)
                 -- (owner: Random Buff goes on the main units first, in the list's order)
                 local rank = 0
                 for i, n in ipairs(AutoPlaceModule.RANK) do if n == unitType(u) then rank = #AutoPlaceModule.RANK - i + 1 end end
