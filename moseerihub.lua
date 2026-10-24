@@ -4925,7 +4925,7 @@ function AutoPlaceModule.InList(list, name)
     for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
     return false
 end
-AutoPlaceModule.EV = { placeBonus = 2, reserve = 0, airMin = 3, airBy = 8, buffUnits = 2, stuck = 25 }
+AutoPlaceModule.EV = { placeBonus = 2, reserve = 0, airMin = 3, airBy = 8, buffUnits = 2, stuck = 12 }
 function AutoPlaceModule.EventChoose(money)
     local EV, now = AutoPlaceModule.EV, os.clock()
     local wave = AutoPlaceModule.WaveNumber()
@@ -4969,7 +4969,8 @@ function AutoPlaceModule.EventChoose(money)
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
             AutoPlaceModule.copySeen[t.uuid] = first
-            if not why and not atCap and now - first > EV.stuck and t.cost and money and money >= t.cost then why = "stuck on the bar" end
+            -- (owner: cleared sooner, money or not - only a main unit may wait for its price)
+            if not why and not atCap and now - first > EV.stuck and (not always or (t.cost and money and money >= t.cost)) then why = "stuck on the bar" end
             if why then
                 AutoPlaceModule.DropCopy(t, why)
                 return 0.5
