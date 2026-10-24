@@ -148,7 +148,7 @@ local Lobby = {
         -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
-        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3,
+        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3, shareData = true, shareNoticed = false,
         eventAlways = { "judar_evolved", "cid_evolved", "bee_girl_evolved", "homura_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
         eventNever = { "armin", "stain_evolved", "narberal_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
@@ -7218,6 +7218,8 @@ task.spawn(function()
         local isStarted = started and started.Value == true
         if isStarted and not wasStarted then
             reported = false
+            -- (per-game card memory starts empty: a Replay keeps the script running)
+            Lobby.cardsTaken, Lobby.badTaken, Lobby.resTaken, Lobby.regenTaken, Lobby.shieldTaken = nil, nil, nil, nil, nil
             startSnap, gameWave = playerSnapshot(), 0
             firstSnap = firstSnap or startSnap
             unitsBefore = #Webhook.url >= 10 and Webhook.OwnedUnits() or nil
@@ -7234,6 +7236,7 @@ task.spawn(function()
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
             pcall(Lobby.TowerResult, win)
+            task.spawn(pcall, Lobby.ShareGame, win, math.max(gameWave, waveNow()))
             -- (while Watch is on: one line per game in AAMacro/games.txt, to measure a strategy)
             if State.watching then
                 pcall(function()
@@ -8395,7 +8398,66 @@ end
 -- Fool's Hunt with Watch on: every new enemy once (wave, max HP, speed, flying, armor, regen)
 -- and, once a wave, our side (units, levels, damage per second from the unit data, base HP) into
 -- event_waves.txt - the numbers a fast strategy simulator is tuned on.
+-- Game data sharing (owner 2026-10-24, the hub is used by friends): one message per Fool's Hunt
+-- game to the owner's data channel - map, wave, win, cards, and each unit's id / upgrade / trait /
+-- golden / wave placed. No name, UserId or account data: a random id per device tells players
+-- apart. On by default, told once on the first run, off with the Event tab toggle. The webhook
+-- address is read from share_url.txt in the script's GitHub repo (the owner keeps it there).
+Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/share_url.txt"
+function Lobby.ShareId()
+    if Lobby.shareId then return Lobby.shareId end
+    local path = "AAMacro/share_id.txt"
+    local id = hasFileApi() and isfile(path) and readfile(path) or ""
+    if #id < 8 then
+        local t = {}
+        for i = 1, 12 do
+            local k = math.random(36)
+            t[i] = string.sub("abcdefghijklmnopqrstuvwxyz0123456789", k, k)
+        end
+        id = table.concat(t)
+        if hasFileApi() then pcall(writefile, path, id) end
+    end
+    Lobby.shareId = id
+    return id
+end
+function Lobby.ShareNotice()
+    if not Lobby.cfg.shareData or Lobby.cfg.shareNoticed then return end
+    Lobby.cfg.shareNoticed = true
+    pcall(saveConfig)
+    notify("moseeri hub sends Fool's Hunt results (map, wave, units, cards - no account info) to help Auto Place. Turn off: Event tab > Share game data.")
+end
+function Lobby.ShareGame(win, wave)
+    if not (Lobby.cfg.shareData and State.eventMode) then return end
+    if not Lobby.shareUrl then
+        local ok, url = pcall(function() return game:HttpGet(Lobby.SHARE_URL_FILE) end)
+        Lobby.shareUrl = ok and type(url) == "string" and url:match("https://[%w%./_%-]+") or ""
+    end
+    if Lobby.shareUrl == "" then return end
+    local units = {}
+    for _, u in ipairs(ownedUnits()) do
+        local st = u:FindFirstChild("_stats")
+        local trait = ""
+        for _, c in ipairs(st and st:GetChildren() or {}) do
+            local n = c.Name:lower()
+            if n:find("trait", 1, true) and not n:find("stat", 1, true) and type(c.Value) == "string" and c.Value ~= "" then trait = c.Value break end
+        end
+        table.insert(units, { unitType(u) or "?", AutoPlaceModule.StatNum(u, "upgrade") or 0, trait,
+            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1 })
+    end
+    local data = { v = 1, id = Lobby.ShareId(), t = os.time(), map = tostring(State.stage), w = wave, win = win and 1 or 0,
+        candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units }
+    local body = HttpService:JSONEncode(data)
+    -- (a Discord message holds 2000 characters: the last-placed units go first when it is long)
+    while #body > 1900 and #units > 0 do
+        table.remove(units)
+        body = HttpService:JSONEncode(data)
+    end
+    httpPost(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
+end
+
 function Lobby.RecordWaves()
+    Lobby.placedAt = Lobby.placedAt or setmetatable({}, { __mode = "k" })
+    for _, u in ipairs(ownedUnits()) do Lobby.placedAt[u] = Lobby.placedAt[u] or AutoPlaceModule.WaveNumber() end
     Lobby.waveSeen = Lobby.waveSeen or setmetatable({}, { __mode = "k" })
     Lobby.waveLog = Lobby.waveLog or { "# " .. os.date("%Y-%m-%d %H:%M:%S") }
     local wave = AutoPlaceModule.WaveNumber()
@@ -8724,6 +8786,10 @@ end
 
 function Lobby.OnCardResult(picked, state)
     if type(state) == "table" then Lobby.candy = tonumber(state.candy_multiplier) or Lobby.candy end
+    if type(picked) == "table" then
+        Lobby.cardsTaken = Lobby.cardsTaken or {}
+        table.insert(Lobby.cardsTaken, { AutoPlaceModule.WaveNumber(), tostring(picked.title) })
+    end
     if type(picked) == "table" then
         for _, e in ipairs(Lobby.AsList(type(picked.effects) == "table" and picked.effects or {})) do
             if e.type == "enemy_regen" then Lobby.regenTaken = (Lobby.regenTaken or 0) + 1 end
@@ -9497,6 +9563,9 @@ event:Dropdown({ Name = "Card choice", Multi = false, Required = true, Options =
     Default = Lobby.cfg.cardMode, Callback = set("cardMode") }, "EventCardMode")
 event:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = set("eventSpells") }, "EventSpells")
 event:Toggle({ Name = "Event Auto Place", Default = Lobby.cfg.eventBrain ~= false, Callback = set("eventBrain") }, "EventBrain")
+event:Toggle({ Name = "Share game data", Default = Lobby.cfg.shareData ~= false, Callback = set("shareData") }, "EventShare")
+event:Paragraph({ Header = "Shared", Body = "Fool's Hunt results only: map, wave, win, cards, units (level, trait, golden). No name or account info." })
+task.delay(5, pcall, Lobby.ShareNotice)
 event:Dropdown({ Name = "Always place", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
     Default = picked(Lobby.cfg.eventAlways or {}), Callback = setList("eventAlways") }, "EventAlways")
 event:Dropdown({ Name = "Never place (X)", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
