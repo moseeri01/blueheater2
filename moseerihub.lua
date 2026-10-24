@@ -3212,6 +3212,7 @@ end
 -- Area attacks hit several enemies at once: their damage counts this much more than a
 -- single-target unit's when ranking units (Value, the "Strongest" status line)
 local AOE_VALUE = 1.5
+AutoPlaceModule.AOE_VALUE = AOE_VALUE
 
 -- Damage per second per ¥ (higher = better value); 0 for units that do not attack.
 function AutoPlaceModule.Value(t, cost)
@@ -5689,6 +5690,9 @@ function AutoPlaceModule.Stop()
     AutoPlaceModule.status = "Off"
 end
 
+-- (for code outside this block: the UI toggle "Place on enemy path")
+function AutoPlaceModule.ResetSpots() candidates, candidatesFor = nil, -1 end
+
 function AutoPlaceModule.ForgetPath()
     AutoPlace.paths[stageKey()] = nil
     AutoPlace.caps = {}
@@ -6741,6 +6745,8 @@ local function httpPost(url, body)
     local code = ok and type(res) == "table" and tonumber(res.StatusCode) or nil
     return ok and (not code or code < 300), code or (not ok and tostring(res)) or nil
 end
+-- (Lobby.ShareGame sits outside this block: it posts through Webhook.post)
+Webhook.post = httpPost
 
 local function commas(n)
     local s = tostring(math.floor((tonumber(n) or 0) + 0.5))
@@ -8466,7 +8472,7 @@ function Lobby.ShareGame(win, wave)
         table.remove(units)
         body = HttpService:JSONEncode(data)
     end
-    local sent, why = httpPost(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
+    local sent, why = Webhook.post(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
     AutoPlaceModule.Note("game data " .. (sent and "shared" or ("NOT shared - " .. tostring(why))))
     Lobby.ShareLog("sent " .. tostring(sent) .. " " .. tostring(why) .. " (" .. #body .. " chars)")
 end
@@ -8696,12 +8702,15 @@ function Lobby.PickCard(options)
     local share = Lobby.DamageShare()
     local hp, hpMax = AutoPlaceModule.ScanBaseHp()
     local hurt = hp and hpMax and hpMax > 0 and hp / hpMax < 0.8
-    local bestBad, bestBadCost, good, goodGain
+    local bestBad, bestBadCost, good, goodGain, yen
     for i, o in ipairs(options) do
         if type(o) == "table" then
             if o.option_type == "Good" then
                 local g = Lobby.CardGain(o)
                 if g and (not good or g > goodGain) then good, goodGain = i, g end
+                -- (Yen only beats a heavy Bad card - Enemy Health / Speed / our resistance;
+                -- real game 2026-10-24: Yen, Resistant, Speed offered and Speed was taken)
+                if not g then yen = i end
             else
                 local c = Lobby.CardCost(o, share)
                 if not bestBad or c < bestBadCost then bestBad, bestBadCost = i, c end
@@ -8713,6 +8722,7 @@ function Lobby.PickCard(options)
     -- mostly from the waves lived; Bad cards on every offer was the worst play tested, -35% coins)
     local late = State.eventMode and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL
     if good and (Lobby.cfg.cardMode == "Safest" or late or hurt or not bestBad or bestBadCost > 0.8) then return good, "help" end
+    if yen and bestBad and bestBadCost >= Lobby.AVOID then return yen, "yen over a heavy Bad card" end
     return bestBad or 1, "coins"
 end
 
@@ -9001,7 +9011,7 @@ function Lobby.SpellTarget(spec)
         local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
         local dmg = AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0
         local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(def)
-        return dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1), (tonumber(def.damage) or 0) > 0
+        return dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AutoPlaceModule.AOE_VALUE or 1), (tonumber(def.damage) or 0) > 0
     end
     local target, best
     if spec.target == "merge" then
@@ -9726,7 +9736,7 @@ generalSection:Toggle({
     Default = Tools.onPath == true,
     Callback = function(on)
         Tools.onPath = on
-        candidates, candidatesFor = nil, -1 -- (spots are worked out again with / without the road)
+        AutoPlaceModule.ResetSpots() -- (spots are worked out again with / without the road)
         saveConfig()
     end,
 }, "PlaceOnPath")
