@@ -4935,6 +4935,11 @@ function AutoPlaceModule.InList(list, name)
     for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
     return false
 end
+function AutoPlaceModule.DamageCount(units)
+    local n = 0
+    for _, u in ipairs(units) do if unitRole(u) == "dps" then n = n + 1 end end
+    return n
+end
 AutoPlaceModule.EV = { placeBonus = 2, reserve = 0, airMin = 3, airBy = 8, buffUnits = 2, stuck = 12 }
 function AutoPlaceModule.EventChoose(money)
     local EV, now = AutoPlaceModule.EV, os.clock()
@@ -4956,6 +4961,8 @@ function AutoPlaceModule.EventChoose(money)
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             local why
             local always = AutoPlaceModule.InList(Lobby.cfg.eventAlways, t.name)
+            -- (a main unit came this game: from now on the rest are not needed; with none, they hold the line)
+            if always and not AutoPlaceModule.UP_CAP[t.name] then AutoPlaceModule.mainSeen = true end
             if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name] then why = "on the never / skip list"
             elseif role == "farm" then
                 -- (owner: 3 speedwagons + 1 bulma, upgraded to the top, any more X'd; a golden
@@ -4975,6 +4982,9 @@ function AutoPlaceModule.EventChoose(money)
             elseif AutoPlaceModule.EventCapped(t) then why = "its unit is at the limit"
             elseif role == "buff" or role == "support" then
                 if buffs >= EV.buffUnits then why = "enough buff units" end
+            -- (owner: only the units on the Always list - the rest just while fewer than 4 damage units
+            -- are down, so the early waves are held)
+            elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 4 then why = "not on the Always list"
             elseif not always and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
