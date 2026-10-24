@@ -4669,6 +4669,13 @@ local function tick()
     AutoPlaceModule.tickStep = "spells"
     pcall(Lobby.SpellStep, money)
     pcall(Lobby.RerollStep)
+    -- a spell in hand beats any upgrade (Random Buff: +100% for 1000): the money waits for it
+    -- (real game: the yen went into upgrades as it came, three buffs sat unused all game)
+    local okSave, saving = pcall(Lobby.SpellSaving, money)
+    if okSave and saving and not AutoPlaceModule.danger then
+        AutoPlaceModule.status = saving
+        return 0.5
+    end
     AutoPlaceModule.tickStep = "choose"
     if AutoPlace.sellFarmsLast and AutoPlaceModule.LastWave() and AutoPlaceModule.SellFarm() then return 0.3 end
     local danger = AutoPlaceModule.Danger()
@@ -8022,6 +8029,7 @@ function Lobby.OnSpells(list)
             Lobby.spellWayTry = (Lobby.spellWayTry or 1) % #Lobby.SPELL_WAYS + 1
         else
             Lobby.cfg.spellWay = before.way
+            if Lobby.spellTries then Lobby.spellTries[before.id] = 0 end
             saveConfig()
             AutoPlaceModule.Note("spell way learned: " .. before.way)
         end
@@ -8052,6 +8060,26 @@ function Lobby.RerollStep()
     end
 end
 
+function Lobby.SpellSaving(money)
+    if not Lobby.cfg.eventSpells or not State.eventMode or not money then return nil end
+    local dps, topLevel = 0, 0
+    for _, u in ipairs(ownedUnits()) do
+        local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+        if (tonumber(def.damage) or 0) > 0 then
+            dps = dps + 1
+            topLevel = math.max(topLevel, AutoPlaceModule.StatNum(u, "upgrade") or 0)
+        end
+    end
+    if dps == 0 then return nil end
+    for _, id in ipairs(Lobby.spells or {}) do
+        -- (not for a spell tried 5 times that stays in hand: the taps are not landing)
+        local tried = (Lobby.spellTries or {})[id] or 0
+        if id == "random_buff" and money < 1000 and tried < 5 then return "Saving for Random Buff" end
+        if id == "clone" and topLevel >= 3 and money < 5000 and tried < 5 then return "Saving for Clone" end
+    end
+    return nil
+end
+
 function Lobby.SpellStep(money)
     if not Lobby.cfg.eventSpells or not money then return end
     local remote = getAARemote("use_ingame_spell")
@@ -8075,8 +8103,12 @@ function Lobby.SpellStep(money)
             for _, u in ipairs(ownedUnits()) do
                 if AutoPlaceModule.RoleOf and unitType(u) then
                     local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
-                    local score = spec.target == "upgraded" and (AutoPlaceModule.StatNum(u, "upgrade") or 0)
-                        or ((tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1))
+                    -- damage per second as the unit stands now (its own _stats: level, upgrades, trait,
+                    -- earlier buffs), area attacks counted higher; Clone takes the most upgraded one
+                    local dmg = AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0
+                    local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or tonumber(def.attack_cooldown) or 1
+                    local dps = dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1)
+                    local score = spec.target == "upgraded" and ((AutoPlaceModule.StatNum(u, "upgrade") or 0) * 1e9 + dps) or dps
                     if (tonumber(def.damage) or 0) > 0 then table.insert(ranked, { u = u, score = score }) end
                     if (tonumber(def.damage) or 0) > 0 and (not best or score > best) then target, best = u, score end
                 end
@@ -8087,6 +8119,8 @@ function Lobby.SpellStep(money)
             local key = way:find("^index") and idx or id
             Lobby.spellAt = os.clock()
             Lobby.spellTry = { id = id, way = way }
+            Lobby.spellTries = Lobby.spellTries or {}
+            Lobby.spellTries[id] = (Lobby.spellTries[id] or 0) + 1
             -- sent without waiting: a call in a shape the game does not take got no answer, and
             -- waiting for it stopped Auto Place for the rest of the game (real game, 2026-10-24)
             task.spawn(pcall, function()
