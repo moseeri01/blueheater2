@@ -8631,8 +8631,33 @@ function Lobby.AsList(t)
     return out
 end
 
+-- Every card the game offers, once per title, to AAMacro/cards_seen.txt (the list lives only on
+-- the server, so this is how the owner sees all of them).
+function Lobby.LogCards(options)
+    if not hasFileApi() then return end
+    local path = "AAMacro/cards_seen.txt"
+    local text = isfile(path) and readfile(path) or ""
+    local add = {}
+    for _, o in ipairs(options) do
+        local title = type(o) == "table" and tostring(o.title) or ""
+        if title ~= "" and not text:find(title .. " |", 1, true) then
+            local parts = {}
+            for _, e in ipairs(Lobby.AsList(type(o.effects) == "table" and o.effects or {})) do
+                local f = {}
+                for k, v in pairs(e) do table.insert(f, tostring(k) .. "=" .. tostring(v)) end
+                table.sort(f)
+                table.insert(parts, table.concat(f, " "))
+            end
+            table.insert(add, string.format("%s | %s | %s", title, tostring(o.option_type), table.concat(parts, " ; ")))
+            text = text .. title .. " |"
+        end
+    end
+    if #add > 0 then writefile(path, (isfile(path) and readfile(path) or "") .. table.concat(add, "\n") .. "\n") end
+end
+
 function Lobby.OnCardOptions(seconds, options)
     options = Lobby.AsList(options)
+    pcall(Lobby.LogCards, options)
     if not Lobby.cfg.eventCards or type(options) ~= "table" or #options == 0 then
         Lobby.cardInfo = "skipped: " .. (Lobby.cfg.eventCards and "no options" or "cards off")
         return
