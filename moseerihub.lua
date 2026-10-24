@@ -4507,11 +4507,12 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     local carryKind = carry and unitType(carry) or ""
     -- (owner 2026-10-24: with no judar / cid down, one carry alone was too little - sakamoto at 2-7,
     -- everything else at 0, lost at waves 11-15; the next best one is upgraded along with it)
-    if carryKind == "judar_evolved" or carryKind == "cid_evolved" then carry2 = nil end
+    -- (2026-10-25 03:30: the second carry and the farm wait were taken back - shared data: after them,
+    -- Snowy Town fell from wave 24 on average (3 games) to wave 14 (7 games))
+    carry2 = nil
     -- (farm upgrades wait from wave 5 while the carry is below level 3: bulma reached 6 with
     -- sakamoto at 2, lost at wave 11)
-    local carryLow = State.eventMode and carry and AutoPlaceModule.WaveNumber() >= 5 and not AutoPlaceModule.danger
-        and (AutoPlaceModule.StatNum(carry, "upgrade") or 0) < 3
+    local carryLow = false
     -- (not once the base is hit, and only to wave 5 on a short road: on Snowy Town every damage unit
     -- sat at level 0 while bulma reached 5, lost at wave 7)
     local earlyNoCarry = State.eventMode and not AutoPlaceModule.danger
@@ -7252,7 +7253,8 @@ task.spawn(function()
             -- (per-game card memory starts empty: a Replay keeps the script running)
             Lobby.cardsTaken, Lobby.badTaken, Lobby.resTaken, Lobby.regenTaken, Lobby.shieldTaken = nil, nil, nil, nil, nil
             Lobby.candy, Lobby.pendingVote, Lobby.spells, Lobby.buffMain = nil, nil, nil, nil
-            AutoPlaceModule.capSeen, AutoPlaceModule.capFails, AutoPlaceModule.mainSeen = nil, 0, nil
+            -- (mainSeen is kept across games, as before: resetting it let weak copies fill the early map)
+            AutoPlaceModule.capSeen, AutoPlaceModule.capFails = nil, 0
             startSnap, gameWave = playerSnapshot(), 0
             firstSnap = firstSnap or startSnap
             unitsBefore = #Webhook.url >= 10 and Webhook.OwnedUnits() or nil
@@ -8447,7 +8449,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-022909"
+Lobby.VERSION = "20261025-032858"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
