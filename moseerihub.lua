@@ -8754,6 +8754,13 @@ function Lobby.OnCardOptions(seconds, options)
     Lobby.cardInfo = string.format("want %s (%s)", tostring(options[i].title), way)
     AutoPlaceModule.Note(string.format("card: %s (%s, way %s)", tostring(options[i].title), why, way))
     task.spawn(pcall, function()
+        -- (owner 2026-10-24: the remote vote stopped counting in one game - the card is also
+        -- tapped on screen after it, so either way the vote lands)
+        if remote then
+            -- (not waited on: a call the game does not answer must not hold up the tap)
+            task.spawn(pcall, function() remote:InvokeServer(arg) end)
+            way = "gui"
+        end
         if way == "gui" then
             -- the card on screen, then its Confirm button (a tapped card only shows Confirm; the
             -- vote counts once Confirm is tapped - real game 2026-10-24)
@@ -8781,9 +8788,6 @@ function Lobby.OnCardOptions(seconds, options)
                 Lobby.TapGui(ok)
                 Lobby.cardInfo = Lobby.cardInfo:gsub(" confirm %d$", "") .. " confirm " .. n
             end
-        else
-            -- (sent without waiting: a call the game does not answer must not hold anything up)
-            remote:InvokeServer(arg)
         end
     end)
 end
