@@ -2930,6 +2930,7 @@ local function rootPos(model)
     local ok, pivot = pcall(function() return model:GetPivot() end)
     return ok and pivot.Position or nil
 end
+AutoPlaceModule.RootPos = rootPos
 
 local function isEnemy(unit)
     local stats = unit:FindFirstChild("_stats")
@@ -8181,7 +8182,7 @@ Lobby.SPELL_WAYS = { "model" }
 -- names on the bar (IngameSpells data) and the ones that only take a slot from new units
 Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
     gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
-Lobby.DROP_SPELLS = { sell_refund = true, sacrifice = true, ritual = true, gate = true }
+Lobby.DROP_SPELLS = { ritual = true }
 
 -- The bar slot showing a spell (by its name on the card).
 function Lobby.SpellSlotBar()
@@ -8244,8 +8245,15 @@ function Lobby.TapGui(obj)
     return ok
 end
 
+-- What each spell does (IngameSpells data) and how it is used:
+-- random_buff +100% attack or range on a unit (the strongest), clone a copy with the same upgrade
+-- level (the most upgraded), summon / gate instant (Astral Summon: a random equipped unit into
+-- the slot; Astral Gate: Astral Summon three times as likely), sacrifice = Merge (all the SAME
+-- units in its range go into it, 1.5x their damage, and their places on the map come free),
+-- sell_refund = Refund (a full refund: near the 20-unit limit the weakest unit makes room).
 Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "upgraded" },
-    summon = { cost = 10000, reserve = 2000 } }
+    summon = { cost = 10000, reserve = 2000 }, gate = { cost = 2500 },
+    sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" } }
 function Lobby.OnSpells(list)
     list = Lobby.AsList(list)
     if type(list) ~= "table" then return end
@@ -8294,6 +8302,57 @@ function Lobby.RerollStep()
     end
 end
 
+-- The unit a spell goes on (nil = none fits now). Units refused before are skipped.
+function Lobby.SpellTarget(spec)
+    local bad = Lobby.spellBad or {}
+    local units = ownedUnits()
+    local function dpsNow(u)
+        local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+        local dmg = AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0
+        local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or tonumber(def.attack_cooldown) or 1
+        return dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1), (tonumber(def.damage) or 0) > 0
+    end
+    local target, best
+    if spec.target == "merge" then
+        -- the damage unit with the most units of its own kind in its range
+        for _, u in ipairs(units) do
+            local dps, hits = dpsNow(u)
+            local p, kind = AutoPlaceModule.RootPos(u), unitType(u)
+            local range = AutoPlaceModule.StatNum(u, "range") or tonumber((AutoPlaceModule.UnitDef(kind) or {}).range) or 0
+            if hits and p and not bad[u] then
+                local n = 0
+                for _, o in ipairs(units) do
+                    local q = o ~= u and unitType(o) == kind and AutoPlaceModule.RootPos(o)
+                    if q and (q - p).Magnitude <= range then n = n + 1 end
+                end
+                local score = n * 1e9 + dps
+                if n > 0 and (not best or score > best) then target, best = u, score end
+            end
+        end
+    elseif spec.target == "weakest" then
+        -- only near the limit; never a unit that hits flyers, never the last damage units
+        if #units < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2 then return nil end
+        for _, u in ipairs(units) do
+            local _, hits = dpsNow(u)
+            local full = AutoPlaceModule.MaxDps(unitType(u) or "")
+            if hits and full and not bad[u] and not AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) and (not best or full < best) then
+                target, best = u, full
+            end
+        end
+    else
+        for _, u in ipairs(units) do
+            if unitType(u) then
+                -- damage per second as the unit stands now (its own _stats: level, upgrades, trait,
+                -- earlier buffs), area attacks counted higher; Clone takes the most upgraded one
+                local dps, hits = dpsNow(u)
+                local score = spec.target == "upgraded" and ((AutoPlaceModule.StatNum(u, "upgrade") or 0) * 1e9 + dps) or dps
+                if hits and not bad[u] and (not best or score > best) then target, best = u, score end
+            end
+        end
+    end
+    return target
+end
+
 function Lobby.SpellSaving(money)
     if not Lobby.cfg.eventSpells or not State.eventMode or not money then return nil end
     -- (only once a spell has gone through: saving for one the game ignores held 8k+ unused)
@@ -8333,23 +8392,16 @@ function Lobby.SpellStep(money)
                 return
             end
         end
-        if spec and money >= spec.cost + (spec.reserve or 0) then
-            local target, best
-            for _, u in ipairs(ownedUnits()) do
-                if AutoPlaceModule.RoleOf and unitType(u) then
-                    local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
-                    -- damage per second as the unit stands now (its own _stats: level, upgrades, trait,
-                    -- earlier buffs), area attacks counted higher; Clone takes the most upgraded one
-                    local dmg = AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0
-                    local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or tonumber(def.attack_cooldown) or 1
-                    local dps = dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1)
-                    local score = spec.target == "upgraded" and ((AutoPlaceModule.StatNum(u, "upgrade") or 0) * 1e9 + dps) or dps
-                    if (tonumber(def.damage) or 0) > 0 and not (Lobby.spellBad or {})[u] and (not best or score > best) then target, best = u, score end
-                end
-            end
-            if spec.target and not target then return end
-            local slot = Lobby.SpellSlot(id)
-            if not slot then return end
+        local target = spec and spec.target and Lobby.SpellTarget(spec)
+        local slot = spec and Lobby.SpellSlot(id)
+        if spec and spec.dropIfNone and not target and slot and slot:FindFirstChild("Delete", true) then
+            -- (Merge with no two of a kind in range: its bar slot is worth more to a new roll)
+            Lobby.spellAt = os.clock()
+            Lobby.TapGui(slot:FindFirstChild("Delete", true))
+            AutoPlaceModule.Note("spell dropped: " .. id .. " (nothing to use it on)")
+            return
+        end
+        if spec and slot and (target or not spec.target) and money >= spec.cost + (spec.reserve or 0) then
             local way = Lobby.SpellWayOk(Lobby.cfg.spellWay) and Lobby.cfg.spellWay or Lobby.SPELL_WAYS[Lobby.spellWayTry or 1]
             local had = 0
             for _, s in ipairs(Lobby.spells) do if s == id then had = had + 1 end end
