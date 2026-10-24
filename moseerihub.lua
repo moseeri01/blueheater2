@@ -5078,7 +5078,8 @@ function AutoPlaceModule.EventChoose(money)
             local first = AutoPlaceModule.copySeen[t.uuid] or now
             AutoPlaceModule.copySeen[t.uuid] = first
             -- (owner: cleared sooner, money or not - only a main unit may wait for its price)
-            local mayWait = always or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8)
+            -- (a thin team gives a damage copy 30 s to be afforded, then it goes like any other)
+            local mayWait = always or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8 and now - first < 30)
             if not why and not atCap and now - first > EV.stuck and (not mayWait or (t.cost and money and money >= t.cost)) then why = "stuck on the bar" end
             if why then
                 AutoPlaceModule.DropCopy(t, why)
@@ -5094,10 +5095,11 @@ function AutoPlaceModule.EventChoose(money)
                 end
                 -- (an Always unit goes down as soon as it can be paid: nagumo was X'd as stuck while the
                 -- money waited for an upgrade - Snowy Town loss 2026-10-24)
-                -- (owner 2026-10-25: below 8 damage units a damage copy is placed before upgrades -
-                -- usopp and illya were cleared "stuck" while the yen went into monet / frieren)
+                -- (owner 2026-10-25: below 8 damage units a damage copy that can be paid NOW is placed
+                -- before upgrades - usopp and illya were cleared while the yen went into monet / frieren.
+                -- Never saved for: saving for unaffordable copies stopped every upgrade and filled the bar)
                 if always or role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0))
-                    or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8) then v = math.huge end
+                    or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8 and t.cost and money and money >= t.cost) then v = math.huge end
                 if v > bestV then best, bestV = { t = t, role = role }, v end
             end
         end
