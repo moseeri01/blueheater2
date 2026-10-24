@@ -3131,13 +3131,22 @@ end
 
 -- A team unit's real numbers: a placed copy's own _stats when there is one (already includes
 -- its rolls and trait), else the definition scaled by the rolls and trait from the team data.
+-- Seconds between hits from the unit data. A unit with none there attacks only with its skill:
+-- Arlem (armin) hits once in 60 s (36k a hit, ~600 a second), but read as one hit a second it
+-- looked 60x stronger, was placed and upgraded - owner 2026-10-24 "it attacks slowly, never take it".
+function AutoPlaceModule.DefCd(def)
+    local cd = tonumber(def and def.attack_cooldown)
+    if cd then return cd end
+    return (tonumber(def and def.damage) or 0) > 0 and 60 or 1
+end
+
 function AutoPlaceModule.Stats(t)
     local def = AutoPlaceModule.UnitDef and AutoPlaceModule.UnitDef(t.name) or {}
     local rolls = t.rolls or {}
     local tm = AutoPlaceModule.TraitMods(t.traits)
     local s = {
         damage = (tonumber(def.damage) or 0) * (rolls.potency_stat or 1) * tm.dmg,
-        cooldown = math.max(0.5, tonumber(def.attack_cooldown) or 1) / math.max(0.1, rolls.speed_stat or 1) * tm.spa,
+        cooldown = math.max(0.5, AutoPlaceModule.DefCd(def)) / math.max(0.1, rolls.speed_stat or 1) * tm.spa,
         range = (tonumber(def.range) or DEFAULT_RANGE) * (rolls.range_stat or 1) * tm.range,
     }
     local placed = t.placedSample
@@ -3893,7 +3902,18 @@ end
 -- Below it, the next damage unit placed / upgraded is an air-capable one; above it the
 -- normal order goes on. Traps count half when the team has another air unit.
 function AutoPlaceModule.AirNeed()
-    if not AutoPlaceModule.flying then AutoPlaceModule.airShare = nil return false end
+    -- (Fool's Hunt: flyers come from wave 10 and one unhit flyer ends the game; the strategy search
+    -- kept 3 units that hit them by wave 8 - so from wave 6 they are made ready before any flies)
+    local early = false
+    if State.eventMode and not AutoPlaceModule.flying and AutoPlaceModule.WaveNumber() >= 6 then
+        local n = 0
+        for _, u in ipairs(ownedUnits()) do
+            local lvl = AutoPlaceModule.StatNum(u, "upgrade") or 0
+            if unitRole(u) == "dps" and AutoPlaceModule.AirCapable(unitType(u) or "", lvl) then n = n + 1 end
+        end
+        early = n < 3
+    end
+    if not AutoPlaceModule.flying and not early then AutoPlaceModule.airShare = nil return false end
     -- another air unit that is on the map or can go down now (a hill unit with no hill spot
     -- does not count: then the trap unit is the whole answer)
     local realAir = false
@@ -4176,12 +4196,12 @@ local function upgradeGain(u, level)
     if def and (type(up) ~= "table" or #up == 0) then
         -- (no upgrade list: an even share of the usual growth per level)
         local maxN = AutoPlaceModule.StatNum(u, "max_upgrade") or 8
-        local base = (tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1)
+        local base = (tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.DefCd(def))
         return level < maxN and base * (AutoPlaceModule.GROWTH - 1) / maxN * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1) or 0
     end
     if type(up) ~= "table" then return 0 end
     local function statsAt(n)
-        local dmg, cd = tonumber(def.damage) or 0, tonumber(def.attack_cooldown) or 1
+        local dmg, cd = tonumber(def.damage) or 0, AutoPlaceModule.DefCd(def)
         for i = 1, n do
             local step = up[i]
             if type(step) == "table" then
@@ -4211,13 +4231,14 @@ end
 -- the unit data: judged at base strength they were X'd as "far below the team" and never got
 -- upgrades picked (real games 2026-10-24).
 AutoPlaceModule.GROWTH = 17
+AutoPlaceModule.FARMS_UNTIL = 9
 
 -- Fool's Hunt: damage per second a unit kind reaches fully upgraded (its definition), area
 -- attacks counted higher. Used to tell a strong random copy from a weak one.
 function AutoPlaceModule.MaxDps(name)
     local def = AutoPlaceModule.UnitDef(name)
     if not def then return nil end
-    local dmg, cd = tonumber(def.damage) or 0, tonumber(def.attack_cooldown) or 1
+    local dmg, cd = tonumber(def.damage) or 0, AutoPlaceModule.DefCd(def)
     local up = def.upgrade or def.upgrades
     -- (newer units keep their upgrades in a form not read here: their full strength is guessed)
     if type(up) ~= "table" or #up == 0 then
@@ -4237,7 +4258,9 @@ end
 -- with 20 units, many weak or never upgraded. Owner, 2026-10-24: place only the strong ones,
 -- X the rest so the slot rolls again. Judged once 4 damage units are down.
 -- (40% while under 10 units: places are plenty early and the team must grow)
-AutoPlaceModule.WEAK_SHARE, AutoPlaceModule.WEAK_SHARE_EARLY = 0.7, 0.4
+-- (strategy search, 400 settings x 300 games: the best ones X copies under the team's middle
+-- unit once the map has a few units, and keep almost anything while it is small)
+AutoPlaceModule.WEAK_SHARE, AutoPlaceModule.WEAK_SHARE_EARLY = 1.0, 0.2
 function AutoPlaceModule.EventWeak(t, role)
     if not State.eventMode or not t or not t.temp or role ~= "dps" then return false end
     -- (a unit that hits flyers is never cleared: goku_ssj3 was, then a flyer walked in and took
@@ -4254,7 +4277,7 @@ function AutoPlaceModule.EventWeak(t, role)
     end
     if #all < 4 then return false end
     table.sort(all)
-    local share = #ownedUnits() >= 10 and AutoPlaceModule.WEAK_SHARE or AutoPlaceModule.WEAK_SHARE_EARLY
+    local share = #ownedUnits() >= 8 and AutoPlaceModule.WEAK_SHARE or AutoPlaceModule.WEAK_SHARE_EARLY
     return mine < all[math.floor(#all / 2) + 1] * share
 end
 
@@ -4871,10 +4894,15 @@ local function tick()
         AutoPlaceModule.DropCopy(t, "its unit is at the limit")
         return 0.5
     end
-    -- (simulator: farms placed until wave 6 pay off, later ones only take a place on the map)
-    if State.eventMode and t.temp and role == "farm" and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL then
-        AutoPlaceModule.DropCopy(t, "no new farms after wave 6")
-        return 0.5
+    -- (strategy search: 2 speedwagons + bulma placed until wave 9 paid off best; later or more
+    -- farms only take a place on the map)
+    if State.eventMode and t.temp and role == "farm" then
+        local same = 0
+        for _, u in ipairs(ownedUnits()) do if unitType(u) == t.name then same = same + 1 end end
+        if AutoPlaceModule.WaveNumber() >= AutoPlaceModule.FARMS_UNTIL or (t.name == "speedwagon" and same >= 2) then
+            AutoPlaceModule.DropCopy(t, "farm not needed now")
+            return 0.5
+        end
     end
     -- (a copy left on the bar 25 s with the money for it is stuck: owner's screenshot, three
     -- copies sat there; cleared so the slot rolls again)
@@ -7914,7 +7942,7 @@ function Lobby.RecordWaves()
         local parts, dps = {}, 0
         for _, u in ipairs(ownedUnits()) do
             local lvl = AutoPlaceModule.StatNum(u, "upgrade") or 0
-            local d = (AutoPlaceModule.StatNum(u, "damage") or 0) / math.max(0.5, AutoPlaceModule.StatNum(u, "attack_cooldown") or 1)
+            local d = (AutoPlaceModule.StatNum(u, "damage") or 0) / math.max(0.5, AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(AutoPlaceModule.UnitDef(unitType(u) or "")))
             dps = dps + d
             table.insert(parts, string.format("%s:%d", tostring(unitType(u)), lvl))
         end
@@ -8038,7 +8066,7 @@ function Lobby.DamageShare()
     for _, u in ipairs(ownedUnits()) do
         local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
         local kind = tostring(def._base_damage_type or "physical")
-        local dps = (tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1)
+        local dps = (tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.DefCd(def))
         share[kind] = (share[kind] or 0) + dps
         total = total + dps
     end
@@ -8350,7 +8378,7 @@ function Lobby.SpellTarget(spec)
     local function dpsNow(u)
         local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
         local dmg = AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0
-        local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or tonumber(def.attack_cooldown) or 1
+        local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(def)
         return dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1), (tonumber(def.damage) or 0) > 0
     end
     local target, best
