@@ -4396,7 +4396,14 @@ function AutoPlaceModule.BestUpgradeScore()
             local lvl = u:FindFirstChild("_stats") and u._stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
             local can, cost = nextUpgrade(u, level)
-            if can and cost then best = math.max(best, upgradeGain(u, level) / math.max(1, cost)) end
+            if can and cost then
+                local v = upgradeGain(u, level) / math.max(1, cost)
+                -- (the same main-unit weight as upgradeStep in Fool's Hunt)
+                local kind = unitType(u) or ""
+                if State.eventMode and AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) and not AutoPlaceModule.UP_CAP[kind] then v = v * 10 end
+                if State.eventMode and AutoPlaceModule.UP_CAP[kind] and level >= AutoPlaceModule.UP_CAP[kind] then v = 0 end
+                best = math.max(best, v)
+            end
         end
     end
     return best
@@ -4456,6 +4463,13 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 -- (owner: giselle also raises summons' damage - worth twice its own gain while a
                 -- summoner such as elyssia is down)
                 if AutoPlaceModule.SUMMON_BUFF[unitType(u) or ""] and summonerDown then score = score * 2 end
+                -- (owner: in Fool's Hunt the main units are pushed to the top first; the early ones
+                -- took the money and the mains stayed low - a lost game 2026-10-24)
+                if State.eventMode and rank == 2 and score > 0 then
+                    local kind = unitType(u) or ""
+                    if AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) and not AutoPlaceModule.UP_CAP[kind] then score = score * 10
+                    elseif AutoPlaceModule.WaveNumber() >= 8 then score = score * 0.3 end
+                end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
@@ -4876,7 +4890,7 @@ function AutoPlaceModule.EventChoose(money)
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             local why
             local always = AutoPlaceModule.InList(Lobby.cfg.eventAlways, t.name)
-            if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) then why = "on the never list"
+            if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name] then why = "on the never / skip list"
             elseif role == "farm" then
                 -- (owner: 3 speedwagons + 1 bulma, upgraded to the top, any more X'd; a golden
                 -- (shiny) copy takes a normal one's place through a Refund)
@@ -7792,7 +7806,9 @@ function AutoPlaceModule.SlotTarget(s, t)
     return tonumber(AutoPlace.slots[s]) or 8
 end
 function AutoPlaceModule.refreshSkipUI()
-    if not Controls.dontPlace then return end
+    -- (not in Fool's Hunt: the bar changes every 10 s and rebuilding the list each time made it
+    -- flicker and drop what was being picked - a friend's test 2026-10-24)
+    if not Controls.dontPlace or State.eventMode then return end
     local names = AutoPlaceModule.TeamNames()
     local picked = {}
     for _, name in ipairs(names) do
@@ -8530,7 +8546,8 @@ end
 -- 20-unit limit the weakest makes room), ritual (the unit becomes a Holy Warlord walking the path,
 -- as strong as that unit: the strongest goes - owner 2026-10-24 "very good").
 Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "maxed" },
-    summon = { cost = 10000 }, gate = { cost = 2500 },
+    -- (owner: Astral Summon only with money to spare - 5000 kept for the main units' upgrades)
+    summon = { cost = 10000, reserve = 5000 }, gate = { cost = 2500 },
     sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" },
     ritual = { cost = 10000, target = "strongest" } }
 function Lobby.OnSpells(list)
@@ -8628,12 +8645,16 @@ function Lobby.SpellTarget(spec)
         end
         if #all < 4 then return nil end
         table.sort(all)
+        -- (owner: from the middle of the game the early units are sold too, their money goes into
+        -- the main units)
         local nearLimit = #units >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2
+            or AutoPlaceModule.WaveNumber() >= 12
         local bar = nearLimit and math.huge or all[math.floor(#all / 2) + 1] * 0.5
         for _, u in ipairs(units) do
             local _, hits = dpsNow(u)
             local full = AutoPlaceModule.MaxDps(unitType(u) or "")
-            if hits and full and full < bar and not bad[u] and not AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) and (not best or full < best) then
+            local main = AutoPlaceModule.InList(AutoPlaceModule.RANK, unitType(u)) and not AutoPlaceModule.UP_CAP[unitType(u) or ""]
+            if hits and full and full < bar and not main and not bad[u] and not AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) and (not best or full < best) then
                 target, best = u, full
             end
         end
@@ -8644,7 +8665,11 @@ function Lobby.SpellTarget(spec)
                 -- earlier buffs), area attacks counted higher; Clone takes the most upgraded one
                 local dps, hits = dpsNow(u)
                 local ok = hits and not bad[u] and (spec.target ~= "maxed" or Lobby.FullyUpgraded(u))
-                if ok and (not best or dps > best) then target, best = u, dps end
+                -- (owner: Random Buff goes on the main units first, in the list's order)
+                local rank = 0
+                for i, n in ipairs(AutoPlaceModule.RANK) do if n == unitType(u) then rank = #AutoPlaceModule.RANK - i + 1 end end
+                local score = rank * 1e9 + dps
+                if ok and (not best or score > best) then target, best = u, score end
             end
         end
     end
@@ -8673,8 +8698,6 @@ function Lobby.SpellSaving(money)
         local grown = #ownedUnits() >= 15
         if id == "clone" and grown and maxed and money < 5000 and tried < 5 then return "Saving for Clone" end
         if id == "ritual" and grown and money < 10000 and tried < 5 then return "Saving for Ritual" end
-        -- (owner: Astral Summon is among the best - saved for as soon as it is in hand)
-        if id == "summon" and money < 10000 and tried < 5 then return "Saving for Astral Summon" end
     end
     return nil
 end
@@ -8710,6 +8733,12 @@ function Lobby.SpellStep(money)
             end
         end
         local target = spec and spec.target and Lobby.SpellTarget(spec)
+        -- (owner: every Random Buff on the same one main unit, stacked - the first one's pick)
+        if id == "random_buff" then
+            local keep = Lobby.buffMain
+            -- (a sold or dead unit moves to _DEAD_UNITS: only one still in _UNITS counts)
+            if keep and keep.Parent and keep.Parent.Name == "_UNITS" and not (Lobby.spellBad or {})[keep] then target = keep else Lobby.buffMain = target end
+        end
         local slot = spec and Lobby.SpellSlot(id)
         if spec and spec.dropIfNone and not target and slot and slot:FindFirstChild("Delete", true) then
             -- (Merge with no two of a kind in range: its bar slot is worth more to a new roll)
