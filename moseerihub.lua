@@ -2062,6 +2062,9 @@ function AutoFarmModule.OnGameEnd()
     endHandling = true
     notify("Match ended: auto " .. goal .. "...")
     task.wait(1.5)
+    -- (the Discord report goes out first: a quick Replay teleported away before it was sent)
+    local reportBy = os.clock() + 8
+    while Webhook.reportPending and os.clock() < reportBy do task.wait(0.2) end
 
     local voteRemote = getAARemote("set_game_finished_vote")
     if voteRemote and goal ~= "leave" then
@@ -4369,11 +4372,15 @@ function AutoPlaceModule.EventCapped(t)
 end
 
 -- Clears a Fool's Hunt copy with its X on the bar: the slot rolls a new one.
+AutoPlaceModule.dropAt = {}
 function AutoPlaceModule.DropCopy(t, why)
     local bar = Lobby.SpellSlotBar and Lobby.SpellSlotBar()
     local x = bar and bar:FindFirstChild(tostring(t.slot))
     x = x and x:FindFirstChild("Delete", true)
-    AutoPlaceModule.badTemp[t.uuid] = true
+    -- (a tap that missed - a panel over the bar - left the copy there for good when it was marked
+    -- gone at once: now it is tapped again 5 s later while it is still on the bar - owner 2026-10-24)
+    AutoPlaceModule.dropAt[t.uuid] = os.clock()
+    if not (State.eventMode and Lobby.cfg.eventBrain ~= false) or not x then AutoPlaceModule.badTemp[t.uuid] = true end
     AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
     if x then Lobby.TapGui(x) end
     AutoPlaceModule.Note(string.format("copy cleared: %s (%s)", t.name, why))
@@ -4481,6 +4488,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     -- medea, archer, gyutaro were upgraded for nothing while the enemies were still easy)
     local carryKind = carry and unitType(carry) or ""
     local earlyNoCarry = State.eventMode and AutoPlaceModule.WaveNumber() < 10
+        and AutoPlaceModule.UnitDef("judar_evolved") ~= nil -- (only with the owner's roster in the game data)
         and not (AutoPlaceModule.EARLY_CARRY[carryKind] or (AutoPlaceModule.InList(AutoPlaceModule.RANK, carryKind) and not AutoPlaceModule.UP_CAP[carryKind]))
     local topOf = {}
     for _, o in ipairs(units) do
@@ -4969,7 +4977,8 @@ function AutoPlaceModule.EventChoose(money)
     -- 1. every copy on the bar: cleared with its X, or a candidate
     local best, bestV = nil, -1
     for _, t in pairs(AutoPlaceModule.team) do
-        if t.temp and not AutoPlaceModule.full[t.uuid] and not AutoPlaceModule.badTemp[t.uuid] then
+        if t.temp and not AutoPlaceModule.full[t.uuid] and not AutoPlaceModule.badTemp[t.uuid]
+            and now - (AutoPlaceModule.dropAt[t.uuid] or -1e9) > 5 then
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             local why
             local always = AutoPlaceModule.InList(Lobby.cfg.eventAlways, t.name)
@@ -5402,7 +5411,7 @@ local function tick()
 end
 
 -- The best moment to stop time: enemies about to reach the base, a boss (3x the usual HP)
--- inside our damage units' range, or most enemies bunched inside that range.
+-- inside our damage units' range, or a big pack (8+) bunched inside that range.
 -- A number from a unit's _stats folder (nil when missing).
 function AutoPlaceModule.StatNum(u, name)
     local st = u:FindFirstChild("_stats")
@@ -5410,7 +5419,8 @@ function AutoPlaceModule.StatNum(u, name)
     return v and tonumber(v.Value) or nil
 end
 
-function AutoPlaceModule.FreezeMoment()
+-- waited = seconds the skill has been ready (unlocks the small-group fallback).
+function AutoPlaceModule.FreezeMoment(waited)
     local folder = unitsFolder()
     local enemies, hps = {}, {}
     for _, u in ipairs(folder and folder:GetChildren() or {}) do
@@ -5450,23 +5460,32 @@ function AutoPlaceModule.FreezeMoment()
         end
     end
     if boss then return "boss inside the damage zone" end
-    if inZone >= math.max(5, math.ceil(#enemies * 0.6)) then return string.format("%d enemies inside the damage zone", inZone) end
+    -- owner 2026-10-24 (Fool's Hunt): 5 in the zone was a wasted 44 s cooldown - wait for a real
+    -- pack (8+), or 6+ that are most of a small wave
+    if inZone >= 8 or (inZone >= 6 and inZone >= math.ceil(#enemies * 0.6)) then
+        return string.format("%d enemies inside the damage zone", inZone)
+    end
+    -- never sit on it all game: after 60 s ready a small group in the zone is still better than nothing
+    if (waited or 0) > 60 and inZone >= 3 then
+        return string.format("%d enemies inside the damage zone, ready for %d s", inZone, math.floor(waited))
+    end
     return nil
 end
 
 local function freezeLoop(gen)
-    local last, lastAny = {}, -1e9
+    local last, lastAny, readyAt = {}, -1e9, {}
     while AutoPlace.enabled and gen == apGen and not State.unloaded do
         if AutoPlace.smartFreeze and isGameRunning() and not isResultsShowing() then
             pcall(function()
-                local why
                 for _, u in ipairs(ownedUnits()) do
                     if BuffRot.isControlSkill(u) and os.clock() - lastAny >= 4 then
                         local cd = AutoPlaceModule.StatNum(u, "active_attack_cooldown") or 30
                         if os.clock() - (last[u] or -1e9) >= cd + 0.5 then
-                            if why == nil then why = AutoPlaceModule.FreezeMoment() or false end
+                            -- first time seen ready (not the cooldown end: a fresh unit has no last cast)
+                            readyAt[u] = readyAt[u] or os.clock()
+                            local why = AutoPlaceModule.FreezeMoment(os.clock() - readyAt[u])
                             if why and fireActiveAttack(u) then
-                                last[u], lastAny = os.clock(), os.clock()
+                                last[u], lastAny, readyAt[u] = os.clock(), os.clock(), nil
                                 AutoPlaceModule.Note(string.format("%s stopped time: %s", unitType(u), why))
                                 break
                             end
@@ -7137,6 +7156,7 @@ task.spawn(function()
         if results and not wasResults and startSnap and not reported then
             reported = true -- (the result screen going away and back is the same game)
             Webhook.endedAt = os.clock()
+            Webhook.reportPending = true
             local win = Webhook.ResultWin()
             if win then session.wins = session.wins + 1 else session.losses = session.losses + 1 end
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
@@ -7165,10 +7185,11 @@ task.spawn(function()
             if lossAlarm then table.insert(pings, "losses") end
             local report = (win and Webhook.notifyComplete) or (not win and Webhook.notifyFail) or lossAlarm
             if report then
-                Webhook.SendReport(win and "win" or "loss", pings)
+                pcall(Webhook.SendReport, win and "win" or "loss", pings)
             elseif bagTurnedFull and Webhook.pingBagFull ~= false then
                 Webhook.Alert("bag", "⛔ Bag full", "Your bag is full: new drops are lost until you make room.", 15548997)
             end
+            Webhook.reportPending = false
             -- (not in Fool's Hunt: its random copies are not drops - every one was announced)
             -- (owner 2026-10-24: removed - it listed Fool's Hunt copies and lobby units as drops)
             if false and Webhook.pingMythic ~= false and unitsBefore and not State.eventMode then
@@ -8703,7 +8724,8 @@ Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { 
     -- (owner: Astral Summon only with money to spare - 5000 kept for the main units' upgrades)
     summon = { cost = 10000, reserve = 5000 }, gate = { cost = 2500 },
     sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" },
-    ritual = { cost = 10000, target = "strongest" } }
+    -- (owner: Ritual around wave 20, with money left once the mains are maxed)
+    ritual = { cost = 10000, reserve = 3000, target = "strongest", fromWave = 18 } }
 function Lobby.OnSpells(list)
     list = Lobby.AsList(list)
     if type(list) ~= "table" then return end
@@ -8857,7 +8879,7 @@ function Lobby.SpellSaving(money)
         -- units for a minute - real game 2026-10-24)
         local grown = #ownedUnits() >= 15
         if id == "clone" and grown and maxed and money < 5000 and tried < 5 then return "Saving for Clone" end
-        if id == "ritual" and grown and money < 10000 and tried < 5 then return "Saving for Ritual" end
+        if id == "ritual" and grown and AutoPlaceModule.WaveNumber() >= 18 and money < 10000 and tried < 5 then return "Saving for Ritual" end
     end
     return nil
 end
@@ -8909,7 +8931,8 @@ function Lobby.SpellStep(money)
             AutoPlaceModule.Note("spell dropped: " .. id .. " (nothing to use it on)")
             return
         end
-        if spec and slot and (target or not spec.target) and money >= spec.cost + (spec.reserve or 0) then
+        if spec and slot and (target or not spec.target) and money >= spec.cost + (spec.reserve or 0)
+            and AutoPlaceModule.WaveNumber() >= (spec.fromWave or 0) then
             local way = Lobby.SpellWayOk(Lobby.cfg.spellWay) and Lobby.cfg.spellWay or Lobby.SPELL_WAYS[Lobby.spellWayTry or 1]
             local had = 0
             for _, s in ipairs(Lobby.spells) do if s == id then had = had + 1 end end
