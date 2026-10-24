@@ -4196,6 +4196,42 @@ local function upgradeGain(u, level)
     return (math.max(0, statsAt(level + 1) - statsAt(level)) + skill) * mult
 end
 
+-- Fool's Hunt: damage per second a unit kind reaches fully upgraded (its definition), area
+-- attacks counted higher. Used to tell a strong random copy from a weak one.
+function AutoPlaceModule.MaxDps(name)
+    local def = AutoPlaceModule.UnitDef(name)
+    if not def then return nil end
+    local dmg, cd = tonumber(def.damage) or 0, tonumber(def.attack_cooldown) or 1
+    local up = def.upgrade or def.upgrades
+    for _, step in ipairs(type(up) == "table" and up or {}) do
+        if type(step) == "table" then
+            dmg = tonumber(step.damage) or dmg
+            cd = tonumber(step.attack_cooldown) or cd
+        end
+    end
+    return dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(name) and AOE_VALUE or 1)
+end
+
+-- Fool's Hunt: a damage copy far weaker than the damage units already down (under 40% of
+-- their middle one, fully upgraded) would only take one of the 20 places: owner, 2026-10-24
+-- "the weak ones should be X'd". Judged once 6 damage units are down.
+AutoPlaceModule.WEAK_SHARE = 0.4
+function AutoPlaceModule.EventWeak(t, role)
+    if not State.eventMode or not t or not t.temp or role ~= "dps" then return false end
+    local mine = AutoPlaceModule.MaxDps(t.name)
+    if not mine then return false end
+    local all = {}
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" then
+            local v = AutoPlaceModule.MaxDps(unitType(u))
+            if v and v > 0 then table.insert(all, v) end
+        end
+    end
+    if #all < 6 then return false end
+    table.sort(all)
+    return mine < all[math.floor(#all / 2) + 1] * AutoPlaceModule.WEAK_SHARE
+end
+
 -- Best damage gained per ¥ from upgrading any placed damage unit (0 when none can be upgraded).
 function AutoPlaceModule.BestUpgradeScore()
     local best, now = 0, os.clock()
@@ -4219,7 +4255,7 @@ end
 -- thin. Control units (time stop) upgrade one copy to max before the next (ControlUp.focus).
 -- onlyRole limits it to one role, airOnly to units that hit flyers. Returns seconds to wait,
 -- or nil when nothing is left.
-local function upgradeStep(money, onlyRole, airOnly)
+local function upgradeStep(money, onlyRole, airOnly, noWait)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
     local RANK = { farm = 1, dps = 2, support = 2 }
@@ -4260,6 +4296,7 @@ local function upgradeStep(money, onlyRole, airOnly)
         end
     end
     if not pick then return nil end
+    if noWait and pickCost and money and money < pickCost then return nil end
     if pickCost and money and money < pickCost then
         AutoPlaceModule.status = string.format("Upgrade %s to %d: waiting for money %d / %d", unitType(pick), pickLevel + 1, math.floor(money), math.floor(pickCost))
         return 0.2
@@ -4764,6 +4801,23 @@ local function tick()
         return 1
     end
     local cost = t.cost or hudPrices[slot]
+    if AutoPlaceModule.EventWeak(t, role) then
+        -- (cleared with its X: the bar rolls a new copy into the slot)
+        local bar = Lobby.SpellSlotBar and Lobby.SpellSlotBar()
+        local x = bar and bar:FindFirstChild(tostring(t.slot))
+        x = x and x:FindFirstChild("Delete", true)
+        AutoPlaceModule.badTemp[t.uuid] = true
+        AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
+        if x then Lobby.TapGui(x) end
+        AutoPlaceModule.Note(string.format("weak copy cleared: %s (far below the team)", t.name))
+        return 0.5
+    end
+    -- Fool's Hunt: copies come one at a time, so money past this copy's price would sit unused
+    -- (16k idle with 13 units in a real game): it goes into upgrades, the copy's price kept
+    if State.eventMode and AutoPlace.upgrade and not danger and cost and money and money > cost then
+        local wait = upgradeStep(money - cost, nil, nil, true)
+        if wait then return wait end
+    end
     if not danger and AutoPlace.upgrade and role == "dps" and (dpsPlaced or 0) > 0 then
         -- stay ahead instead of waiting for the base to get hit: when upgrading the strongest
         -- unit (trait / rolls included) adds more damage per ¥ than another copy, upgrade it
@@ -7927,10 +7981,24 @@ function Lobby.OnCardOptions(seconds, options)
     task.spawn(pcall, function()
         if way == "gui" then
             -- the card on screen, clicked (the game sends its own vote)
+            -- the card on screen, then its Confirm button (a tapped card only shows Confirm; the
+            -- vote counts once Confirm is tapped - real game 2026-10-24)
+            local card
             for _ = 1, 15 do
-                local b = Lobby.ButtonFor(options[i].title)
-                if b then Lobby.TapGui(b) return end
+                card = Lobby.ButtonFor(options[i].title)
+                if card then break end
                 task.wait(0.3)
+            end
+            if not card then return end
+            for _ = 1, 4 do
+                Lobby.TapGui(card)
+                task.wait(0.4)
+                local ok = Lobby.ButtonFor("Confirm")
+                if ok then
+                    Lobby.TapGui(ok)
+                    Lobby.cardInfo = Lobby.cardInfo:gsub(" confirmed$", "") .. " confirmed"
+                    return
+                end
             end
         elseif remote then
             -- (sent without waiting: a call with the wrong arguments got no answer in the real game)
@@ -7964,13 +8032,28 @@ end
 -- Refund / Ritual / Merge / Astral Gate. use_ingame_spell's arguments were never seen either:
 -- a way counts as working when the spell leaves the hand (cfg.spellWay).
 -- (owner: a spell is used by tapping its card, then the unit on the map - taps only)
-Lobby.SPELL_WAYS = { "gui" }
+-- (the game's own call, seen by Watch: use_ingame_spell(<bar slot number>, <target>); the target
+-- shape is tried in turn until a spell leaves the hand)
+Lobby.SPELL_WAYS = { "model", "uuid" }
 -- names on the bar (IngameSpells data) and the ones that only take a slot from new units
 Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
     gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
 Lobby.DROP_SPELLS = { sell_refund = true, sacrifice = true, ritual = true, gate = true }
 
 -- The bar slot showing a spell (by its name on the card).
+function Lobby.SpellSlotBar()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local bar = gui and gui:FindFirstChild("spawn_units")
+    bar = bar and bar:FindFirstChild("Lives")
+    bar = bar and bar:FindFirstChild("Frame")
+    return bar and bar:FindFirstChild("Units")
+end
+
+function Lobby.SpellWayOk(way)
+    for _, w in ipairs(Lobby.SPELL_WAYS) do if w == way then return true end end
+    return false
+end
+
 function Lobby.SpellSlot(id)
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local bar = gui and gui:FindFirstChild("spawn_units")
@@ -8003,18 +8086,6 @@ function Lobby.TapGui(obj)
     return ok
 end
 
--- Taps a unit on the map (its spot on screen), as the player does after picking a spell.
-function Lobby.TapUnit(u)
-    local cam = workspace.CurrentCamera
-    local p = rootPos(u)
-    if not cam or not p then return false end
-    local v, onScreen = cam:WorldToViewportPoint(p)
-    if not onScreen then return false end
-    VirtualInputManager:SendMouseButtonEvent(v.X, v.Y, 0, true, game, 0)
-    task.wait(0.05)
-    VirtualInputManager:SendMouseButtonEvent(v.X, v.Y, 0, false, game, 0)
-    return true
-end
 Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "upgraded" },
     summon = { cost = 10000, reserve = 2000 } }
 function Lobby.OnSpells(list)
@@ -8022,10 +8093,10 @@ function Lobby.OnSpells(list)
     if type(list) ~= "table" then return end
     local before = Lobby.spellTry
     Lobby.spells = list
-    if before and Lobby.cfg.spellWay == "" then
-        local still = false
-        for _, s in ipairs(list) do if s == before.id then still = true end end
-        if still then
+    if before and not Lobby.SpellWayOk(Lobby.cfg.spellWay) then
+        local n = 0
+        for _, s in ipairs(list) do if s == before.id then n = n + 1 end end
+        if n >= (before.had or 1) then
             Lobby.spellWayTry = (Lobby.spellWayTry or 1) % #Lobby.SPELL_WAYS + 1
         else
             Lobby.cfg.spellWay = before.way
@@ -8084,7 +8155,7 @@ function Lobby.SpellStep(money)
     if not Lobby.cfg.eventSpells or not money then return end
     local remote = getAARemote("use_ingame_spell")
     if os.clock() - (Lobby.spellAt or -1e9) < 4 then return end
-    for idx, id in ipairs(Lobby.spells or {}) do
+    for _, id in ipairs(Lobby.spells or {}) do
         local spec = Lobby.SPELLS[id]
         -- spells that only take a slot from the next random unit: dropped with their X
         if Lobby.DROP_SPELLS[id] then
@@ -8099,7 +8170,6 @@ function Lobby.SpellStep(money)
         end
         if spec and money >= spec.cost + (spec.reserve or 0) then
             local target, best
-            local ranked = {}
             for _, u in ipairs(ownedUnits()) do
                 if AutoPlaceModule.RoleOf and unitType(u) then
                     local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
@@ -8109,36 +8179,29 @@ function Lobby.SpellStep(money)
                     local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or tonumber(def.attack_cooldown) or 1
                     local dps = dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1)
                     local score = spec.target == "upgraded" and ((AutoPlaceModule.StatNum(u, "upgrade") or 0) * 1e9 + dps) or dps
-                    if (tonumber(def.damage) or 0) > 0 then table.insert(ranked, { u = u, score = score }) end
                     if (tonumber(def.damage) or 0) > 0 and (not best or score > best) then target, best = u, score end
                 end
             end
-            table.sort(ranked, function(a, b) return a.score > b.score end)
             if spec.target and not target then return end
-            local way = "gui"
-            local key = way:find("^index") and idx or id
+            local slot = Lobby.SpellSlot(id)
+            if not slot then return end
+            local way = Lobby.SpellWayOk(Lobby.cfg.spellWay) and Lobby.cfg.spellWay or Lobby.SPELL_WAYS[Lobby.spellWayTry or 1]
+            local had = 0
+            for _, s in ipairs(Lobby.spells) do if s == id then had = had + 1 end end
             Lobby.spellAt = os.clock()
-            Lobby.spellTry = { id = id, way = way }
+            Lobby.spellTry = { id = id, way = way, had = had }
             Lobby.spellTries = Lobby.spellTries or {}
             Lobby.spellTries[id] = (Lobby.spellTries[id] or 0) + 1
             -- sent without waiting: a call in a shape the game does not take got no answer, and
             -- waiting for it stopped Auto Place for the rest of the game (real game, 2026-10-24)
-            task.spawn(pcall, function()
-                if way == "gui" then
-                    -- the spell's slot, then the unit, tapped like a player
-                    local slot = Lobby.SpellSlot(id)
-                    if slot then
-                        Lobby.TapGui(slot)
-                        task.wait(0.5)
-                        -- (the best unit the camera shows: a unit off screen cannot be tapped)
-                        for _, r in ipairs(ranked) do
-                            if Lobby.TapUnit(r.u) then break end
-                        end
-                    end
-                elseif remote then
-                    if way:find("_unit$") and target then remote:InvokeServer(key, target) else remote:InvokeServer(key) end
-                end
-            end)
+            -- (taps on the unit missed: the game sent the spell with no target - real game 2026-10-24)
+            local arg = target
+            if way == "uuid" and target then
+                local st = target:FindFirstChild("_stats")
+                local v = st and st:FindFirstChild("uuid")
+                arg = v and tostring(v.Value) or nil
+            end
+            if remote then task.spawn(pcall, function() remote:InvokeServer(slot.Name, arg) end) end
             AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
             return
         end
