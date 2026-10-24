@@ -7990,15 +7990,22 @@ function Lobby.OnCardOptions(seconds, options)
                 task.wait(0.3)
             end
             if not card then return end
-            for _ = 1, 4 do
-                Lobby.TapGui(card)
-                task.wait(0.4)
-                local ok = Lobby.ButtonFor("Confirm")
-                if ok then
-                    Lobby.TapGui(ok)
-                    Lobby.cardInfo = Lobby.cardInfo:gsub(" confirmed$", "") .. " confirmed"
-                    return
-                end
+            -- (the card is tapped once only: a second tap may take the choice back; Confirm pops
+            -- in with an animation, so it is tapped after it settles and again while it stays -
+            -- one quick tap on it did not count in the real game)
+            Lobby.TapGui(card)
+            local ok
+            for _ = 1, 10 do
+                task.wait(0.3)
+                ok = Lobby.ButtonFor("Confirm")
+                if ok then break end
+            end
+            if not ok then return end
+            for n = 1, 4 do
+                task.wait(0.6)
+                if not (ok.Parent and isOnScreen(ok)) then return end
+                Lobby.TapGui(ok)
+                Lobby.cardInfo = Lobby.cardInfo:gsub(" confirm %d$", "") .. " confirm " .. n
             end
         elseif remote then
             -- (sent without waiting: a call with the wrong arguments got no answer in the real game)
