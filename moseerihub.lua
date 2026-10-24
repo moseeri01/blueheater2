@@ -3457,6 +3457,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             local len = 0
             for i = 2, #pts do len = len + math.sqrt((pts[i][1] - pts[i - 1][1]) ^ 2 + (pts[i][3] - pts[i - 1][3]) ^ 2) end
             local short = len < AutoPlaceModule.SHORT_ROAD
+            AutoPlaceModule.shortRoad = short
             if AutoPlaceModule.roadNoted ~= stageKey() then
                 AutoPlaceModule.roadNoted = stageKey()
                 AutoPlaceModule.Note(string.format("road %d studs: %s map", math.floor(len), short and "short" or "long"))
@@ -4501,7 +4502,10 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     -- (owner: before wave 10, no damage upgrade unless the carry is a main or an early carry -
     -- medea, archer, gyutaro were upgraded for nothing while the enemies were still easy)
     local carryKind = carry and unitType(carry) or ""
-    local earlyNoCarry = State.eventMode and AutoPlaceModule.WaveNumber() < 10
+    -- (not once the base is hit, and only to wave 5 on a short road: on Snowy Town every damage unit
+    -- sat at level 0 while bulma reached 5, lost at wave 7)
+    local earlyNoCarry = State.eventMode and not AutoPlaceModule.danger
+        and AutoPlaceModule.WaveNumber() < (AutoPlaceModule.shortRoad and 5 or 10)
         and AutoPlaceModule.UnitDef("judar_evolved") ~= nil -- (only with the owner's roster in the game data)
         and not (AutoPlaceModule.EARLY_CARRY[carryKind] or (AutoPlaceModule.InList(AutoPlaceModule.RANK, carryKind) and not AutoPlaceModule.UP_CAP[carryKind]))
     local topOf = {}
@@ -5122,7 +5126,8 @@ function AutoPlaceModule.EventChoose(money)
         -- the mains never reached their big upgrades)
         local m = (money or 0) - EV.reserve
         -- (farms and the aura unit only when they can be paid now; a farm's 30000 must not hold the team)
-        local wait = upgradeStep(m, "farm", nil, true) or upgradeStep(m, "support", nil, true) or upgradeStep(m, "dps")
+        -- (base being hit: damage first, no farm or aura upgrades)
+        local wait = (not AutoPlaceModule.danger and (upgradeStep(m, "farm", nil, true) or upgradeStep(m, "support", nil, true))) or upgradeStep(m, "dps")
         if wait then return wait end
         -- (no "saving" without an upgrade that can actually be picked: with the carry maxed and no
         -- other main, 20k sat unused until the loss - real game 2026-10-24)
