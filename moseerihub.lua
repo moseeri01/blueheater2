@@ -4577,15 +4577,16 @@ end
 -- waves; endless events do not stop). Unknown numbers: yes, as before.
 AutoPlaceModule.FARM_HORIZON = 15
 function AutoPlaceModule.FarmPays(u, level, cost)
-    if State.eventMode or not cost then return true end
+    if not cost then return true end
     local def = AutoPlaceModule.UnitDef(unitType(u))
     local up = def and (def.upgrade or def.upgrades)
     if type(up) ~= "table" or type(up[level + 1]) ~= "table" then return true end
     local now = level == 0 and tonumber(def.farm_amount) or (type(up[level]) == "table" and tonumber(up[level].farm_amount))
     local nextAmount = tonumber(up[level + 1].farm_amount)
     if not now or not nextAmount or nextAmount <= now then return true end
-    local left = AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber()
-    return cost / (nextAmount - now) <= left / 2
+    -- (Fool's Hunt runs to wave 30: an upgrade must pay 1.5x its price before then - simulator)
+    local left = (State.eventMode and 30 or AutoPlaceModule.FARM_HORIZON) - AutoPlaceModule.WaveNumber()
+    return cost / (nextAmount - now) <= left / (State.eventMode and 1.5 or 2)
 end
 
 function AutoPlaceModule.LastWave()
@@ -4868,6 +4869,11 @@ local function tick()
     end
     if AutoPlaceModule.EventCapped(t) then
         AutoPlaceModule.DropCopy(t, "its unit is at the limit")
+        return 0.5
+    end
+    -- (simulator: farms placed until wave 6 pay off, later ones only take a place on the map)
+    if State.eventMode and t.temp and role == "farm" and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL then
+        AutoPlaceModule.DropCopy(t, "no new farms after wave 6")
         return 0.5
     end
     -- (a copy left on the bar 25 s with the money for it is stuck: owner's screenshot, three
@@ -8086,6 +8092,7 @@ end
 -- The card to pick: "Most coins" takes the Bad card that hurts least (each adds 0.3 to the
 -- coin multiplier) unless the base is losing HP or every Bad card is heavy; "Safest" takes a
 -- Good card whenever there is one.
+Lobby.BAD_CARDS_UNTIL = 6
 function Lobby.PickCard(options)
     local share = Lobby.DamageShare()
     local hp, hpMax = AutoPlaceModule.ScanBaseHp()
@@ -8102,7 +8109,11 @@ function Lobby.PickCard(options)
             end
         end
     end
-    if good and (Lobby.cfg.cardMode == "Safest" or hurt or not bestBad or bestBadCost > 0.8) then return good, "help" end
+    -- (strategy simulator, 2000 games each: Bad cards past wave 6 make the enemies outgrow the team
+    -- - Good cards only reached wave 23 on average vs 18, with 22% MORE coins, since coins come
+    -- mostly from the waves lived; Bad cards on every offer was the worst play tested, -35% coins)
+    local late = State.eventMode and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL
+    if good and (Lobby.cfg.cardMode == "Safest" or late or hurt or not bestBad or bestBadCost > 0.8) then return good, "help" end
     return bestBad or 1, "coins"
 end
 
