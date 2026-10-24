@@ -146,8 +146,8 @@ local Lobby = {
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
         eventBrain = true, maxSpellsHeld = 2,
-        eventAlways = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "archer_evolved" },
-        eventNever = { "armin", "stain_evolved", "narberal_evolved", "jiraiya_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "emilia", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
+        eventAlways = { "judar_evolved", "cid_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
+        eventNever = { "armin", "stain_evolved", "narberal_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
 }
 
@@ -4326,6 +4326,11 @@ function AutoPlaceModule.DropCopy(t, why)
 end
 
 AutoPlaceModule.SUMMON_BUFF = { giselle_evolved = true, giselle = true }
+-- owner 2026-10-24: saber carries the early game, 2 upgrades are enough; pucci is placed when money
+-- is left over and then upgraded to the top (its skill speeds up the team's attacks)
+-- (jiraiya and emilia slow the enemies: placed, never upgraded)
+AutoPlaceModule.UP_CAP = { saber_evolved = 2, jiraiya_evolved = 0, emilia = 0 }
+AutoPlaceModule.UP_FIRST = { pucci_heaven = true }
 function AutoPlaceModule.SummonerDown(units)
     for _, o in ipairs(units) do
         local def = AutoPlaceModule.UnitDef(unitType(o) or "") or {}
@@ -4389,6 +4394,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
         local role = unitRole(u)
         -- (owner: a Never unit is not upgraded either - akainu and Cream get slower with upgrades)
         local never = State.eventMode and AutoPlaceModule.InList(Lobby.cfg.eventNever, unitType(u))
+        local capLvl = AutoPlaceModule.UP_CAP[unitType(u) or ""]
+        if capLvl and (AutoPlaceModule.StatNum(u, "upgrade") or 0) >= capLvl then never = true end
         if role ~= "buff" and not never and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
             and not AutoPlaceModule.OutOfReach(u) then
             local stats = u:FindFirstChild("_stats")
@@ -4402,7 +4409,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             -- 6500 upgrade held 30k unused in a real game)
             if can and noWait and cost and money and cost > money then can = false end
             if can then
-                local rank = RANK[role] or 2
+                local rank = AutoPlaceModule.UP_FIRST[unitType(u) or ""] and 1 or RANK[role] or 2
                 -- (an upgrade price not in the data: about the unit's price times the next level)
                 local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
                 local guess = (tonumber(def.cost) or 1000) * (level + 1)
@@ -4807,9 +4814,10 @@ end
 -- damage per yen x placeBonus) with the best upgrade (damage gained per yen) and do the better
 -- one, saving for it when it cannot be paid yet. Farms, buff units and flyer hitters while short
 -- go first. Returns seconds to wait, or nil and the copy to place.
--- strongest first (simulator: damage per map place at full upgrade; judar first - owner)
-AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "archer_evolved" }
-AutoPlaceModule.ROSTER = { "akainu_evolved", "aokiji_evolved", "archer_evolved", "armin", "avdol_evolved", "bee_girl_evolved", "caesarclown_evolved", "cid_evolved", "daki_evolved", "demiurge_evolved", "emilia", "escanor_evolved", "esdeath_evolved", "frieren_evolved", "fujitora_evolved", "ghostkun_evolved", "gildarts_evolved", "gilgamesh_evolved", "goku_ssj3_evolved", "gremmy_evolved", "guts_berserker", "gyutaro_evolved", "hakari_evolved", "hidan_unit_evolved", "illya_evolved", "jiraiya_evolved", "josuke_2_evolved", "judar_evolved", "julius_evolved", "koichi_evolved", "konan_unit_evolved", "law_2_evolved", "medea_evolved", "meliodas_evolved", "metal_knight_evolved", "monet_evolved", "narberal_evolved", "naruto_6tails", "natsu_evolved", "pucci_heaven", "saber_evolved", "sabo_evolved", "sakamoto_evolved", "shalltear_evolved", "shigaraki_evolved", "stain_evolved", "sukuna", "tatsumaki_evolved", "tengen_2_evolved", "usopp_ts_evolved", "vanilla_ice_evolved" }
+-- owner's picks 2026-10-24, first placed first: judar (cid when no judar), sakamoto, nagumo (cuts
+-- HP), saber (early carry), frieren and monet (flyers, slow), jiraiya and emilia (slow, no upgrades)
+AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" }
+AutoPlaceModule.ROSTER = { "akainu_evolved", "aokiji_evolved", "archer_evolved", "armin", "avdol_evolved", "bee_girl_evolved", "caesarclown_evolved", "cid_evolved", "daki_evolved", "demiurge_evolved", "emilia", "escanor_evolved", "esdeath_evolved", "frieren_evolved", "fujitora_evolved", "ghostkun_evolved", "gildarts_evolved", "gilgamesh_evolved", "goku_ssj3_evolved", "gremmy_evolved", "guts_berserker", "gyutaro_evolved", "hakari_evolved", "hidan_unit_evolved", "illya_evolved", "jiraiya_evolved", "josuke_2_evolved", "judar_evolved", "julius_evolved", "koichi_evolved", "konan_unit_evolved", "law_2_evolved", "medea_evolved", "meliodas_evolved", "metal_knight_evolved", "monet_evolved", "nagumo_evolved", "nagumo_evolved", "narberal_evolved", "naruto_6tails", "natsu_evolved", "pucci_heaven", "saber_evolved", "sabo_evolved", "sakamoto_evolved", "shalltear_evolved", "shigaraki_evolved", "stain_evolved", "sukuna", "tatsumaki_evolved", "tengen_2_evolved", "usopp_ts_evolved", "vanilla_ice_evolved" }
 function AutoPlaceModule.InList(list, name)
     for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
     return false
@@ -8484,7 +8492,7 @@ end
 -- 20-unit limit the weakest makes room), ritual (the unit becomes a Holy Warlord walking the path,
 -- as strong as that unit: the strongest goes - owner 2026-10-24 "very good").
 Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "maxed" },
-    summon = { cost = 10000, reserve = 2000 }, gate = { cost = 2500 },
+    summon = { cost = 10000 }, gate = { cost = 2500 },
     sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" },
     ritual = { cost = 10000, target = "strongest" } }
 function Lobby.OnSpells(list)
@@ -8627,6 +8635,8 @@ function Lobby.SpellSaving(money)
         local grown = #ownedUnits() >= 15
         if id == "clone" and grown and maxed and money < 5000 and tried < 5 then return "Saving for Clone" end
         if id == "ritual" and grown and money < 10000 and tried < 5 then return "Saving for Ritual" end
+        -- (owner: Astral Summon is among the best - saved for as soon as it is in hand)
+        if id == "summon" and money < 10000 and tried < 5 then return "Saving for Astral Summon" end
     end
     return nil
 end
@@ -8718,7 +8728,7 @@ function Lobby.SpellCap()
     return true
 end
 -- which spell to keep when too many wait (higher = kept)
-Lobby.SPELL_KEEP = { ritual = 7, clone = 6, random_buff = 5, summon = 4, sacrifice = 3, sell_refund = 2, gate = 1 }
+Lobby.SPELL_KEEP = { summon = 8, ritual = 7, clone = 6, random_buff = 5, sacrifice = 3, sell_refund = 2, gate = 1 }
 
 -- (each connected on its own: one missing event must not leave the others unheard)
 for name, fn in pairs({ show_roguelike_options = function(sec, o)
