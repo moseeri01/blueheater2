@@ -8525,11 +8525,17 @@ function Lobby.ButtonFor(text, root)
     return nil
 end
 
--- Share of our damage by type (physical / magic / true ...), from the placed units' data.
+-- Share of our damage by type (physical / magic / true ...), from the placed units' data -
+-- in event also the Always list: the first card comes before the mains are down (owner
+-- 2026-10-24: Magic Resistance +75 taken at the start, then judar came).
 function Lobby.DamageShare()
-    local share, total = {}, 0
-    for _, u in ipairs(ownedUnits()) do
-        local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+    local share, total, names = {}, 0, {}
+    for _, u in ipairs(ownedUnits()) do table.insert(names, unitType(u)) end
+    if State.eventMode then
+        for _, n in ipairs(Lobby.cfg.eventAlways or {}) do table.insert(names, n) end
+    end
+    for _, name in ipairs(names) do
+        local def = AutoPlaceModule.UnitDef(name) or {}
         local kind = tostring(def._base_damage_type or "physical")
         local dps = (tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.DefCd(def))
         share[kind] = (share[kind] or 0) + dps
