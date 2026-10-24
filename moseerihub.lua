@@ -127,6 +127,9 @@ local DungeonRun = {
 local Tools = {
     antiAfk = false,
     antiAfkConnection = nil,
+    -- spots ON the enemy path are tried too (some units may stand on the road; the game refuses
+    -- where it does not allow it and that spot is skipped) - owner 2026-10-24
+    onPath = false,
     sessionStartedAt = os.clock(),
     totalReplays = 0,
     totalFails = 0,
@@ -255,7 +258,7 @@ local function buildConfigData()
             showAllMacros = State.showAllMacros,
             lastMacro = State.macroName,
         },
-        tools = { antiAfk = Tools.antiAfk, perf = Tools.perf },
+        tools = { antiAfk = Tools.antiAfk, perf = Tools.perf, onPath = Tools.onPath or nil },
         autoPlace = {
             enabled = AutoPlace.enabled, manual = AutoPlace.manual, skip = next(AutoPlace.skip) and AutoPlace.skip or nil,
             homeKeep = AutoPlace.homeKeep, upgrade = AutoPlace.upgrade, slots = AutoPlace.slots,
@@ -328,6 +331,7 @@ local function applyConfigData(data)
     local t = data.tools or {}
     pendingToggles.antiAfk = t.antiAfk ~= false -- on unless the saved config turned it off
     pendingToggles.perf = type(t.perf) == "table" and t.perf or nil
+    Tools.onPath = t.onPath == true
     local ap = data.autoPlace or {}
     pendingToggles.autoPlace = ap.enabled == true
     AutoPlace.manual = ap.manual == true
@@ -2025,8 +2029,30 @@ local function endGoal()
     return nil
 end
 
+-- "There is a pending teleport, please wait." on screen: the game is already moving us on
+function AutoFarmModule.TeleportPending()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.lower(tostring(d.Text)):find("pending teleport", 1, true) and isOnScreen(d) then return true end
+    end
+    return false
+end
+
 function AutoFarmModule.OnGameEnd()
     if endHandling or State.recording or State.finalizing then return end
+    -- (a friend's Infinity Mansion: Next Room pressed again every 20 s while the teleport was
+    -- pending, and each press only brought the message back - wait for the game instead; still
+    -- there after 2 minutes with Auto join on: back to the lobby, Auto join starts the next room)
+    if AutoFarmModule.TeleportPending() then
+        AutoFarmModule.pendingSince = AutoFarmModule.pendingSince or os.clock()
+        if os.clock() - AutoFarmModule.pendingSince > 120 and Lobby.cfg.autoJoin then
+            AutoFarmModule.pendingSince = nil
+            local back = findScreenButton(Words.LEAVE)
+            if back then clickButton(back) notify("Teleport stuck for 2 minutes: back to the lobby, Auto join goes on") end
+        end
+        return
+    end
+    AutoFarmModule.pendingSince = nil
     local goal, words = endGoal()
     if not goal then return end
     endHandling = true
@@ -3023,6 +3049,14 @@ local function buildCandidates(pts)
     for i = 1, #pts, step do
         local p = pts[i]
         local roadY = groundHit(p[1], p[2], p[3])
+        if Tools.onPath and roadY then
+            local score = 0
+            for _, q in ipairs(pts) do
+                local dx, dz = q[1] - p[1], q[3] - p[3]
+                if dx * dx + dz * dz <= DEFAULT_RANGE * DEFAULT_RANGE then score = score + 1 end
+            end
+            table.insert(list, { x = p[1], y = p[2], z = p[3], score = score, groundY = roadY, kind = "ground", onPath = true })
+        end
         for _, d in ipairs(dirs) do
             for _, dist in ipairs(SIDE_DIST) do
                 local x, z = p[1] + d[1] * dist, p[3] + d[2] * dist
@@ -3033,7 +3067,7 @@ local function buildCandidates(pts)
                     if d2 < nearest then nearest = d2 end
                     if d2 <= DEFAULT_RANGE * DEFAULT_RANGE then score = score + 1 end
                 end
-                if nearest >= MIN_FROM_PATH * MIN_FROM_PATH then
+                if nearest >= MIN_FROM_PATH * MIN_FROM_PATH or (Tools.onPath and dist == SIDE_DIST[1]) then
                     local gy, tag, part = groundHit(x, p[2], z)
                     -- nothing under it, or well below the road (past a rooftop / ledge edge, as on
                     -- Fiend City where the road runs over roofs): not a place to stand
@@ -4388,6 +4422,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     local units = ownedUnits()
     local focus = ControlUp.focus(units, now)
     local fuse = ControlUp.fusionFocus(units)
+    local summonerDown = AutoPlaceModule.SummonerDown(units)
     for _, u in ipairs(units) do
         local role = unitRole(u)
         -- (owner: a Never unit is not upgraded either - akainu and Cream get slower with upgrades)
@@ -4420,7 +4455,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 if rank == 2 and score > 0 and AutoPlaceModule.HasTrait(u, "unique") then score = score * 1e6 end
                 -- (owner: giselle also raises summons' damage - worth twice its own gain while a
                 -- summoner such as elyssia is down)
-                if AutoPlaceModule.SUMMON_BUFF[unitType(u) or ""] and AutoPlaceModule.SummonerDown(units) then score = score * 2 end
+                if AutoPlaceModule.SUMMON_BUFF[unitType(u) or ""] and summonerDown then score = score * 2 end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
@@ -8128,7 +8163,12 @@ function Lobby.RecordWaves()
             tostring(Lobby.candy), table.concat(parts, " ")))
     end
     while #Lobby.waveLog > 3000 do table.remove(Lobby.waveLog, 2) end
-    AutoPlaceModule.Catalog.save("event_waves_" .. tostring(math.floor(AutoPlaceModule.loadUnix or 0)) .. ".txt", table.concat(Lobby.waveLog, "\n"))
+    -- (written only when something new came, at most every 20 s: the whole file every 5 s was a
+    -- steady stutter on a phone once it grew)
+    if #Lobby.waveLog ~= Lobby.waveSaved and os.clock() - (Lobby.waveSavedAt or -1e9) > 20 then
+        Lobby.waveSaved, Lobby.waveSavedAt = #Lobby.waveLog, os.clock()
+        AutoPlaceModule.Catalog.save("event_waves_" .. tostring(math.floor(AutoPlaceModule.loadUnix or 0)) .. ".txt", table.concat(Lobby.waveLog, "\n"))
+    end
 end
 
 -- Every 5 s in the lobby (not while Watch is teaching): join again 20 s after a try.
@@ -9229,6 +9269,15 @@ UIRef.antiAfkToggle = generalSection:Toggle({
         saveConfig()
     end,
 }, "AntiAfk")
+generalSection:Toggle({
+    Name = "Place on enemy path",
+    Default = Tools.onPath == true,
+    Callback = function(on)
+        Tools.onPath = on
+        candidates, candidatesFor = nil, -1 -- (spots are worked out again with / without the road)
+        saveConfig()
+    end,
+}, "PlaceOnPath")
 
 webhookSection:Header({ Text = "Discord" })
 Controls.webhookUrl = webhookSection:Input({
