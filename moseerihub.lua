@@ -4459,6 +4459,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             local more = nextUpgrade(o, lv)
             if unitRole(o) == "dps" and not AutoPlaceModule.UP_CAP[k] and more and (upgradeFails[o] or 0) < now then
                 local v = (AutoPlaceModule.MaxDps(k) or 0) * (AutoPlaceModule.InList(AutoPlaceModule.RANK, k) and 100 or 1)
+                -- (owner: the first carry is best one that hits flyers too - maxed before flyers come at wave 10)
+                if AutoPlaceModule.AirCapable(k, math.huge) then v = v * 3 end
                 if not carry or v > carryV then carry, carryV = o, v end
             end
         end
@@ -7074,7 +7076,7 @@ pcall(function()
         -- (Fool's Hunt: leaving right after a game ended is the replay teleport, not a kick)
         if State.eventMode and os.clock() - (Webhook.endedAt or -1e9) < 120 then return end
         Webhook.disconnectSent = true
-        if Webhook.pingDisconnect ~= false then pcall(Webhook.Alert, "disconnect", "⚠️ Disconnected", clip(text, 300), 15105570) end
+        -- (owner 2026-10-24: removed - every replay / lobby teleport was reported as a disconnect)
     end
     pcall(function() table.insert(State.connections, gs.ErrorMessageChanged:Connect(onError)) end)
     pcall(function()
@@ -7138,7 +7140,8 @@ task.spawn(function()
                 Webhook.Alert("bag", "⛔ Bag full", "Your bag is full: new drops are lost until you make room.", 15548997)
             end
             -- (not in Fool's Hunt: its random copies are not drops - every one was announced)
-            if Webhook.pingMythic ~= false and unitsBefore and not State.eventMode then
+            -- (owner 2026-10-24: removed - it listed Fool's Hunt copies and lobby units as drops)
+            if false and Webhook.pingMythic ~= false and unitsBefore and not State.eventMode then
                 local okR, drops = pcall(Webhook.RareDrops, unitsBefore)
                 if okR and #drops > 0 then
                     Webhook.Alert("mythic", "🌟 " .. drops[1], table.concat(drops, "\n"), 16766720)
@@ -8907,6 +8910,21 @@ end
 -- Refunds filled the bar in a real game)
 function Lobby.SpellCap()
     local held = Lobby.spells or {}
+    -- (owner: one Clone in hand is enough - a second one is cleared at once)
+    local seen = {}
+    for _, id in ipairs(held) do
+        seen[id] = (seen[id] or 0) + 1
+        if Lobby.SPELL_MAX[id] and seen[id] > Lobby.SPELL_MAX[id] then
+            local slot = Lobby.SpellSlot(id)
+            local x = slot and slot:FindFirstChild("Delete", true)
+            if x then
+                Lobby.spellAt = os.clock()
+                Lobby.TapGui(x)
+                AutoPlaceModule.Note("spell dropped: " .. id .. " (one is enough)")
+                return true
+            end
+        end
+    end
     if #held <= (tonumber(Lobby.cfg.maxSpellsHeld) or 2) then return false end
     local worst, worstP
     for _, id in ipairs(held) do
@@ -8922,6 +8940,7 @@ function Lobby.SpellCap()
     return true
 end
 -- which spell to keep when too many wait (higher = kept)
+Lobby.SPELL_MAX = { clone = 1 }
 Lobby.SPELL_KEEP = { summon = 8, ritual = 7, clone = 6, random_buff = 5, sacrifice = 3, sell_refund = 2, gate = 1 }
 
 -- (each connected on its own: one missing event must not leave the others unheard)
