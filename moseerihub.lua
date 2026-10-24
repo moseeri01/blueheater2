@@ -7891,7 +7891,7 @@ function Lobby.OnCardOptions(seconds, options)
             -- the card on screen, clicked (the game sends its own vote)
             for _ = 1, 15 do
                 local b = Lobby.ButtonFor(options[i].title)
-                if b then clickButton(b) return end
+                if b then Lobby.TapGui(b) return end
                 task.wait(0.3)
             end
         elseif remote then
@@ -7947,6 +7947,20 @@ function Lobby.SpellSlot(id)
         end
     end
     return nil
+end
+
+-- A real tap on a screen object (its middle). In the real game the card vote did not go
+-- through the button's click handlers, but a finger tap on the card did.
+function Lobby.TapGui(obj)
+    if not obj then return false end
+    local ok = pcall(function()
+        local inset = game:GetService("GuiService"):GetGuiInset()
+        local pos = obj.AbsolutePosition + obj.AbsoluteSize / 2 + inset
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end)
+    return ok
 end
 
 -- Taps a unit on the map (its spot on screen), as the player does after picking a spell.
@@ -8021,7 +8035,7 @@ function Lobby.SpellStep(money)
                     -- the spell's slot, then the unit, tapped like a player
                     local slot = Lobby.SpellSlot(id)
                     if slot then
-                        clickButton(slot:IsA("GuiButton") and slot or slot:FindFirstChildWhichIsA("GuiButton", true))
+                        Lobby.TapGui(slot)
                         task.wait(0.5)
                         if target then Lobby.TapUnit(target) end
                     end
