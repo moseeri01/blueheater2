@@ -3560,9 +3560,9 @@ AutoPlaceModule.liveTemp, AutoPlaceModule.goneTemp, AutoPlaceModule.badTemp, Aut
 AutoPlaceModule.usedSlot = {}
 AutoPlaceModule.EVENT_CAP = 20
 task.spawn(pcall, function()
-    local stc = ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5)
+    local stc = ReplicatedStorage:WaitForChild("endpoints"):WaitForChild("server_to_client")
     local function uuidOf(v) return type(v) == "table" and v.uuid and tostring(v.uuid) or (type(v) == "string" and v or nil) end
-    stc:WaitForChild("unit_added_temporary", 5).OnClientEvent:Connect(function(data)
+    stc:WaitForChild("unit_added_temporary").OnClientEvent:Connect(function(data)
         local uuid = uuidOf(data)
         if uuid and type(data) == "table" and data.unit_id then
             AutoPlaceModule.liveTemp[uuid] = { id = tostring(data.unit_id), made = tonumber(data._creation_time) or os.time(), seen = os.clock(),
@@ -3571,7 +3571,7 @@ task.spawn(pcall, function()
             AutoPlaceModule.tempVersion = AutoPlaceModule.tempVersion + 1
         end
     end)
-    stc:WaitForChild("unit_removed_temporary", 5).OnClientEvent:Connect(function(data)
+    stc:WaitForChild("unit_removed_temporary").OnClientEvent:Connect(function(data)
         local uuid = uuidOf(data)
         if uuid then
             AutoPlaceModule.liveTemp[uuid], AutoPlaceModule.goneTemp[uuid] = nil, true
@@ -7020,6 +7020,15 @@ function Webhook.BuildReport(kind)
             table.insert(why, string.format("- %ds before: %s", math.floor(os.clock() - log[i].at), yamlValue(log[i].text)))
         end
         if AutoPlaceModule.problem then table.insert(why, "Problem: " .. yamlValue(AutoPlaceModule.problem)) end
+        -- (also kept on the device, AAMacro/losses.txt, newest last, so each loss can be read
+        -- and fixed without copying it from Discord; owner 2026-10-24)
+        pcall(function()
+            local path = "AAMacro/losses.txt"
+            local old = isfile(path) and readfile(path) or ""
+            if #old > 60000 then old = old:sub(-40000) end
+            writefile(path, old .. string.format("=== %s | candy %s | card %s\n%s\n\n", os.date("%Y-%m-%d %H:%M:%S"),
+                tostring(Lobby.candy), tostring(Lobby.cardInfo), table.concat(why, "\n")))
+        end)
         table.insert(embed.fields, { name = "Why it was lost", value = clip("```yaml\n" .. table.concat(why, "\n"), 1000) .. "\n```", inline = false })
     end
     local avatar = playerAvatar()
@@ -9122,7 +9131,9 @@ for name, fn in pairs({ show_roguelike_options = function(sec, o)
     show_roguelike_vote_result = function(p, st) pcall(Lobby.OnCardResult, p, st) end,
     ingame_spells = function(l) pcall(Lobby.OnSpells, l) end }) do
     task.spawn(pcall, function()
-        ReplicatedStorage:WaitForChild("endpoints", 5):WaitForChild("server_to_client", 5):WaitForChild(name, 5).OnClientEvent:Connect(fn)
+        -- (no time limit: a slow map load passed the old 5 s wait and left cards and spells unheard
+        -- all game - real game 2026-10-24, Cursed Festival)
+        ReplicatedStorage:WaitForChild("endpoints"):WaitForChild("server_to_client"):WaitForChild(name).OnClientEvent:Connect(fn)
     end)
 end
 
