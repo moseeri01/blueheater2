@@ -7869,7 +7869,9 @@ end
 -- seen with its arguments: the ways below are tried in turn; a way whose result matched the
 -- pick twice is kept (cfg.voteWay).
 -- (a finger tap on the card is what the real game took - taps only)
-Lobby.VOTE_WAYS = { "gui" }
+-- (the game's own call, seen by Watch when the owner voted by hand: select_roguelike_option("3"),
+-- the card's number as text; taps on Confirm did not count - real game 2026-10-24)
+Lobby.VOTE_WAYS = { "remote" }
 
 -- The button for a text on screen (a card's title, a spell's name): the label's nearest
 -- button ancestor, else a button inside the label's card (3 levels up). Clicking it lets the
@@ -7972,15 +7974,14 @@ function Lobby.OnCardOptions(seconds, options)
     end
     local remote = getAARemote("select_roguelike_option")
     local i, why = Lobby.PickCard(options)
-    -- (a way learned by an older build from a chance match is ignored: taps only)
-    local way = Lobby.cfg.voteWay == "gui" and "gui" or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
-    local arg = (way == "index0" and i - 1) or (way == "title" and options[i].title) or (way == "option" and options[i]) or i
+    -- (taps only when the game has no vote call)
+    local way = remote and "remote" or "gui"
+    local arg = tostring(i)
     Lobby.pendingVote = { title = options[i].title, way = way }
     Lobby.cardInfo = string.format("want %s (%s)", tostring(options[i].title), way)
     AutoPlaceModule.Note(string.format("card: %s (%s, way %s)", tostring(options[i].title), why, way))
     task.spawn(pcall, function()
         if way == "gui" then
-            -- the card on screen, clicked (the game sends its own vote)
             -- the card on screen, then its Confirm button (a tapped card only shows Confirm; the
             -- vote counts once Confirm is tapped - real game 2026-10-24)
             local card
@@ -8007,8 +8008,8 @@ function Lobby.OnCardOptions(seconds, options)
                 Lobby.TapGui(ok)
                 Lobby.cardInfo = Lobby.cardInfo:gsub(" confirm %d$", "") .. " confirm " .. n
             end
-        elseif remote then
-            -- (sent without waiting: a call with the wrong arguments got no answer in the real game)
+        else
+            -- (sent without waiting: a call the game does not answer must not hold anything up)
             remote:InvokeServer(arg)
         end
     end)
@@ -8039,9 +8040,10 @@ end
 -- Refund / Ritual / Merge / Astral Gate. use_ingame_spell's arguments were never seen either:
 -- a way counts as working when the spell leaves the hand (cfg.spellWay).
 -- (owner: a spell is used by tapping its card, then the unit on the map - taps only)
--- (the game's own call, seen by Watch: use_ingame_spell(<bar slot number>, <target>); the target
--- shape is tried in turn until a spell leaves the hand)
-Lobby.SPELL_WAYS = { "model", "uuid" }
+-- (the game's own call, seen by Watch: use_ingame_spell(<bar slot number>, <unit model>). The
+-- owner's hand calls on konan went through; the script's on armin were refused every time, so a
+-- unit whose spell stays in hand is skipped from then on)
+Lobby.SPELL_WAYS = { "model" }
 -- names on the bar (IngameSpells data) and the ones that only take a slot from new units
 Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
     gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
@@ -8104,6 +8106,11 @@ function Lobby.OnSpells(list)
         local n = 0
         for _, s in ipairs(list) do if s == before.id then n = n + 1 end end
         if n >= (before.had or 1) then
+            if before.target then
+                Lobby.spellBad = Lobby.spellBad or {}
+                Lobby.spellBad[before.target] = true
+                AutoPlaceModule.Note("spell refused on " .. tostring(before.targetName) .. " - next unit")
+            end
             Lobby.spellWayTry = (Lobby.spellWayTry or 1) % #Lobby.SPELL_WAYS + 1
         else
             Lobby.cfg.spellWay = before.way
@@ -8186,7 +8193,7 @@ function Lobby.SpellStep(money)
                     local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or tonumber(def.attack_cooldown) or 1
                     local dps = dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1)
                     local score = spec.target == "upgraded" and ((AutoPlaceModule.StatNum(u, "upgrade") or 0) * 1e9 + dps) or dps
-                    if (tonumber(def.damage) or 0) > 0 and (not best or score > best) then target, best = u, score end
+                    if (tonumber(def.damage) or 0) > 0 and not (Lobby.spellBad or {})[u] and (not best or score > best) then target, best = u, score end
                 end
             end
             if spec.target and not target then return end
@@ -8196,19 +8203,13 @@ function Lobby.SpellStep(money)
             local had = 0
             for _, s in ipairs(Lobby.spells) do if s == id then had = had + 1 end end
             Lobby.spellAt = os.clock()
-            Lobby.spellTry = { id = id, way = way, had = had }
+            Lobby.spellTry = { id = id, way = way, had = had, target = target, targetName = target and unitType(target) }
             Lobby.spellTries = Lobby.spellTries or {}
             Lobby.spellTries[id] = (Lobby.spellTries[id] or 0) + 1
             -- sent without waiting: a call in a shape the game does not take got no answer, and
             -- waiting for it stopped Auto Place for the rest of the game (real game, 2026-10-24)
             -- (taps on the unit missed: the game sent the spell with no target - real game 2026-10-24)
-            local arg = target
-            if way == "uuid" and target then
-                local st = target:FindFirstChild("_stats")
-                local v = st and st:FindFirstChild("uuid")
-                arg = v and tostring(v.Value) or nil
-            end
-            if remote then task.spawn(pcall, function() remote:InvokeServer(slot.Name, arg) end) end
+            if remote then task.spawn(pcall, function() remote:InvokeServer(slot.Name, target) end) end
             AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
             return
         end
