@@ -5078,7 +5078,8 @@ function AutoPlaceModule.EventChoose(money)
             local first = AutoPlaceModule.copySeen[t.uuid] or now
             AutoPlaceModule.copySeen[t.uuid] = first
             -- (owner: cleared sooner, money or not - only a main unit may wait for its price)
-            if not why and not atCap and now - first > EV.stuck and (not always or (t.cost and money and money >= t.cost)) then why = "stuck on the bar" end
+            local mayWait = always or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8)
+            if not why and not atCap and now - first > EV.stuck and (not mayWait or (t.cost and money and money >= t.cost)) then why = "stuck on the bar" end
             if why then
                 AutoPlaceModule.DropCopy(t, why)
                 return 0.5
@@ -5093,7 +5094,10 @@ function AutoPlaceModule.EventChoose(money)
                 end
                 -- (an Always unit goes down as soon as it can be paid: nagumo was X'd as stuck while the
                 -- money waited for an upgrade - Snowy Town loss 2026-10-24)
-                if always or role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0)) then v = math.huge end
+                -- (owner 2026-10-25: below 8 damage units a damage copy is placed before upgrades -
+                -- usopp and illya were cleared "stuck" while the yen went into monet / frieren)
+                if always or role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0))
+                    or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8) then v = math.huge end
                 if v > bestV then best, bestV = { t = t, role = role }, v end
             end
         end
