@@ -4482,7 +4482,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     local summonerDown = AutoPlaceModule.SummonerDown(units)
     -- (Fool's Hunt: ONE carry gets the upgrades first - a main unit when one is down, else the one
     -- strongest at full upgrade; spread over many, the early damage was never enough - owner)
-    local carry, carryV
+    local carry, carryV, carry2, carry2V
     if State.eventMode then
         for _, o in ipairs(units) do
             local k = unitType(o) or ""
@@ -4496,13 +4496,21 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 -- (owner: the first carry is best one that hits flyers too - maxed before flyers come at wave 10)
                 -- (owner: bee_girl carries the early game only; from wave 8 judar gets everything to the top)
                 local w = AutoPlaceModule.WaveNumber()
-                if not carry or v > carryV then carry, carryV = o, v end
+                if not carry or v > carryV then carry, carryV, carry2, carry2V = o, v, carry, carryV
+                elseif not carry2 or v > carry2V then carry2, carry2V = o, v end
             end
         end
     end
     -- (owner: before wave 10, no damage upgrade unless the carry is a main or an early carry -
     -- medea, archer, gyutaro were upgraded for nothing while the enemies were still easy)
     local carryKind = carry and unitType(carry) or ""
+    -- (owner 2026-10-24: with no judar / cid down, one carry alone was too little - sakamoto at 2-7,
+    -- everything else at 0, lost at waves 11-15; the next best one is upgraded along with it)
+    if carryKind == "judar_evolved" or carryKind == "cid_evolved" then carry2 = nil end
+    -- (farm upgrades wait from wave 5 while the carry is below level 3: bulma reached 6 with
+    -- sakamoto at 2, lost at wave 11)
+    local carryLow = State.eventMode and carry and AutoPlaceModule.WaveNumber() >= 5 and not AutoPlaceModule.danger
+        and (AutoPlaceModule.StatNum(carry, "upgrade") or 0) < 3
     -- (not once the base is hit, and only to wave 5 on a short road: on Snowy Town every damage unit
     -- sat at level 0 while bulma reached 5, lost at wave 7)
     local earlyNoCarry = State.eventMode and not AutoPlaceModule.danger
@@ -4563,7 +4571,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                     if (AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) or airMain) and not AutoPlaceModule.UP_CAP[kind] then score = score * 10
                     else score = score * 0.3 end
                     -- (owner: one unit to the top at a time - every other damage upgrade waits)
-                    if carry and u ~= carry then score = 0 end
+                    if carry and u ~= carry and u ~= carry2 then score = 0 end
                 end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
@@ -4571,7 +4579,9 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                     -- skip: only units that hit flyers this time
                 elseif State.eventMode and rank == 2 and earlyNoCarry then
                     -- skip: early game with no main / early carry down - money goes to farms and the mains to come
-                elseif State.eventMode and carry and rank == 2 and u ~= carry
+                elseif State.eventMode and rank == 1 and carryLow then
+                    -- skip: the carry gets to level 3 before more farm upgrades
+                elseif State.eventMode and carry and rank == 2 and u ~= carry and u ~= carry2
                     and not (unitType(carry) ~= "judar_evolved" and unitType(carry) ~= "cid_evolved" and AutoPlaceModule.EARLY_CARRY[unitType(u) or ""]) then
                     -- skip: the carry goes to the top first
                 elseif not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
