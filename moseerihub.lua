@@ -4988,6 +4988,12 @@ function AutoPlaceModule.ShieldBreaker(name)
     return cd ~= nil and cd > 0 and cd <= 2 and (tonumber(def.damage) or 0) > 0
 end
 
+function AutoPlaceModule.CountKind(units, name)
+    local n = 0
+    for _, u in ipairs(units) do if unitType(u) == name then n = n + 1 end end
+    return n
+end
+
 function AutoPlaceModule.DamageCount(units)
     local n = 0
     for _, u in ipairs(units) do if unitRole(u) == "dps" then n = n + 1 end end
@@ -5026,6 +5032,8 @@ function AutoPlaceModule.EventChoose(money)
             -- (a main unit came this game: from now on the rest are not needed; with none, they hold the line)
             if always and not AutoPlaceModule.UP_CAP[t.name] then AutoPlaceModule.mainSeen = true end
             if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name] then why = "on the never / skip list"
+            -- (place-only units - nagumo, jiraiya, emilia: one of each; three nagumos took three places)
+            elseif AutoPlaceModule.UP_CAP[t.name] == 0 and AutoPlaceModule.CountKind(units, t.name) >= 1 then why = "one is enough"
             elseif role == "farm" then
                 -- (owner: 3 speedwagons + 1 bulma, upgraded to the top, any more X'd; a golden
                 -- (shiny) copy takes a normal one's place through a Refund)
