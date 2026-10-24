@@ -3450,7 +3450,18 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         local mode = AutoPlaceModule.Mode()
         -- (owner: Fool's Hunt maps are short - the first units stand back near the base so the early
         -- waves walk longer through them while the money goes into upgrades; later ones go forward)
-        if State.eventMode then mode = AutoPlaceModule.WaveNumber() < 10 and "Safe" or "Balanced" end
+        -- (owner: it depends on the map - a short road keeps them back until wave 20, a long one
+        -- plays the middle from the start; the road length is noted so the line can be tuned)
+        if State.eventMode then
+            local len = 0
+            for i = 2, #pts do len = len + math.sqrt((pts[i][1] - pts[i - 1][1]) ^ 2 + (pts[i][3] - pts[i - 1][3]) ^ 2) end
+            local short = len < AutoPlaceModule.SHORT_ROAD
+            if AutoPlaceModule.roadNoted ~= stageKey() then
+                AutoPlaceModule.roadNoted = stageKey()
+                AutoPlaceModule.Note(string.format("road %d studs: %s map", math.floor(len), short and "short" or "long"))
+            end
+            mode = (AutoPlaceModule.WaveNumber() < (short and 20 or 0)) and "Safe" or "Balanced"
+        end
         local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
         -- (Fool's Hunt: a copy goes next to one of its own kind, inside its reach, so Merge can fold
         -- them - spread over the map, three fujitoras never could)
@@ -4301,6 +4312,8 @@ end
 -- upgrades picked (real games 2026-10-24).
 AutoPlaceModule.GROWTH = 17
 -- farms the owner keeps (2026-10-24): 3 speedwagons + 1 bulma, all upgraded to the top
+-- road length (studs) under which a map counts as short (a first guess: tuned from the noted lengths)
+AutoPlaceModule.SHORT_ROAD = 350
 AutoPlaceModule.FARM_COUNT = { speedwagon = 3, bulma = 1 }
 function AutoPlaceModule.IsShiny(u)
     local st = u:FindFirstChild("_stats")
