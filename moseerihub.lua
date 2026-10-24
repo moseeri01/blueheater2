@@ -5077,7 +5077,9 @@ function AutoPlaceModule.EventChoose(money)
                     for i, n in ipairs(list) do if n == t.name then at = i end end
                     v = v * (3 + 2 * math.max(0, #list - at + 1) / #list)
                 end
-                if role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0)) then v = math.huge end
+                -- (an Always unit goes down as soon as it can be paid: nagumo was X'd as stuck while the
+                -- money waited for an upgrade - Snowy Town loss 2026-10-24)
+                if always or role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0)) then v = math.huge end
                 if v > bestV then best, bestV = { t = t, role = role }, v end
             end
         end
