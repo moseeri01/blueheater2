@@ -8543,6 +8543,7 @@ end
 -- How much a card hurts us (0 = nothing): enemy health and speed directly, resistance only
 -- for the damage types we deal (true damage ignores it), shields and death bombs a little.
 Lobby.AVOID = 10
+Lobby.RES_CAP = 75
 function Lobby.CardCost(opt, share)
     local cost = 0
     for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
@@ -8554,8 +8555,12 @@ function Lobby.CardCost(opt, share)
         elseif t == "enemy_stat_mul" then cost = cost + Lobby.AVOID + a
         elseif t == "enemy_speedup" then cost = cost + Lobby.AVOID + 1.2 * a
         elseif t == "enemy_resistance_specific" then
-            local mine = share[tostring(e.damage_type)] or 0
-            cost = cost + 1.5 * (a / 100) * mine + (mine >= 0.3 and Lobby.AVOID or 0)
+            -- (owner 2026-10-24: a team grows into its damage type later, so each type takes at
+            -- most RES_CAP in all - past it the card goes behind every other one)
+            local kind = tostring(e.damage_type)
+            local mine = share[kind] or 0
+            local over = ((Lobby.resTaken or {})[kind] or 0) + a > Lobby.RES_CAP
+            cost = cost + 1.5 * (a / 100) * mine + ((mine >= 0.3 or over) and Lobby.AVOID or 0)
         -- (regen once is fine, more of it stacks up: each one taken costs more)
         elseif t == "enemy_regen" then cost = cost + 100 * a * (1 + (Lobby.regenTaken or 0))
         elseif t == "enemy_shield" then cost = cost + 0.1 * a
@@ -8675,6 +8680,11 @@ function Lobby.OnCardResult(picked, state)
         for _, e in ipairs(Lobby.AsList(type(picked.effects) == "table" and picked.effects or {})) do
             if e.type == "enemy_regen" then Lobby.regenTaken = (Lobby.regenTaken or 0) + 1 end
             if e.type == "enemy_shield" then Lobby.shieldTaken = true end
+            if e.type == "enemy_resistance_specific" then
+                Lobby.resTaken = Lobby.resTaken or {}
+                local kind = tostring(e.damage_type)
+                Lobby.resTaken[kind] = (Lobby.resTaken[kind] or 0) + (tonumber(e.amount) or 0)
+            end
         end
     end
     local p = Lobby.pendingVote
