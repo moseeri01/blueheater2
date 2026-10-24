@@ -8121,6 +8121,21 @@ function Lobby.SpellSlotBar()
     return bar and bar:FindFirstChild("Units")
 end
 
+-- The number the game wants for a spell on the bar: its place there, 1-6 (the owner's buffs in
+-- places 1, 3, 4 went out as "1", "3", "4"). Spell frames are all named GameSpellFrame, so the
+-- name is no use (sent as the key, every call was ignored - real game 2026-10-24): the layout
+-- order when it is a place, else the place counted left to right.
+function Lobby.SpellKey(frame)
+    local order = tonumber(frame.LayoutOrder)
+    if order and order >= 1 and order <= 6 then return tostring(order) end
+    if tonumber(frame.Name) then return frame.Name end
+    local rank, x = 1, frame.AbsolutePosition.X
+    for _, o in ipairs(frame.Parent and frame.Parent:GetChildren() or {}) do
+        if o ~= frame and o:IsA("GuiObject") and o.Visible and o.AbsolutePosition.X < x - 1 then rank = rank + 1 end
+    end
+    return tostring(rank)
+end
+
 function Lobby.SpellWayOk(way)
     for _, w in ipairs(Lobby.SPELL_WAYS) do if w == way then return true end end
     return false
@@ -8278,9 +8293,10 @@ function Lobby.SpellStep(money)
             -- the script's got ignored - real game 2026-10-24)
             if remote then
                 task.spawn(pcall, function()
-                    local a, b = remote:InvokeServer(slot.Name, target)
-                    AutoPlaceModule.Note(string.format("spell answer %s: %s %s (slot %s, %s)", id, tostring(a), tostring(b),
-                        tostring(slot.Name), target and target:GetFullName() or "no target"))
+                    local key = Lobby.SpellKey(slot)
+                    local a, b = remote:InvokeServer(key, target)
+                    AutoPlaceModule.Note(string.format("spell answer %s: %s %s (key %s, order %s, %s)", id, tostring(a), tostring(b),
+                        key, tostring(slot.LayoutOrder), target and target:GetFullName() or "no target"))
                 end)
             end
             AutoPlaceModule.Note(string.format("spell: %s%s (way %s)", id, target and (" on " .. unitType(target)) or "", way))
