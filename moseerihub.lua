@@ -4487,13 +4487,13 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             local lv = AutoPlaceModule.StatNum(o, "upgrade") or 0
             local more = nextUpgrade(o, lv)
             if unitRole(o) == "dps" and not AutoPlaceModule.UP_CAP[k] and more and (upgradeFails[o] or 0) < now then
-                local v = (AutoPlaceModule.MaxDps(k) or 0) * (AutoPlaceModule.InList(AutoPlaceModule.RANK, k) and 100 or 1)
+                -- (the owner's list order first - cid before Siren - then strength)
+                local at = 0
+                for i, n in ipairs(AutoPlaceModule.RANK) do if n == k then at = #AutoPlaceModule.RANK - i + 1 end end
+                local v = at * 1e12 + (AutoPlaceModule.MaxDps(k) or 0)
                 -- (owner: the first carry is best one that hits flyers too - maxed before flyers come at wave 10)
-                if AutoPlaceModule.AirCapable(k, math.huge) then v = v * 3 end
                 -- (owner: bee_girl carries the early game only; from wave 8 judar gets everything to the top)
                 local w = AutoPlaceModule.WaveNumber()
-                -- (owner: judar takes every upgrade as soon as it is down)
-                if k == "judar_evolved" then v = v * 1e6 end
                 if not carry or v > carryV then carry, carryV = o, v end
             end
         end
@@ -4566,7 +4566,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 elseif State.eventMode and rank == 2 and earlyNoCarry then
                     -- skip: early game with no main / early carry down - money goes to farms and the mains to come
                 elseif State.eventMode and carry and rank == 2 and u ~= carry
-                    and not (unitType(carry) ~= "judar_evolved" and AutoPlaceModule.EARLY_CARRY[unitType(u) or ""]) then
+                    and not (unitType(carry) ~= "judar_evolved" and unitType(carry) ~= "cid_evolved" and AutoPlaceModule.EARLY_CARRY[unitType(u) or ""]) then
                     -- skip: the carry goes to the top first
                 elseif not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
                     or (rank == pickRank and isAir == pickAir and score > pickScore) then
@@ -8944,8 +8944,12 @@ function Lobby.SpellStep(money)
         if id == "random_buff" then
             local keep = Lobby.buffMain
             -- (a sold or dead unit moves to _DEAD_UNITS: only one still in _UNITS counts)
-            -- (owner: once judar is down every buff goes to judar)
-            if target and unitType(target) == "judar_evolved" and keep and unitType(keep) ~= "judar_evolved" then keep = nil end
+            -- (owner: the buffs move to a higher main when one comes - judar, then cid ...)
+            local function rankOf(x)
+                for i, n in ipairs(AutoPlaceModule.RANK) do if n == unitType(x) then return i end end
+                return 99
+            end
+            if target and keep and rankOf(target) < rankOf(keep) then keep = nil end
             if keep and keep.Parent and keep.Parent.Name == "_UNITS" and not (Lobby.spellBad or {})[keep] then target = keep else Lobby.buffMain = target end
         end
         local slot = spec and Lobby.SpellSlot(id)
