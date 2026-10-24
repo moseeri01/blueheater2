@@ -35,7 +35,7 @@ local Config = {
     ListLines = 14,
     ScanMaxLines = 300,
     ScreenFill = 0.9,
-    Keybind = Enum.KeyCode.LeftControl,
+    Keybind = Enum.KeyCode.LeftControl
 }
 local MacroFolder = Config.Folder .. "/macros"
 local ConfigFile = Config.Folder .. "/config.json"
@@ -8658,7 +8658,8 @@ Lobby.SPELL_WAYS = { "model" }
 -- names on the bar (IngameSpells data) and the ones that only take a slot from new units
 Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
     gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
-Lobby.DROP_SPELLS = {}
+-- (owner 2026-10-24: Ritual is not used - its 10000 goes into upgrades)
+Lobby.DROP_SPELLS = { ritual = true }
 
 -- The bar slot showing a spell (by its name on the card).
 function Lobby.SpellSlotBar()
@@ -8733,8 +8734,7 @@ Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { 
     -- (owner: Astral Summon only with money to spare - 5000 kept for the main units' upgrades)
     summon = { cost = 10000, reserve = 5000 }, gate = { cost = 2500 },
     sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" },
-    -- (owner: Ritual around wave 20, with money left once the mains are maxed)
-    ritual = { cost = 10000, reserve = 3000, target = "strongest", notMain = true, fromWave = 18 } }
+}
 function Lobby.OnSpells(list)
     list = Lobby.AsList(list)
     if type(list) ~= "table" then return end
