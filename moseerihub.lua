@@ -4238,6 +4238,9 @@ local function upgradeStep(money, onlyRole, airOnly)
             local lvl = stats and stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
             local can, cost = nextUpgrade(u, level)
+            -- a farm upgrade must pay back in time (friend's Infinity Mansion loss: ~60k in farms
+            -- by wave 9, Bulma at 6, the damage units barely upgraded)
+            if can and role == "farm" and not AutoPlaceModule.FarmPays(u, level, cost) then can = false end
             if can then
                 local rank = RANK[role] or 2
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
@@ -4466,6 +4469,31 @@ function AutoPlaceModule.Danger()
 end
 
 -- Last wave of the stage (workspace._is_last_wave); never true in infinite modes.
+-- The wave now (workspace._wave_num in the real game, _DATA.Wave otherwise).
+function AutoPlaceModule.WaveNumber()
+    local alt = workspace:FindFirstChild("_wave_num")
+    local w = alt and tonumber(alt.Value) or 0
+    local data = workspace:FindFirstChild("_DATA")
+    local v = data and (data:FindFirstChild("Wave") or data:FindFirstChild("CurrentWave"))
+    if v and tonumber(v.Value) then w = math.max(w, tonumber(v.Value)) end
+    return w
+end
+
+-- Does this farm upgrade pay back in half the waves left? (a stage counts as FARM_HORIZON
+-- waves; endless events do not stop). Unknown numbers: yes, as before.
+AutoPlaceModule.FARM_HORIZON = 15
+function AutoPlaceModule.FarmPays(u, level, cost)
+    if State.eventMode or not cost then return true end
+    local def = AutoPlaceModule.UnitDef(unitType(u))
+    local up = def and (def.upgrade or def.upgrades)
+    if type(up) ~= "table" or type(up[level + 1]) ~= "table" then return true end
+    local now = level == 0 and tonumber(def.farm_amount) or (type(up[level]) == "table" and tonumber(up[level].farm_amount))
+    local nextAmount = tonumber(up[level + 1].farm_amount)
+    if not now or not nextAmount or nextAmount <= now then return true end
+    local left = AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber()
+    return cost / (nextAmount - now) <= left / 2
+end
+
 function AutoPlaceModule.LastWave()
     local v = workspace:FindFirstChild("_is_last_wave")
     return v ~= nil and v.Value == true
@@ -4640,6 +4668,7 @@ local function tick()
         or readCostValue("LP._stats.resource") or hudMoney
     AutoPlaceModule.tickStep = "spells"
     pcall(Lobby.SpellStep, money)
+    pcall(Lobby.RerollStep)
     AutoPlaceModule.tickStep = "choose"
     if AutoPlace.sellFarmsLast and AutoPlaceModule.LastWave() and AutoPlaceModule.SellFarm() then return 0.3 end
     local danger = AutoPlaceModule.Danger()
@@ -7778,7 +7807,8 @@ end
 -- a "Good" card helps us and adds nothing. The vote call (select_roguelike_option) was never
 -- seen with its arguments: the ways below are tried in turn; a way whose result matched the
 -- pick twice is kept (cfg.voteWay).
-Lobby.VOTE_WAYS = { "gui", "index", "index0", "title", "option" }
+-- (a finger tap on the card is what the real game took - taps only)
+Lobby.VOTE_WAYS = { "gui" }
 
 -- The button for a text on screen (a card's title, a spell's name): the label's nearest
 -- button ancestor, else a button inside the label's card (3 levels up). Clicking it lets the
@@ -7881,7 +7911,8 @@ function Lobby.OnCardOptions(seconds, options)
     end
     local remote = getAARemote("select_roguelike_option")
     local i, why = Lobby.PickCard(options)
-    local way = Lobby.cfg.voteWay ~= "" and Lobby.cfg.voteWay or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
+    -- (a way learned by an older build from a chance match is ignored: taps only)
+    local way = Lobby.cfg.voteWay == "gui" and "gui" or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
     local arg = (way == "index0" and i - 1) or (way == "title" and options[i].title) or (way == "option" and options[i]) or i
     Lobby.pendingVote = { title = options[i].title, way = way }
     Lobby.cardInfo = string.format("want %s (%s)", tostring(options[i].title), way)
@@ -7925,7 +7956,8 @@ end
 -- strongest damage unit, Clone on the most upgraded one, Astral Summon when rich; never
 -- Refund / Ritual / Merge / Astral Gate. use_ingame_spell's arguments were never seen either:
 -- a way counts as working when the spell leaves the hand (cfg.spellWay).
-Lobby.SPELL_WAYS = { "gui", "id_unit", "index_unit", "id", "index" }
+-- (owner: a spell is used by tapping its card, then the unit on the map - taps only)
+Lobby.SPELL_WAYS = { "gui" }
 -- names on the bar (IngameSpells data) and the ones that only take a slot from new units
 Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
     gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
@@ -7938,10 +7970,11 @@ function Lobby.SpellSlot(id)
     bar = bar and bar:FindFirstChild("Lives")
     bar = bar and bar:FindFirstChild("Frame")
     bar = bar and bar:FindFirstChild("Units")
-    local want = string.lower(Lobby.SPELL_NAMES[id] or id)
+    local want = string.lower(Lobby.SPELL_NAMES[id] or id):gsub("%s+", "")
     for _, slot in ipairs(bar and bar:GetChildren() or {}) do
         for _, d in ipairs(slot:GetDescendants()) do
-            if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "") == want then
+            -- (the card writes it over two lines, "Random" / "Buff": compared without spaces)
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.lower(tostring(d.Text)):gsub("<[^>]->", " "):gsub("%s+", "") == want then
                 return slot
             end
         end
@@ -7996,10 +8029,33 @@ function Lobby.OnSpells(list)
     Lobby.spellTry = nil
 end
 
+-- At the unit cap a new random unit cannot be placed: its slot is cleared with its X so the
+-- bar rolls again (owner: spells like Random Buff come that way).
+function Lobby.RerollStep()
+    if not State.eventMode or not Lobby.cfg.eventSpells or os.clock() - (Lobby.rerollAt or -1e9) < 3 then return end
+    if #ownedUnits() < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) then return end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local bar = gui and gui:FindFirstChild("spawn_units")
+    bar = bar and bar:FindFirstChild("Lives")
+    bar = bar and bar:FindFirstChild("Frame")
+    bar = bar and bar:FindFirstChild("Units")
+    for _, slot in ipairs(bar and bar:GetChildren() or {}) do
+        local view = slot:FindFirstChild("Main") and slot.Main:FindFirstChild("View")
+        local world = view and view:FindFirstChildOfClass("WorldModel")
+        local x = slot:FindFirstChild("Delete", true)
+        if world and world:FindFirstChildOfClass("Model") and x then
+            Lobby.rerollAt = os.clock()
+            Lobby.TapGui(x)
+            AutoPlaceModule.Note("bar full of units at the cap: cleared one for a new roll")
+            return
+        end
+    end
+end
+
 function Lobby.SpellStep(money)
     if not Lobby.cfg.eventSpells or not money then return end
     local remote = getAARemote("use_ingame_spell")
-    if os.clock() - (Lobby.spellAt or -1e9) < 12 then return end
+    if os.clock() - (Lobby.spellAt or -1e9) < 4 then return end
     for idx, id in ipairs(Lobby.spells or {}) do
         local spec = Lobby.SPELLS[id]
         -- spells that only take a slot from the next random unit: dropped with their X
@@ -8008,23 +8064,26 @@ function Lobby.SpellStep(money)
             local x = slot and slot:FindFirstChild("Delete", true)
             if x then
                 Lobby.spellAt = os.clock()
-                clickButton(x)
+                Lobby.TapGui(x)
                 AutoPlaceModule.Note("spell dropped: " .. id)
                 return
             end
         end
         if spec and money >= spec.cost + (spec.reserve or 0) then
             local target, best
+            local ranked = {}
             for _, u in ipairs(ownedUnits()) do
                 if AutoPlaceModule.RoleOf and unitType(u) then
                     local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
                     local score = spec.target == "upgraded" and (AutoPlaceModule.StatNum(u, "upgrade") or 0)
                         or ((tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1))
+                    if (tonumber(def.damage) or 0) > 0 then table.insert(ranked, { u = u, score = score }) end
                     if (tonumber(def.damage) or 0) > 0 and (not best or score > best) then target, best = u, score end
                 end
             end
+            table.sort(ranked, function(a, b) return a.score > b.score end)
             if spec.target and not target then return end
-            local way = Lobby.cfg.spellWay ~= "" and Lobby.cfg.spellWay or Lobby.SPELL_WAYS[Lobby.spellWayTry or 1]
+            local way = "gui"
             local key = way:find("^index") and idx or id
             Lobby.spellAt = os.clock()
             Lobby.spellTry = { id = id, way = way }
@@ -8037,7 +8096,10 @@ function Lobby.SpellStep(money)
                     if slot then
                         Lobby.TapGui(slot)
                         task.wait(0.5)
-                        if target then Lobby.TapUnit(target) end
+                        -- (the best unit the camera shows: a unit off screen cannot be tapped)
+                        for _, r in ipairs(ranked) do
+                            if Lobby.TapUnit(r.u) then break end
+                        end
                     end
                 elseif remote then
                     if way:find("_unit$") and target then remote:InvokeServer(key, target) else remote:InvokeServer(key) end
