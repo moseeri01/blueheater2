@@ -7238,7 +7238,10 @@ task.spawn(function()
             pcall(Lobby.TowerResult, win)
             task.spawn(function(w)
                 local ok, err = pcall(Lobby.ShareGame, win, w)
-                if not ok then AutoPlaceModule.Note("game data NOT shared - " .. clip(tostring(err), 80)) end
+                if not ok then
+                    AutoPlaceModule.Note("game data NOT shared - " .. clip(tostring(err), 80))
+                    pcall(Lobby.ShareLog, "error: " .. tostring(err))
+                end
             end, math.max(gameWave, waveNow()))
             -- (while Watch is on: one line per game in AAMacro/games.txt, to measure a strategy)
             if State.watching then
@@ -8429,13 +8432,21 @@ function Lobby.ShareNotice()
     pcall(saveConfig)
     notify("moseeri hub sends Fool's Hunt results (map, wave, units, cards - no account info) to help Auto Place. Turn off: Event tab > Share game data.")
 end
+-- (each try is noted in AAMacro/share_log.txt, so a send that never arrived can be traced)
+function Lobby.ShareLog(text)
+    if not hasFileApi() then return end
+    local path = "AAMacro/share_log.txt"
+    local old = isfile(path) and readfile(path) or ""
+    writefile(path, old:sub(-4000) .. os.date("%H:%M:%S ") .. text .. "\n")
+end
 function Lobby.ShareGame(win, wave)
+    Lobby.ShareLog(string.format("game end: share %s, event %s, wave %s", tostring(Lobby.cfg.shareData), tostring(State.eventMode), tostring(wave)))
     if not (Lobby.cfg.shareData and State.eventMode) then return end
     if not Lobby.shareUrl then
         local ok, url = pcall(function() return game:HttpGet(Lobby.SHARE_URL_FILE) end)
         Lobby.shareUrl = ok and type(url) == "string" and url:match("https://[%w%./_%-]+") or ""
     end
-    if Lobby.shareUrl == "" then return end
+    if Lobby.shareUrl == "" then Lobby.ShareLog("no share_url.txt address") return end
     local units = {}
     for _, u in ipairs(ownedUnits()) do
         local st = u:FindFirstChild("_stats")
@@ -8457,6 +8468,7 @@ function Lobby.ShareGame(win, wave)
     end
     local sent, why = httpPost(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
     AutoPlaceModule.Note("game data " .. (sent and "shared" or ("NOT shared - " .. tostring(why))))
+    Lobby.ShareLog("sent " .. tostring(sent) .. " " .. tostring(why) .. " (" .. #body .. " chars)")
 end
 
 function Lobby.RecordWaves()
