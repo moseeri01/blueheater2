@@ -4417,6 +4417,7 @@ end
 -- thin. Control units (time stop) upgrade one copy to max before the next (ControlUp.focus).
 -- onlyRole limits it to one role, airOnly to units that hit flyers. Returns seconds to wait,
 -- or nil when nothing is left.
+AutoPlaceModule.upNeed = setmetatable({}, { __mode = "k" })
 local function upgradeStep(money, onlyRole, airOnly, noWait)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
@@ -4443,6 +4444,9 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             local lvl = stats and stats:FindFirstChild("upgrade")
             local level = lvl and tonumber(lvl.Value) or 0
             local can, cost = nextUpgrade(u, level)
+            -- (no price in the data: the least it can be, learned from the game refusing it)
+            local need = AutoPlaceModule.upNeed[u]
+            if not cost and need and need.level == level then cost = need.money end
             -- a farm upgrade must pay back in time (friend's Infinity Mansion loss: ~60k in farms
             -- by wave 9, Bulma at 6, the damage units barely upgraded)
             if can and role == "farm" and not AutoPlaceModule.FarmPays(u, level, cost) then can = false end
@@ -4503,6 +4507,11 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
         AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
             pickAir and ", hits flying enemies" or fuse[pick] and ", for the fusion" or BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
+    elseif not pickCost and State.eventMode and money then
+        -- (no price in the data and refused: it costs more than the money we had - saved for
+        -- instead of skipped; judar's 18000 upgrade never came, cheaper ones took the money)
+        AutoPlaceModule.upNeed[pick] = { level = pickLevel, money = math.floor(money) + 1 }
+        AutoPlaceModule.Note(string.format("%s upgrade costs over %d - saving for it", unitType(pick), math.floor(money)))
     elseif not (pickCost and money and money < pickCost) then
         -- refused with the money in hand: leave this unit for 30 s instead of retrying forever
         upgradeFails[pick] = now + 30
@@ -4941,7 +4950,11 @@ function AutoPlaceModule.EventChoose(money)
         return 0.2
     end
     if AutoPlace.upgrade then
-        local wait = upgradeStep((money or 0) - EV.reserve, nil, nil, true)
+        -- (waits for the best one - main units weigh x10 - instead of buying whatever is cheap:
+        -- the mains never reached their big upgrades)
+        local m = (money or 0) - EV.reserve
+        -- (farms and the aura unit only when they can be paid now; a farm's 30000 must not hold the team)
+        local wait = upgradeStep(m, "farm", nil, true) or upgradeStep(m, "support", nil, true) or upgradeStep(m, "dps")
         if wait then return wait end
         if upV > 0 then
             AutoPlaceModule.status = "Saving for the best upgrade"
