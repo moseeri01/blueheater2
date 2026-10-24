@@ -141,7 +141,13 @@ local Lobby = {
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
         openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false,
-        watchNoPause = false, eventCards = false, cardMode = "Most coins", voteWay = "", eventSpells = false, spellWay = "" }, -- (config only: Watch logs without pausing the lobby automation)
+        watchNoPause = false, eventCards = false, cardMode = "Most coins", voteWay = "", eventSpells = false, spellWay = "",
+        -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
+        -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
+        -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
+        eventBrain = true, maxSpellsHeld = 2,
+        eventAlways = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "vanilla_ice_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "tengen_2_evolved", "archer_evolved", "konan_unit_evolved" },
+        eventNever = { "armin", "stain_evolved", "narberal_evolved", "jiraiya_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "emilia", "natsu_evolved", "caesarclown_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
 }
 
@@ -3815,7 +3821,11 @@ end
 -- Attack shape of a unit from ReplicatedStorage.src.Data.Attacks: true when its main attack
 -- hits an area (aoe / aoe_dot / cone / line / full), false for single target, nil unknown.
 local attacksModule
+-- Area units the owner saw in game whose attack is not in the data (newer units): judar hits a
+-- group for 78k at level 2 (2026-10-24)
+AutoPlaceModule.AOE_SEEN = { judar_evolved = true }
 function AutoPlaceModule.IsAoe(name)
+    if AutoPlaceModule.AOE_SEEN[name] then return true end
     local def = AutoPlaceModule.UnitDef(name)
     local id = def and (def.primary_attack_no_upgrades or def.primary_attack)
     if type(id) ~= "string" then return nil end
@@ -4754,6 +4764,13 @@ end
 -- damage per yen x placeBonus) with the best upgrade (damage gained per yen) and do the better
 -- one, saving for it when it cannot be paid yet. Farms, buff units and flyer hitters while short
 -- go first. Returns seconds to wait, or nil and the copy to place.
+-- strongest first (simulator: damage per map place at full upgrade; judar first - owner)
+AutoPlaceModule.RANK = { "judar_evolved", "cid_evolved", "pucci_heaven", "usopp_ts_evolved", "naruto_6tails", "meliodas_evolved", "julius_evolved", "sakamoto_evolved", "gremmy_evolved", "vanilla_ice_evolved", "metal_knight_evolved", "monet_evolved", "bee_girl_evolved", "medea_evolved", "goku_ssj3_evolved", "law_2_evolved", "tatsumaki_evolved", "saber_evolved", "frieren_evolved", "koichi_evolved", "illya_evolved", "tengen_2_evolved", "archer_evolved", "konan_unit_evolved" }
+AutoPlaceModule.ROSTER = { "akainu_evolved", "aokiji_evolved", "archer_evolved", "armin", "avdol_evolved", "bee_girl_evolved", "caesarclown_evolved", "cid_evolved", "daki_evolved", "demiurge_evolved", "emilia", "escanor_evolved", "esdeath_evolved", "frieren_evolved", "fujitora_evolved", "ghostkun_evolved", "gildarts_evolved", "gilgamesh_evolved", "goku_ssj3_evolved", "gremmy_evolved", "guts_berserker", "gyutaro_evolved", "hakari_evolved", "hidan_unit_evolved", "illya_evolved", "jiraiya_evolved", "josuke_2_evolved", "judar_evolved", "julius_evolved", "koichi_evolved", "konan_unit_evolved", "law_2_evolved", "medea_evolved", "meliodas_evolved", "metal_knight_evolved", "monet_evolved", "narberal_evolved", "naruto_6tails", "natsu_evolved", "pucci_heaven", "saber_evolved", "sabo_evolved", "sakamoto_evolved", "shalltear_evolved", "shigaraki_evolved", "stain_evolved", "sukuna", "tatsumaki_evolved", "tengen_2_evolved", "usopp_ts_evolved", "vanilla_ice_evolved" }
+function AutoPlaceModule.InList(list, name)
+    for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
+    return false
+end
 AutoPlaceModule.EV = { placeBonus = 2, reserve = 0, airMin = 3, airBy = 8, buffUnits = 2, stuck = 25 }
 function AutoPlaceModule.EventChoose(money)
     local EV, now = AutoPlaceModule.EV, os.clock()
@@ -4774,14 +4791,16 @@ function AutoPlaceModule.EventChoose(money)
         if t.temp and not AutoPlaceModule.full[t.uuid] and not AutoPlaceModule.badTemp[t.uuid] then
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             local why
-            if AutoPlaceModule.EventCapped(t) then why = "its unit is at the limit"
+            local always = AutoPlaceModule.InList(Lobby.cfg.eventAlways, t.name)
+            if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) then why = "on the never list"
+            elseif AutoPlaceModule.EventCapped(t) then why = "its unit is at the limit"
             elseif role == "farm" then
                 local same = 0
                 for _, u in ipairs(units) do if unitType(u) == t.name then same = same + 1 end end
                 if wave >= AutoPlaceModule.FARMS_UNTIL or (t.name == "speedwagon" and same >= 2) then why = "farm not needed now" end
             elseif role == "buff" or role == "support" then
                 if buffs >= EV.buffUnits then why = "enough buff units" end
-            elseif AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
+            elseif not always and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
             AutoPlaceModule.copySeen[t.uuid] = first
@@ -4791,7 +4810,13 @@ function AutoPlaceModule.EventChoose(money)
                 return 0.5
             end
             if not atCap and (AutoPlaceModule.noSpot[t.uuid] or 0) <= now then
+                -- (an Always unit counts 3x, and more the stronger it ranks - AutoPlaceModule.RANK)
                 local v = AutoPlaceModule.Value(t, t.cost or 1000) * EV.placeBonus
+                if always then
+                    local list, at = AutoPlaceModule.RANK, #AutoPlaceModule.RANK + 1
+                    for i, n in ipairs(list) do if n == t.name then at = i end end
+                    v = v * (3 + 2 * math.max(0, #list - at + 1) / #list)
+                end
                 if role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0)) then v = math.huge end
                 if v > bestV then best, bestV = { t = t, role = role }, v end
             end
@@ -4903,7 +4928,7 @@ local function tick()
     -- Place units myself (Home): the player places, the script only upgrades / sells
     if AutoPlace.manual then t = nil end
     -- Fool's Hunt: its own brain decides (EventChoose); the normal-stage rules below are skipped
-    local ev = State.eventMode and not AutoPlace.manual
+    local ev = State.eventMode and not AutoPlace.manual and Lobby.cfg.eventBrain ~= false
     if ev then
         local wait, et, er = AutoPlaceModule.EventChoose(money)
         if wait then return wait end
@@ -8596,7 +8621,26 @@ function Lobby.SpellStep(money)
             return
         end
     end
+    -- (owner: spells waiting for money or a target must not fill the bar - a bar full of them
+    -- gets no new units; above the limit the least useful one is cleared)
+    local held = Lobby.spells or {}
+    if #held > (tonumber(Lobby.cfg.maxSpellsHeld) or 2) then
+        local worst, worstP
+        for _, id in ipairs(held) do
+            local p = Lobby.SPELL_KEEP[id] or 0
+            if not worst or p < worstP then worst, worstP = id, p end
+        end
+        local slot = worst and Lobby.SpellSlot(worst)
+        local x = slot and slot:FindFirstChild("Delete", true)
+        if x then
+            Lobby.spellAt = os.clock()
+            Lobby.TapGui(x)
+            AutoPlaceModule.Note("spell dropped: " .. worst .. " (more than " .. tostring(Lobby.cfg.maxSpellsHeld or 2) .. " waiting)")
+        end
+    end
 end
+-- which spell to keep when too many wait (higher = kept)
+Lobby.SPELL_KEEP = { ritual = 7, clone = 6, random_buff = 5, summon = 4, sacrifice = 3, sell_refund = 2, gate = 1 }
 
 -- (each connected on its own: one missing event must not leave the others unheard)
 for name, fn in pairs({ show_roguelike_options = function(sec, o)
@@ -8963,6 +9007,14 @@ event:Toggle({ Name = "Vote cards", Default = Lobby.cfg.eventCards, Callback = s
 event:Dropdown({ Name = "Card choice", Multi = false, Required = true, Options = { "Most coins", "Safest" },
     Default = Lobby.cfg.cardMode, Callback = set("cardMode") }, "EventCardMode")
 event:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = set("eventSpells") }, "EventSpells")
+event:Toggle({ Name = "Event Auto Place", Default = Lobby.cfg.eventBrain ~= false, Callback = set("eventBrain") }, "EventBrain")
+event:Dropdown({ Name = "Always place", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
+    Default = picked(Lobby.cfg.eventAlways or {}), Callback = setList("eventAlways") }, "EventAlways")
+event:Dropdown({ Name = "Never place (X)", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
+    Default = picked(Lobby.cfg.eventNever or {}), Callback = setList("eventNever") }, "EventNever")
+event:Dropdown({ Name = "Spells kept waiting", Multi = false, Required = true, Options = { "1", "2", "3" },
+    Default = tostring(Lobby.cfg.maxSpellsHeld or 2), Callback = function(v) if syncing then return end Lobby.cfg.maxSpellsHeld = tonumber(v) or 2 saveConfig() end }, "EventSpellsHeld")
+event:Paragraph({ Header = "Event Auto Place", Body = "Its own brain for Fool's Hunt (normal stages keep the usual Auto Place). Always place: placed first, never X'd as weak. Never place: X'd at once so the slot rolls again. The rest: placed when not far below the team. Every X and placement says why in the Home log." })
 event:Paragraph({ Header = "Cards", Body = "Most coins: the Bad card that hurts the team least (+0.3 coins each), a Good card when the base is hurt. Safest: Good cards first." })
 end
 
