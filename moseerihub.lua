@@ -4214,10 +4214,12 @@ function AutoPlaceModule.MaxDps(name)
     return dmg / math.max(0.5, cd) * (AutoPlaceModule.IsAoe(name) and AOE_VALUE or 1)
 end
 
--- Fool's Hunt: a damage copy far weaker than the damage units already down (under 40% of
--- their middle one, fully upgraded) would only take one of the 20 places: owner, 2026-10-24
--- "the weak ones should be X'd". Judged once 6 damage units are down.
-AutoPlaceModule.WEAK_SHARE = 0.4
+-- Fool's Hunt: a damage copy weaker than the damage units already down (under 70% of their
+-- middle one, fully upgraded) would only take one of the 20 places - a real game hit the limit
+-- with 20 units, many weak or never upgraded. Owner, 2026-10-24: place only the strong ones,
+-- X the rest so the slot rolls again. Judged once 4 damage units are down.
+-- (40% while under 10 units: places are plenty early and the team must grow)
+AutoPlaceModule.WEAK_SHARE, AutoPlaceModule.WEAK_SHARE_EARLY = 0.7, 0.4
 function AutoPlaceModule.EventWeak(t, role)
     if not State.eventMode or not t or not t.temp or role ~= "dps" then return false end
     -- (a unit that hits flyers is never cleared: goku_ssj3 was, then a flyer walked in and took
@@ -4232,9 +4234,10 @@ function AutoPlaceModule.EventWeak(t, role)
             if v and v > 0 then table.insert(all, v) end
         end
     end
-    if #all < 6 then return false end
+    if #all < 4 then return false end
     table.sort(all)
-    return mine < all[math.floor(#all / 2) + 1] * AutoPlaceModule.WEAK_SHARE
+    local share = #ownedUnits() >= 10 and AutoPlaceModule.WEAK_SHARE or AutoPlaceModule.WEAK_SHARE_EARLY
+    return mine < all[math.floor(#all / 2) + 1] * share
 end
 
 -- Fool's Hunt: a copy of a unit already at its own limit (bulma 1, speedwagon 3) cannot be
@@ -4846,6 +4849,17 @@ local function tick()
         AutoPlaceModule.DropCopy(t, "its unit is at the limit")
         return 0.5
     end
+    -- (a copy left on the bar 25 s with the money for it is stuck: owner's screenshot, three
+    -- copies sat there; cleared so the slot rolls again)
+    if State.eventMode and t.temp then
+        AutoPlaceModule.copySeen = AutoPlaceModule.copySeen or {}
+        local first = AutoPlaceModule.copySeen[t.uuid] or os.clock()
+        AutoPlaceModule.copySeen[t.uuid] = first
+        if os.clock() - first > 25 and cost and money and money >= cost then
+            AutoPlaceModule.DropCopy(t, "stuck on the bar")
+            return 0.5
+        end
+    end
     -- Fool's Hunt: copies come one at a time, so money past this copy's price would sit unused
     -- (16k idle with 13 units in a real game): it goes into upgrades, the copy's price kept
     -- (in danger too, damage units only: 35k sat unused while enemies were getting through)
@@ -4948,7 +4962,9 @@ local function tick()
         -- (event: refused three times in a row with this many units down = the map is full)
         if t.temp then
             AutoPlaceModule.capFails = (AutoPlaceModule.capFails or 0) + 1
-            if AutoPlaceModule.capFails >= 3 and #ownedUnits() > 0 then AutoPlaceModule.capSeen = #ownedUnits() end
+            -- (only from 10 units on: one copy refused three times with 1 unit down read as
+            -- "map full" and nothing more was placed all game)
+            if AutoPlaceModule.capFails >= 3 and #ownedUnits() >= 10 then AutoPlaceModule.capSeen = #ownedUnits() end
         end
         -- (below the map's unit limit only: at the limit every copy is refused)
         if t.temp and t.refused >= 3 and AutoPlaceModule.liveTemp[t.uuid] and State.eventMode
