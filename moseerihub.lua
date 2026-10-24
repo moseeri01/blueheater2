@@ -5607,7 +5607,9 @@ end
 -- per unit every 3 s; a unit where every way failed twice is left alone.
 AutoPlaceModule.prioTries = setmetatable({}, { __mode = "k" })
 function AutoPlaceModule.TargetStep()
-    local boss = AutoPlaceModule.Threat() == "boss on the map"
+    -- (event: every unit on "first" - a boss comes most waves there, and chasing it let the
+    -- front enemies through; owner 2026-10-24)
+    local boss = not State.eventMode and AutoPlaceModule.Threat() == "boss on the map"
     local now = os.clock()
     for _, u in ipairs(ownedUnits()) do
         local st = u:FindFirstChild("_stats")
@@ -8554,6 +8556,8 @@ function Lobby.CardCost(opt, share)
     local cost = 0
     for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
         local t, a = tostring(e.type), tonumber(e.amount) or 0
+        -- (owner 2026-10-24: each kind of Bad card once a game - a second one goes behind the rest)
+        if t ~= "candy_multiplier" and (Lobby.badTaken or {})[t .. tostring(e.damage_type or "")] then cost = cost + Lobby.AVOID end
         if t == "candy_multiplier" then
             -- (the reward, not a cost)
         -- (owner 2026-10-24: never Enemy Health, Enemy Speed or armor against the damage we deal
@@ -8711,6 +8715,10 @@ function Lobby.OnCardResult(picked, state)
         for _, e in ipairs(Lobby.AsList(type(picked.effects) == "table" and picked.effects or {})) do
             if e.type == "enemy_regen" then Lobby.regenTaken = (Lobby.regenTaken or 0) + 1 end
             if e.type == "enemy_shield" then Lobby.shieldTaken = true end
+            if picked.option_type == "Bad" and e.type ~= "candy_multiplier" then
+                Lobby.badTaken = Lobby.badTaken or {}
+                Lobby.badTaken[tostring(e.type) .. tostring(e.damage_type or "")] = true
+            end
             if e.type == "enemy_resistance_specific" then
                 Lobby.resTaken = Lobby.resTaken or {}
                 local kind = tostring(e.damage_type)
