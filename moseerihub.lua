@@ -4844,7 +4844,9 @@ local function tick()
     local flyShare = AutoPlaceModule.seenFly / math.max(1, AutoPlaceModule.seenN)
     if AutoPlaceModule.airNeed and (flyShare >= 0.5 or danger) and AutoPlace.upgrade and t and role == "dps"
         and not AutoPlaceModule.AirCapable(t.name, 0) then
-        local wait = upgradeStep(money, "dps", true)
+        -- (only an upgrade it can pay now: waiting 3500 for a flyer upgrade left a 1500 copy unplaced
+        -- with 3k in hand and 4 units down - real game 2026-10-24)
+        local wait = upgradeStep(money, "dps", true, State.eventMode)
         if wait then return wait end
     end
     if danger and not t then
