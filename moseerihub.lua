@@ -8392,8 +8392,11 @@ function Lobby.SpellSaving(money)
         -- (not for a spell tried 5 times that stays in hand: the taps are not landing)
         local tried = (Lobby.spellTries or {})[id] or 0
         if id == "random_buff" and money < 1000 and tried < 5 then return "Saving for Random Buff" end
-        if id == "clone" and maxed and money < 5000 and tried < 5 then return "Saving for Clone" end
-        if id == "ritual" and money < 10000 and tried < 5 then return "Saving for Ritual" end
+        -- (big spells only once the team is grown: saving for Clone from wave 5 held a team of 5
+        -- units for a minute - real game 2026-10-24)
+        local grown = #ownedUnits() >= 15
+        if id == "clone" and grown and maxed and money < 5000 and tried < 5 then return "Saving for Clone" end
+        if id == "ritual" and grown and money < 10000 and tried < 5 then return "Saving for Ritual" end
     end
     return nil
 end
