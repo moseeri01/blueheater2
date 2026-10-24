@@ -7236,7 +7236,10 @@ task.spawn(function()
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
             pcall(Lobby.TowerResult, win)
-            task.spawn(pcall, Lobby.ShareGame, win, math.max(gameWave, waveNow()))
+            task.spawn(function(w)
+                local ok, err = pcall(Lobby.ShareGame, win, w)
+                if not ok then AutoPlaceModule.Note("game data NOT shared - " .. clip(tostring(err), 80)) end
+            end, math.max(gameWave, waveNow()))
             -- (while Watch is on: one line per game in AAMacro/games.txt, to measure a strategy)
             if State.watching then
                 pcall(function()
@@ -8439,7 +8442,7 @@ function Lobby.ShareGame(win, wave)
         local trait = ""
         for _, c in ipairs(st and st:GetChildren() or {}) do
             local n = c.Name:lower()
-            if n:find("trait", 1, true) and not n:find("stat", 1, true) and type(c.Value) == "string" and c.Value ~= "" then trait = c.Value break end
+            if c:IsA("StringValue") and n:find("trait", 1, true) and not n:find("stat", 1, true) and c.Value ~= "" then trait = c.Value break end
         end
         table.insert(units, { unitType(u) or "?", AutoPlaceModule.StatNum(u, "upgrade") or 0, trait,
             AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1 })
@@ -8452,7 +8455,8 @@ function Lobby.ShareGame(win, wave)
         table.remove(units)
         body = HttpService:JSONEncode(data)
     end
-    httpPost(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
+    local sent, why = httpPost(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
+    AutoPlaceModule.Note("game data " .. (sent and "shared" or ("NOT shared - " .. tostring(why))))
 end
 
 function Lobby.RecordWaves()
