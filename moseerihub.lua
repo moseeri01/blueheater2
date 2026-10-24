@@ -4514,6 +4514,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
         -- (owner: a Never unit is not upgraded either - akainu and Cream get slower with upgrades)
         local never = State.eventMode and AutoPlaceModule.InList(Lobby.cfg.eventNever, unitType(u))
         local capLvl = AutoPlaceModule.UP_CAP[unitType(u) or ""]
+        if State.eventMode and Lobby.shieldTaken and AutoPlaceModule.ShieldBreaker(unitType(u) or "") and not AutoPlaceModule.InList(AutoPlaceModule.RANK, unitType(u)) then capLvl = 0 end
         if capLvl and (AutoPlaceModule.StatNum(u, "upgrade") or 0) >= capLvl then never = true end
         if role ~= "buff" and not never and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
             and not AutoPlaceModule.OutOfReach(u) then
@@ -4978,6 +4979,15 @@ function AutoPlaceModule.InList(list, name)
     for _, n in ipairs(type(list) == "table" and list or {}) do if n == name then return true end end
     return false
 end
+-- A fast hitter that breaks enemy shields (one hit takes a shield point): attacks every 2 s or
+-- faster, or bee_girl (1 s, armour shred) - owner 2026-10-24
+function AutoPlaceModule.ShieldBreaker(name)
+    if name == "bee_girl_evolved" then return true end
+    local def = AutoPlaceModule.UnitDef(name)
+    local cd = def and tonumber(def.attack_cooldown)
+    return cd ~= nil and cd > 0 and cd <= 2 and (tonumber(def.damage) or 0) > 0
+end
+
 function AutoPlaceModule.DamageCount(units)
     local n = 0
     for _, u in ipairs(units) do if unitRole(u) == "dps" then n = n + 1 end end
@@ -5005,6 +5015,14 @@ function AutoPlaceModule.EventChoose(money)
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             local why
             local always = AutoPlaceModule.InList(Lobby.cfg.eventAlways, t.name)
+            -- (an Enemy Shield card was taken: up to 2 fast hitters are placed to break the shields)
+            local breaker = false
+            if Lobby.shieldTaken and not always and AutoPlaceModule.ShieldBreaker(t.name) then
+                local have = 0
+                for _, u in ipairs(units) do if AutoPlaceModule.ShieldBreaker(unitType(u) or "") then have = have + 1 end end
+                breaker = have < 2
+            end
+            always = always or breaker
             -- (a main unit came this game: from now on the rest are not needed; with none, they hold the line)
             if always and not AutoPlaceModule.UP_CAP[t.name] then AutoPlaceModule.mainSeen = true end
             if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name] then why = "on the never / skip list"
@@ -8640,6 +8658,7 @@ function Lobby.OnCardResult(picked, state)
     if type(picked) == "table" then
         for _, e in ipairs(Lobby.AsList(type(picked.effects) == "table" and picked.effects or {})) do
             if e.type == "enemy_regen" then Lobby.regenTaken = (Lobby.regenTaken or 0) + 1 end
+            if e.type == "enemy_shield" then Lobby.shieldTaken = true end
         end
     end
     local p = Lobby.pendingVote
