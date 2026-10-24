@@ -5205,6 +5205,10 @@ local function tick()
         for _, tm in pairs(AutoPlaceModule.team) do
             if AutoPlaceModule.AirCapable(tm.name, math.huge) then any = true end
         end
+        -- (event has no fixed team: the units already down count)
+        for _, u in ipairs(ownedUnits()) do
+            if AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) then any = true end
+        end
         if any then
             AutoPlaceModule.Note("flying enemies on the map: hill / hybrid units first")
         elseif not AutoPlaceModule.flyWarned then
@@ -9055,7 +9059,10 @@ function Lobby.SpellStep(money)
             AutoPlaceModule.Note("spell dropped: " .. id .. " (nothing to use it on)")
             return
         end
-        if spec and slot and (target or not spec.target) and money >= spec.cost + (spec.reserve or 0)
+        -- (a thin team spends it all: real game 2026-10-24, waves 1-4 with no unit and 11k unused
+        -- while Astral Summon waited for its reserve)
+        local reserve = AutoPlaceModule.DamageCount(ownedUnits()) < 6 and 0 or (spec and spec.reserve or 0)
+        if spec and slot and (target or not spec.target) and money >= spec.cost + reserve
             and AutoPlaceModule.WaveNumber() >= (spec.fromWave or 0) then
             local way = Lobby.SpellWayOk(Lobby.cfg.spellWay) and Lobby.cfg.spellWay or Lobby.SPELL_WAYS[Lobby.spellWayTry or 1]
             local had = 0
