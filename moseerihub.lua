@@ -8182,7 +8182,7 @@ Lobby.SPELL_WAYS = { "model" }
 -- names on the bar (IngameSpells data) and the ones that only take a slot from new units
 Lobby.SPELL_NAMES = { clone = "Clone", random_buff = "Random Buff", sacrifice = "Merge", sell_refund = "Refund",
     gate = "Astral Gate", summon = "Astral Summon", ritual = "Ritual" }
-Lobby.DROP_SPELLS = { ritual = true }
+Lobby.DROP_SPELLS = {}
 
 -- The bar slot showing a spell (by its name on the card).
 function Lobby.SpellSlotBar()
@@ -8247,13 +8247,16 @@ end
 
 -- What each spell does (IngameSpells data) and how it is used:
 -- random_buff +100% attack or range on a unit (the strongest), clone a copy with the same upgrade
--- level (the most upgraded), summon / gate instant (Astral Summon: a random equipped unit into
+-- level (owner: only once a unit is fully upgraded - then the copy is just as strong), summon / gate instant (Astral Summon: a random equipped unit into
 -- the slot; Astral Gate: Astral Summon three times as likely), sacrifice = Merge (all the SAME
 -- units in its range go into it, 1.5x their damage, and their places on the map come free),
--- sell_refund = Refund (a full refund: near the 20-unit limit the weakest unit makes room).
-Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "upgraded" },
+-- sell_refund = Refund (a full refund: a weak unit is sold from the start, and near the
+-- 20-unit limit the weakest makes room), ritual (the unit becomes a Holy Warlord walking the path,
+-- as strong as that unit: the strongest goes - owner 2026-10-24 "very good").
+Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "maxed" },
     summon = { cost = 10000, reserve = 2000 }, gate = { cost = 2500 },
-    sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" } }
+    sacrifice = { cost = 1000, target = "merge", dropIfNone = true }, sell_refund = { cost = 0, target = "weakest" },
+    ritual = { cost = 10000, target = "strongest" } }
 function Lobby.OnSpells(list)
     list = Lobby.AsList(list)
     if type(list) ~= "table" then return end
@@ -8302,6 +8305,13 @@ function Lobby.RerollStep()
     end
 end
 
+-- At its last upgrade level (the unit data's upgrade list).
+function Lobby.FullyUpgraded(u)
+    local def = AutoPlaceModule.UnitDef(unitType(u) or "")
+    local up = def and (def.upgrade or def.upgrades)
+    return type(up) == "table" and #up > 0 and (AutoPlaceModule.StatNum(u, "upgrade") or 0) >= #up
+end
+
 -- The unit a spell goes on (nil = none fits now). Units refused before are skipped.
 function Lobby.SpellTarget(spec)
     local bad = Lobby.spellBad or {}
@@ -8325,17 +8335,29 @@ function Lobby.SpellTarget(spec)
                     local q = o ~= u and unitType(o) == kind and AutoPlaceModule.RootPos(o)
                     if q and (q - p).Magnitude <= range then n = n + 1 end
                 end
-                local score = n * 1e9 + dps
+                -- (strong kinds first - owner: merging the strong ones saves places and makes them
+                -- stronger; then the most of its kind in range)
+                local score = (AutoPlaceModule.MaxDps(kind) or 0) * 100 + n * 10 + dps / 1e9
                 if n > 0 and (not best or score > best) then target, best = u, score end
             end
         end
     elseif spec.target == "weakest" then
-        -- only near the limit; never a unit that hits flyers, never the last damage units
-        if #units < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2 then return nil end
+        -- a damage unit under half of the team's middle one (fully upgraded) from the start (owner:
+        -- sell the weak ones early), any weakest one near the limit; never a unit that hits flyers,
+        -- never a farm, never with under 4 damage units down
+        local all = {}
+        for _, u in ipairs(units) do
+            local v = select(2, dpsNow(u)) and AutoPlaceModule.MaxDps(unitType(u) or "")
+            if v then table.insert(all, v) end
+        end
+        if #all < 4 then return nil end
+        table.sort(all)
+        local nearLimit = #units >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2
+        local bar = nearLimit and math.huge or all[math.floor(#all / 2) + 1] * 0.5
         for _, u in ipairs(units) do
             local _, hits = dpsNow(u)
             local full = AutoPlaceModule.MaxDps(unitType(u) or "")
-            if hits and full and not bad[u] and not AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) and (not best or full < best) then
+            if hits and full and full < bar and not bad[u] and not AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) and (not best or full < best) then
                 target, best = u, full
             end
         end
@@ -8345,8 +8367,8 @@ function Lobby.SpellTarget(spec)
                 -- damage per second as the unit stands now (its own _stats: level, upgrades, trait,
                 -- earlier buffs), area attacks counted higher; Clone takes the most upgraded one
                 local dps, hits = dpsNow(u)
-                local score = spec.target == "upgraded" and ((AutoPlaceModule.StatNum(u, "upgrade") or 0) * 1e9 + dps) or dps
-                if hits and not bad[u] and (not best or score > best) then target, best = u, score end
+                local ok = hits and not bad[u] and (spec.target ~= "maxed" or Lobby.FullyUpgraded(u))
+                if ok and (not best or dps > best) then target, best = u, dps end
             end
         end
     end
@@ -8357,12 +8379,12 @@ function Lobby.SpellSaving(money)
     if not Lobby.cfg.eventSpells or not State.eventMode or not money then return nil end
     -- (only once a spell has gone through: saving for one the game ignores held 8k+ unused)
     if not Lobby.SpellWayOk(Lobby.cfg.spellWay) then return nil end
-    local dps, topLevel = 0, 0
+    local dps, maxed = 0, false
     for _, u in ipairs(ownedUnits()) do
         local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
         if (tonumber(def.damage) or 0) > 0 then
             dps = dps + 1
-            topLevel = math.max(topLevel, AutoPlaceModule.StatNum(u, "upgrade") or 0)
+            maxed = maxed or Lobby.FullyUpgraded(u)
         end
     end
     if dps == 0 then return nil end
@@ -8370,7 +8392,8 @@ function Lobby.SpellSaving(money)
         -- (not for a spell tried 5 times that stays in hand: the taps are not landing)
         local tried = (Lobby.spellTries or {})[id] or 0
         if id == "random_buff" and money < 1000 and tried < 5 then return "Saving for Random Buff" end
-        if id == "clone" and topLevel >= 3 and money < 5000 and tried < 5 then return "Saving for Clone" end
+        if id == "clone" and maxed and money < 5000 and tried < 5 then return "Saving for Clone" end
+        if id == "ritual" and money < 10000 and tried < 5 then return "Saving for Ritual" end
     end
     return nil
 end
