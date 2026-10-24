@@ -8445,7 +8445,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-004923"
+Lobby.VERSION = "20261025-012903"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8724,6 +8724,10 @@ function Lobby.CardCost(opt, share)
         elseif t == "enemy_regen" then cost = cost + 100 * a * (1 + (Lobby.regenTaken or 0))
         elseif t == "enemy_shield" then cost = cost + 0.1 * a
         elseif t == "enemy_bomb" then cost = cost + 0.2
+        -- (Random Curses: "amount" random Bad effects, often Enemy Health / Speed / our resistance -
+        -- each counted at 60% of a heavy card; taken as cheap, it gave Spellproof + Enemy Health
+        -- in one game - real game 2026-10-25)
+        elseif t == "random_effects" then cost = cost + math.max(1, a) * 0.6 * Lobby.AVOID
         elseif opt.option_type == "Bad" then cost = cost + 0.6
         end
     end
