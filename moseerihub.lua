@@ -3620,9 +3620,11 @@ end
 
 function AutoPlaceModule.RefreshTeam()
     local team = {}
-    if AutoPlaceModule.EventMode() then
+    -- (set from the stage every time: once on, it stayed on - a later normal stage would then run
+    -- the event brain, which finds no random copies and places nothing)
+    State.eventMode = AutoPlaceModule.EventMode()
+    if State.eventMode then
         -- (never saved as lastTeam: these copies vanish when the game ends)
-        State.eventMode = true
         local hot = AutoPlaceModule.HotbarTeam()
         for _, t in pairs(hot) do
             local def = AutoPlaceModule.UnitDef(t.name)
@@ -4323,6 +4325,21 @@ function AutoPlaceModule.DropCopy(t, why)
     AutoPlaceModule.Note(string.format("copy cleared: %s (%s)", t.name, why))
 end
 
+-- Does this placed unit carry the trait (team data by uuid: traits = {{trait = "unique", tier = 1}})?
+function AutoPlaceModule.HasTrait(u, name)
+    local uuid = u:FindFirstChild("_stats") and u._stats:FindFirstChild("uuid")
+    if not uuid then return false end
+    for _, t in pairs(AutoPlaceModule.team) do
+        if normUuid(t.uuid) == normUuid(uuid.Value) then
+            for _, tr in pairs(type(t.traits) == "table" and t.traits or {}) do
+                local id = type(tr) == "table" and (tr.trait or tr.id or tr.name) or tr
+                if string.lower(tostring(id)) == name then return true end
+            end
+        end
+    end
+    return false
+end
+
 -- Best damage gained per ¥ from upgrading any placed damage unit (0 when none can be upgraded).
 function AutoPlaceModule.BestUpgradeScore()
     local best, now = 0, os.clock()
@@ -4381,6 +4398,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 -- the two at level 7, a forced push starved better upgrades: near loss in Hard
                 -- Room 45); a level that adds no damage (Vego 6) still moves on toward the fusion
                 if rank == 2 and fuse[u] then score = math.max(score, 1e-6) end
+                -- (owner 2026-10-24: the Unique-trait unit is upgraded first, to the top)
+                if rank == 2 and score > 0 and AutoPlaceModule.HasTrait(u, "unique") then score = score * 1e6 end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
@@ -5480,6 +5499,14 @@ end
 function AutoPlaceModule.MapReport()
     local lines = { "[moseeri hub · Map report] " .. os.date("%H:%M:%S") .. " stage " .. stageKey() }
     table.insert(lines, "map fingerprint: " .. (AutoPlaceModule.MapFingerprint(true) or "none (no _BASES)") .. " from " .. (AutoPlaceModule.fpFrom ~= "" and AutoPlaceModule.fpFrom or "-"))
+    -- (a friend's report could not say why nothing was placed: the Auto Place status goes in now)
+    table.insert(lines, string.format("auto place: %s | problem: %s | event mode: %s | last step: %s %ss ago", tostring(AutoPlaceModule.status),
+        tostring(AutoPlaceModule.problem), tostring(State.eventMode), tostring(AutoPlaceModule.tickStep),
+        tostring(AutoPlaceModule.tickAt and math.floor(os.clock() - AutoPlaceModule.tickAt))))
+    for i = math.max(1, #AutoPlaceModule.log - 6), #AutoPlaceModule.log do
+        local e = AutoPlaceModule.log[i]
+        table.insert(lines, "  note: " .. tostring(type(e) == "table" and (e.text or e.msg) or e))
+    end
     table.insert(lines, "getgc: " .. tostring(type(getgc) == "function") .. ", Raycast: " .. tostring(pcall(function() return RaycastParams.new() end)))
     AutoPlaceModule.RefreshTeam()
     for s = 1, 6 do
