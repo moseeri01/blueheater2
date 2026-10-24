@@ -5080,7 +5080,7 @@ function AutoPlaceModule.EventChoose(money)
             AutoPlaceModule.copySeen[t.uuid] = first
             -- (owner: cleared sooner, money or not - only a main unit may wait for its price)
             -- (a thin team gives a damage copy 30 s to be afforded, then it goes like any other)
-            local mayWait = always or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8 and now - first < 30)
+            local mayWait = always
             if not why and not atCap and now - first > EV.stuck and (not mayWait or (t.cost and money and money >= t.cost)) then why = "stuck on the bar" end
             if why then
                 AutoPlaceModule.DropCopy(t, why)
@@ -5105,7 +5105,9 @@ function AutoPlaceModule.EventChoose(money)
                 local payNow = t.cost and money and money >= t.cost
                 if (always and (payNow or not AutoPlaceModule.danger))
                     or (payNow and (role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0))
-                    or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8))) then v = math.huge end
+                    )) then v = math.huge end
+                -- (2026-10-25 night: "below 8 damage units a payable damage copy goes before upgrades" was
+                -- taken back - shared data showed 6-8 units placed at level 0 and losses at waves 7-15)
                 if v > bestV then best, bestV = { t = t, role = role }, v end
             end
         end
@@ -8445,7 +8447,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-012903"
+Lobby.VERSION = "20261025-022909"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
