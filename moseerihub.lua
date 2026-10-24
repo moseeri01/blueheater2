@@ -4173,6 +4173,12 @@ ControlUp.fails = upgradeFails
 local function upgradeGain(u, level)
     local def = AutoPlaceModule.UnitDef(unitType(u))
     local up = def and (def.upgrade or def.upgrades)
+    if def and (type(up) ~= "table" or #up == 0) then
+        -- (no upgrade list: an even share of the usual growth per level)
+        local maxN = AutoPlaceModule.StatNum(u, "max_upgrade") or 8
+        local base = (tonumber(def.damage) or 0) / math.max(0.5, tonumber(def.attack_cooldown) or 1)
+        return level < maxN and base * (AutoPlaceModule.GROWTH - 1) / maxN * (AutoPlaceModule.IsAoe(unitType(u)) and AOE_VALUE or 1) or 0
+    end
     if type(up) ~= "table" then return 0 end
     local function statsAt(n)
         local dmg, cd = tonumber(def.damage) or 0, tonumber(def.attack_cooldown) or 1
@@ -4199,6 +4205,13 @@ local function upgradeGain(u, level)
     return (math.max(0, statsAt(level + 1) - statsAt(level)) + skill) * mult
 end
 
+-- Damage per second at the last upgrade over the base one, the middle of the units whose upgrade
+-- lists are known (bee_girl 13x, medea 22x, esdeath 17x, tatsumaki 17x, metal_knight 25x ...).
+-- About half the roster (fujitora, konan, sakamoto, gyutaro, frieren, saber ...) has no list in
+-- the unit data: judged at base strength they were X'd as "far below the team" and never got
+-- upgrades picked (real games 2026-10-24).
+AutoPlaceModule.GROWTH = 17
+
 -- Fool's Hunt: damage per second a unit kind reaches fully upgraded (its definition), area
 -- attacks counted higher. Used to tell a strong random copy from a weak one.
 function AutoPlaceModule.MaxDps(name)
@@ -4206,6 +4219,10 @@ function AutoPlaceModule.MaxDps(name)
     if not def then return nil end
     local dmg, cd = tonumber(def.damage) or 0, tonumber(def.attack_cooldown) or 1
     local up = def.upgrade or def.upgrades
+    -- (newer units keep their upgrades in a form not read here: their full strength is guessed)
+    if type(up) ~= "table" or #up == 0 then
+        return dmg / math.max(0.5, cd) * AutoPlaceModule.GROWTH * (AutoPlaceModule.IsAoe(name) and AOE_VALUE or 1)
+    end
     for _, step in ipairs(type(up) == "table" and up or {}) do
         if type(step) == "table" then
             dmg = tonumber(step.damage) or dmg
@@ -4316,7 +4333,10 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             if can and noWait and cost and money and cost > money then can = false end
             if can then
                 local rank = RANK[role] or 2
-                local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or 1000)) or -level
+                -- (an upgrade price not in the data: about the unit's price times the next level)
+                local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+                local guess = (tonumber(def.cost) or 1000) * (level + 1)
+                local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or guess)) or -level
                 -- fusion halves go by value like everything else (Vegito is only ~16% more than
                 -- the two at level 7, a forced push starved better upgrades: near loss in Hard
                 -- Room 45); a level that adds no damage (Vego 6) still moves on toward the fusion
