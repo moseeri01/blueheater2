@@ -7790,15 +7790,16 @@ function Lobby.ButtonFor(text, root)
         if (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and not isOwnGui(d) then
             local plain = string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
             if plain == want then
+                -- the label itself or its closest container that holds a button (the card's
+                -- own frame comes before the frame holding all the cards)
                 local node = d
                 for _ = 1, 6 do
                     if node:IsA("GuiButton") then return node end
+                    for _, b in ipairs(node:GetDescendants()) do
+                        if b:IsA("GuiButton") and b.Name ~= "Delete" and isOnScreen(b) then return b end
+                    end
                     node = node.Parent
                     if not node or node:IsA("LayerCollector") then break end
-                end
-                local card = d.Parent and d.Parent.Parent and d.Parent.Parent.Parent or d.Parent
-                for _, b in ipairs(card and card:GetDescendants() or {}) do
-                    if b:IsA("GuiButton") and isOnScreen(b) and b.Name ~= "Delete" then return b end
                 end
             end
         end
@@ -7825,12 +7826,13 @@ end
 -- for the damage types we deal (true damage ignores it), shields and death bombs a little.
 function Lobby.CardCost(opt, share)
     local cost = 0
-    for _, e in ipairs(type(opt.effects) == "table" and opt.effects or {}) do
+    for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
         local t, a = tostring(e.type), tonumber(e.amount) or 0
         if t == "candy_multiplier" then
             -- (the reward, not a cost)
         elseif t == "enemy_stat_mul" then cost = cost + a
-        elseif t == "enemy_speedup" then cost = cost + 2 * a
+        -- (+25% speed = 20% less time in range, about +25% health: a bit worse for leaks)
+        elseif t == "enemy_speedup" then cost = cost + 1.2 * a
         elseif t == "enemy_resistance_specific" then cost = cost + 1.5 * (a / 100) * (share[tostring(e.damage_type)] or 0)
         elseif t == "enemy_shield" then cost = cost + 0.1 * a
         elseif t == "enemy_bomb" then cost = cost + 0.2
@@ -7861,8 +7863,22 @@ function Lobby.PickCard(options)
     return bestBad or 1, "coins"
 end
 
+-- (the real game sends the cards keyed "1", "2", "3" - strings, so # sees none)
+function Lobby.AsList(t)
+    if type(t) ~= "table" or #t > 0 then return t end
+    local keys, out = {}, {}
+    for k in pairs(t) do table.insert(keys, k) end
+    table.sort(keys, function(x, y) return (tonumber(x) or math.huge) < (tonumber(y) or math.huge) end)
+    for _, k in ipairs(keys) do table.insert(out, t[k]) end
+    return out
+end
+
 function Lobby.OnCardOptions(seconds, options)
-    if not Lobby.cfg.eventCards or type(options) ~= "table" or #options == 0 then return end
+    options = Lobby.AsList(options)
+    if not Lobby.cfg.eventCards or type(options) ~= "table" or #options == 0 then
+        Lobby.cardInfo = "skipped: " .. (Lobby.cfg.eventCards and "no options" or "cards off")
+        return
+    end
     local remote = getAARemote("select_roguelike_option")
     local i, why = Lobby.PickCard(options)
     local way = Lobby.cfg.voteWay ~= "" and Lobby.cfg.voteWay or Lobby.VOTE_WAYS[Lobby.voteTry or 1]
@@ -7948,6 +7964,7 @@ end
 Lobby.SPELLS = { random_buff = { cost = 1000, target = "strongest" }, clone = { cost = 5000, target = "upgraded" },
     summon = { cost = 10000, reserve = 2000 } }
 function Lobby.OnSpells(list)
+    list = Lobby.AsList(list)
     if type(list) ~= "table" then return end
     local before = Lobby.spellTry
     Lobby.spells = list
