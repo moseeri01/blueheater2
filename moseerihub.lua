@@ -4746,6 +4746,78 @@ function AutoPlaceModule.SpotRefused(t, spot, kind)
     end
 end
 
+-- Fool's Hunt brain: ONE decision a tick over every copy on the bar and every upgrade on the map,
+-- in place of the stack of normal-stage rules that kept blocking each other there (saving for a
+-- spell, waiting for a flyer upgrade, an empty bar, danger) - owner 2026-10-24: "it should have
+-- been separate from the start". The policy is the strategy simulator's (sim/strategies.js act,
+-- tested over 100k+ games): clear what is not wanted, then compare the best copy (its level-0
+-- damage per yen x placeBonus) with the best upgrade (damage gained per yen) and do the better
+-- one, saving for it when it cannot be paid yet. Farms, buff units and flyer hitters while short
+-- go first. Returns seconds to wait, or nil and the copy to place.
+AutoPlaceModule.EV = { placeBonus = 2, reserve = 0, airMin = 3, airBy = 8, buffUnits = 2, stuck = 25 }
+function AutoPlaceModule.EventChoose(money)
+    local EV, now = AutoPlaceModule.EV, os.clock()
+    local wave = AutoPlaceModule.WaveNumber()
+    local units = ownedUnits()
+    local atCap = #units >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99)
+    local air, buffs = 0, 0
+    for _, u in ipairs(units) do
+        local r = unitRole(u)
+        if r == "dps" and AutoPlaceModule.AirCapable(unitType(u) or "", AutoPlaceModule.StatNum(u, "upgrade") or 0) then air = air + 1 end
+        if r == "buff" or r == "support" then buffs = buffs + 1 end
+    end
+    local airShort = air < EV.airMin and wave <= EV.airBy + 5
+    AutoPlaceModule.copySeen = AutoPlaceModule.copySeen or {}
+    -- 1. every copy on the bar: cleared with its X, or a candidate
+    local best, bestV = nil, -1
+    for _, t in pairs(AutoPlaceModule.team) do
+        if t.temp and not AutoPlaceModule.full[t.uuid] and not AutoPlaceModule.badTemp[t.uuid] then
+            local role = AutoPlaceModule.RoleOf(t) or "dps"
+            local why
+            if AutoPlaceModule.EventCapped(t) then why = "its unit is at the limit"
+            elseif role == "farm" then
+                local same = 0
+                for _, u in ipairs(units) do if unitType(u) == t.name then same = same + 1 end end
+                if wave >= AutoPlaceModule.FARMS_UNTIL or (t.name == "speedwagon" and same >= 2) then why = "farm not needed now" end
+            elseif role == "buff" or role == "support" then
+                if buffs >= EV.buffUnits then why = "enough buff units" end
+            elseif AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
+            end
+            local first = AutoPlaceModule.copySeen[t.uuid] or now
+            AutoPlaceModule.copySeen[t.uuid] = first
+            if not why and not atCap and now - first > EV.stuck and t.cost and money and money >= t.cost then why = "stuck on the bar" end
+            if why then
+                AutoPlaceModule.DropCopy(t, why)
+                return 0.5
+            end
+            if not atCap and (AutoPlaceModule.noSpot[t.uuid] or 0) <= now then
+                local v = AutoPlaceModule.Value(t, t.cost or 1000) * EV.placeBonus
+                if role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0)) then v = math.huge end
+                if v > bestV then best, bestV = { t = t, role = role }, v end
+            end
+        end
+    end
+    -- 2. the best upgrade on the map, then the better of the two
+    local upV = AutoPlace.upgrade and AutoPlaceModule.BestUpgradeScore() or 0
+    local function canPay(b) return not b.t.cost or (money and money >= b.t.cost) end
+    if best and bestV >= upV then
+        if canPay(best) then return nil, best.t, best.role end
+        AutoPlaceModule.status = string.format("Saving for %s: %d / %d", best.t.name, math.floor(money or 0), math.floor(best.t.cost))
+        return 0.2
+    end
+    if AutoPlace.upgrade then
+        local wait = upgradeStep((money or 0) - EV.reserve, nil, nil, true)
+        if wait then return wait end
+        if upV > 0 then
+            AutoPlaceModule.status = "Saving for the best upgrade"
+            return 0.3
+        end
+    end
+    if best and canPay(best) then return nil, best.t, best.role end
+    AutoPlaceModule.status = best and "Waiting for money" or (atCap and "Unit limit reached - upgrading" or "Waiting for the next copy")
+    return 0.5
+end
+
 local function tick()
     AutoPlaceModule.idleMoney = nil
     -- (where the last tick got to, for the live status: a step that never returns shows here)
@@ -4830,6 +4902,14 @@ local function tick()
     local slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, danger)
     -- Place units myself (Home): the player places, the script only upgrades / sells
     if AutoPlace.manual then t = nil end
+    -- Fool's Hunt: its own brain decides (EventChoose); the normal-stage rules below are skipped
+    local ev = State.eventMode and not AutoPlace.manual
+    if ev then
+        local wait, et, er = AutoPlaceModule.EventChoose(money)
+        if wait then return wait end
+        t, role, slot = et, er, et.slot
+    end
+    if not ev then
     -- Fool's Hunt: 20 units at most on the map (seen in the real game); then the money goes into
     -- upgrades instead of refused placements
     if t and AutoPlaceModule.hotbarAt and #ownedUnits() >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) then t = nil end
@@ -4887,7 +4967,9 @@ local function tick()
         end
         return 1
     end
+    end
     local cost = t.cost or hudPrices[slot]
+    if not ev then
     if AutoPlaceModule.EventWeak(t, role) then
         AutoPlaceModule.DropCopy(t, "far below the team")
         return 0.5
@@ -4935,6 +5017,7 @@ local function tick()
     if cost and money and money < cost then
         AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(cost))
         return 0.1
+    end
     end
     local unknown = not (cost and money)
     local range = AutoPlaceModule.Range(t)
