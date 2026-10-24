@@ -3441,6 +3441,9 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         -- Fast clear: prefer spots near the enemy spawn (kills early, waves end sooner);
         -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
         local mode = AutoPlaceModule.Mode()
+        -- (owner: Fool's Hunt maps are short - the first units stand back near the base so the early
+        -- waves walk longer through them while the money goes into upgrades; later ones go forward)
+        if State.eventMode then mode = AutoPlaceModule.WaveNumber() < 10 and "Safe" or "Balanced" end
         local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
         -- (Fool's Hunt: a copy goes next to one of its own kind, inside its reach, so Merge can fold
         -- them - spread over the map, three fujitoras never could)
@@ -4446,6 +4449,20 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     local focus = ControlUp.focus(units, now)
     local fuse = ControlUp.fusionFocus(units)
     local summonerDown = AutoPlaceModule.SummonerDown(units)
+    -- (Fool's Hunt: ONE carry gets the upgrades first - a main unit when one is down, else the one
+    -- strongest at full upgrade; spread over many, the early damage was never enough - owner)
+    local carry, carryV
+    if State.eventMode then
+        for _, o in ipairs(units) do
+            local k = unitType(o) or ""
+            local lv = AutoPlaceModule.StatNum(o, "upgrade") or 0
+            local more = nextUpgrade(o, lv)
+            if unitRole(o) == "dps" and not AutoPlaceModule.UP_CAP[k] and more and (upgradeFails[o] or 0) < now then
+                local v = (AutoPlaceModule.MaxDps(k) or 0) * (AutoPlaceModule.InList(AutoPlaceModule.RANK, k) and 100 or 1)
+                if not carry or v > carryV then carry, carryV = o, v end
+            end
+        end
+    end
     local topOf = {}
     for _, o in ipairs(units) do
         local k = unitType(o) or ""
@@ -4497,12 +4514,16 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                     -- level 0 and a flyer took the game at wave 12)
                     local airMain = AutoPlaceModule.WaveNumber() >= 8 and AutoPlaceModule.AirCapable(kind, math.huge)
                     if (AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) or airMain) and not AutoPlaceModule.UP_CAP[kind] then score = score * 10
-                    elseif AutoPlaceModule.WaveNumber() >= 8 then score = score * 0.3 end
+                    else score = score * 0.3 end
+                    -- (owner: one unit to the top at a time - every other damage upgrade waits)
+                    if carry and u ~= carry then score = 0 end
                 end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
                     -- skip: only units that hit flyers this time
+                elseif State.eventMode and carry and rank == 2 and u ~= carry then
+                    -- skip: the carry goes to the top first
                 elseif not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
                     or (rank == pickRank and isAir == pickAir and score > pickScore) then
                     pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir = u, level, rank, cost, score, role, isAir
