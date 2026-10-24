@@ -4401,7 +4401,7 @@ function AutoPlaceModule.BestUpgradeScore()
                 local v = upgradeGain(u, level) / math.max(1, cost)
                 -- (the same main-unit weight as upgradeStep in Fool's Hunt)
                 local kind = unitType(u) or ""
-                if State.eventMode and AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) and not AutoPlaceModule.UP_CAP[kind] then v = v * 10 end
+                if State.eventMode and (AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) or (AutoPlaceModule.WaveNumber() >= 8 and AutoPlaceModule.AirCapable(kind, math.huge))) and not AutoPlaceModule.UP_CAP[kind] then v = v * 10 end
                 if State.eventMode and AutoPlaceModule.UP_CAP[kind] and level >= AutoPlaceModule.UP_CAP[kind] then v = 0 end
                 best = math.max(best, v)
             end
@@ -4472,7 +4472,10 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 -- took the money and the mains stayed low - a lost game 2026-10-24)
                 if State.eventMode and rank == 2 and score > 0 then
                     local kind = unitType(u) or ""
-                    if AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) and not AutoPlaceModule.UP_CAP[kind] then score = score * 10
+                    -- (from wave 8 the units that hit flyers count as mains too: two metal_knights sat at
+                    -- level 0 and a flyer took the game at wave 12)
+                    local airMain = AutoPlaceModule.WaveNumber() >= 8 and AutoPlaceModule.AirCapable(kind, math.huge)
+                    if (AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) or airMain) and not AutoPlaceModule.UP_CAP[kind] then score = score * 10
                     elseif AutoPlaceModule.WaveNumber() >= 8 then score = score * 0.3 end
                 end
                 local isAir = air and role == "dps" and AutoPlaceModule.AirCapable(unitType(u), level + 1)
