@@ -4311,7 +4311,8 @@ end
 -- (40% while under 10 units: places are plenty early and the team must grow)
 -- (strategy search, 400 settings x 300 games: the best ones X copies under the team's middle
 -- unit once the map has a few units, and keep almost anything while it is small)
-AutoPlaceModule.WEAK_SHARE, AutoPlaceModule.WEAK_SHARE_EARLY = 1.0, 0.2
+-- (1.0 left Magic Town games with 9-12 units: middle units are X'd only when far weaker)
+AutoPlaceModule.WEAK_SHARE, AutoPlaceModule.WEAK_SHARE_EARLY = 0.5, 0.2
 function AutoPlaceModule.EventWeak(t, role)
     if not State.eventMode or not t or not t.temp or role ~= "dps" then return false end
     -- (a unit that hits flyers is never cleared: goku_ssj3 was, then a flyer walked in and took
@@ -8648,7 +8649,7 @@ function Lobby.SpellTarget(spec)
         -- (owner: from the middle of the game the early units are sold too, their money goes into
         -- the main units)
         local nearLimit = #units >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2
-            or AutoPlaceModule.WaveNumber() >= 12
+            or (AutoPlaceModule.WaveNumber() >= 12 and #units >= 15)
         local bar = nearLimit and math.huge or all[math.floor(#all / 2) + 1] * 0.5
         for _, u in ipairs(units) do
             local _, hits = dpsNow(u)
