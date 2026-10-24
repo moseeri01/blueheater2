@@ -4941,6 +4941,37 @@ function AutoPlaceModule.EventChoose(money)
             end
         end
     end
+    -- 1b. the map is full and a main unit waits on the bar: the weakest other unit makes room
+    -- (Refund in hand = full price back, else sold) - owner 2026-10-24: two judar copies sat on
+    -- the bar while 20 weaker units held every place
+    if atCap and os.clock() - (AutoPlaceModule.swapAt or -1e9) > 6 then
+        local mainWaiting = false
+        for _, t in pairs(AutoPlaceModule.team) do
+            if t.temp and not AutoPlaceModule.badTemp[t.uuid] and AutoPlaceModule.InList(AutoPlaceModule.RANK, t.name)
+                and not AutoPlaceModule.UP_CAP[t.name] then mainWaiting = true end
+        end
+        if mainWaiting then
+            local worst, worstV
+            for _, u in ipairs(units) do
+                local kind = unitType(u) or ""
+                local main = AutoPlaceModule.InList(AutoPlaceModule.RANK, kind) and not AutoPlaceModule.UP_CAP[kind]
+                local airUnit = AutoPlaceModule.AirCapable(kind, AutoPlaceModule.StatNum(u, "upgrade") or 0)
+                if unitRole(u) == "dps" and not main and not (airUnit and air <= EV.airMin) then
+                    local v = AutoPlaceModule.MaxDps(kind) or 0
+                    if not worst or v < worstV then worst, worstV = u, v end
+                end
+            end
+            if worst then
+                AutoPlaceModule.swapAt = os.clock()
+                if not Lobby.CastOn("sell_refund", worst) then
+                    local sell = getAARemote("sell_unit_ingame")
+                    if sell then task.spawn(pcall, function() sell:InvokeServer(worst) end) end
+                    AutoPlaceModule.Note(string.format("sold %s to make room for a main unit", unitType(worst) or "?"))
+                end
+                return 1
+            end
+        end
+    end
     -- 2. the best upgrade on the map, then the better of the two
     local upV = AutoPlace.upgrade and AutoPlaceModule.BestUpgradeScore() or 0
     local function canPay(b) return not b.t.cost or (money and money >= b.t.cost) end
@@ -8603,7 +8634,13 @@ function Lobby.RerollStep()
         local view = slot:FindFirstChild("Main") and slot.Main:FindFirstChild("View")
         local world = view and view:FindFirstChildOfClass("WorldModel")
         local x = slot:FindFirstChild("Delete", true)
-        if world and world:FindFirstChildOfClass("Model") and x then
+        local model = world and world:FindFirstChildOfClass("Model")
+        -- (never a main unit's copy: it waits for a place to be made for it)
+        local main = false
+        for _, n in ipairs(AutoPlaceModule.RANK) do
+            if model and AutoPlaceModule.BaseId(n) == AutoPlaceModule.BaseId(model.Name) and not AutoPlaceModule.UP_CAP[n] then main = true end
+        end
+        if model and x and not main then
             Lobby.rerollAt = os.clock()
             Lobby.TapGui(x)
             AutoPlaceModule.Note("bar full of units at the cap: cleared one for a new roll")
