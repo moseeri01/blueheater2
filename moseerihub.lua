@@ -5035,9 +5035,9 @@ function AutoPlaceModule.EventChoose(money)
             always = always or breaker
             -- (a main unit came this game: from now on the rest are not needed; with none, they hold the line)
             if always and not AutoPlaceModule.UP_CAP[t.name] then AutoPlaceModule.mainSeen = true end
-            -- (under 4 damage units any damage copy goes down - Snowy Town was lost at wave 7 with 4 units;
+            -- (under 6 damage units any damage copy goes down - Snowy Town was lost at wave 7 with 4 units;
             -- Arlem only never: 5000 for a hit every 60 s)
-            local thin = role == "dps" and AutoPlaceModule.DamageCount(units) < 4 and t.name ~= "armin"
+            local thin = role == "dps" and AutoPlaceModule.DamageCount(units) < 6 and t.name ~= "armin"
             if (AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name]) and not thin then why = "on the never / skip list"
             -- (place-only units - nagumo, jiraiya, emilia: one of each; three nagumos took three places)
             elseif AutoPlaceModule.UP_CAP[t.name] == 0 and AutoPlaceModule.CountKind(units, t.name) >= 1 then why = "one is enough"
