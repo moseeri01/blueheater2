@@ -4488,7 +4488,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             local k = unitType(o) or ""
             local lv = AutoPlaceModule.StatNum(o, "upgrade") or 0
             local more = nextUpgrade(o, lv)
-            if unitRole(o) == "dps" and not AutoPlaceModule.UP_CAP[k] and more and (upgradeFails[o] or 0) < now then
+            if unitRole(o) == "dps" and not AutoPlaceModule.UP_CAP[k] and more and (upgradeFails[o] or 0) < now
+                and not AutoPlaceModule.InList(Lobby.cfg.eventNever, k) then
                 -- (the owner's list order first - cid before Siren - then strength)
                 local at = 0
                 for i, n in ipairs(AutoPlaceModule.RANK) do if n == k then at = #AutoPlaceModule.RANK - i + 1 end end
@@ -5098,8 +5099,13 @@ function AutoPlaceModule.EventChoose(money)
                 -- (owner 2026-10-25: below 8 damage units a damage copy that can be paid NOW is placed
                 -- before upgrades - usopp and illya were cleared while the yen went into monet / frieren.
                 -- Never saved for: saving for unaffordable copies stopped every upgrade and filled the bar)
-                if always or role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0))
-                    or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8 and t.cost and money and money >= t.cost) then v = math.huge end
+                -- (only a copy that can be paid now goes before upgrades; an Always copy may also be
+                -- saved for while the base is safe - review 2026-10-25: saving for unpayable copies
+                -- stalled every upgrade)
+                local payNow = t.cost and money and money >= t.cost
+                if (always and (payNow or not AutoPlaceModule.danger))
+                    or (payNow and (role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0))
+                    or (role == "dps" and AutoPlaceModule.DamageCount(units) < 8))) then v = math.huge end
                 if v > bestV then best, bestV = { t = t, role = role }, v end
             end
         end
@@ -5424,7 +5430,8 @@ local function tick()
     end
     -- (Fool's Hunt: "max placement" for a copy under its own unit limit = the map's unit limit;
     -- not learning that sent every new copy in to be refused)
-    if why == "cap" and t.temp and State.eventMode and not AutoPlaceModule.EventCapped(t) and #ownedUnits() > 0 then
+    -- (10 units at least: one misread refusal with 3 units down stopped every placement - review 2026-10-25)
+    if why == "cap" and t.temp and State.eventMode and not AutoPlaceModule.EventCapped(t) and #ownedUnits() >= 10 then
         AutoPlaceModule.capSeen = #ownedUnits()
     end
     if why == "cap" then
@@ -7242,6 +7249,8 @@ task.spawn(function()
             reported = false
             -- (per-game card memory starts empty: a Replay keeps the script running)
             Lobby.cardsTaken, Lobby.badTaken, Lobby.resTaken, Lobby.regenTaken, Lobby.shieldTaken = nil, nil, nil, nil, nil
+            Lobby.candy, Lobby.pendingVote, Lobby.spells, Lobby.buffMain = nil, nil, nil, nil
+            AutoPlaceModule.capSeen, AutoPlaceModule.capFails, AutoPlaceModule.mainSeen = nil, 0, nil
             startSnap, gameWave = playerSnapshot(), 0
             firstSnap = firstSnap or startSnap
             unitsBefore = #Webhook.url >= 10 and Webhook.OwnedUnits() or nil
@@ -8436,7 +8445,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-004320"
+Lobby.VERSION = "20261025-004700"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8485,9 +8494,10 @@ function Lobby.ShareGame(win, wave)
     if not (Lobby.cfg.shareData and State.eventMode) then return end
     if not Lobby.shareUrl then
         local ok, url = pcall(function() return game:HttpGet(Lobby.SHARE_URL_FILE) end)
-        Lobby.shareUrl = ok and type(url) == "string" and url:match("https://[%w%./_%-]+") or ""
+        -- (kept only when found: a failed fetch is tried again next game)
+        Lobby.shareUrl = ok and type(url) == "string" and url:match("https://[%w%./_%-]+") or nil
     end
-    if Lobby.shareUrl == "" then Lobby.ShareLog("no share_url.txt address") return end
+    if not Lobby.shareUrl then Lobby.ShareLog("no share_url.txt address") return end
     local units = {}
     for _, u in ipairs(ownedUnits()) do
         local st = u:FindFirstChild("_stats")
@@ -8581,6 +8591,13 @@ function Lobby.Loop()
                     tostring(Lobby.candy), tostring(Lobby.cardInfo), table.concat(Lobby.spells or {}, "+"), live, table.concat(slots, ","), (AutoPlaceModule.StatusText():gsub("\n", " | "):gsub("Map fingerprint:[^|]*|", ""))))
                 if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
+            end)
+        end
+        -- (wave each unit was placed, for the shared game data: not only while Watch is on)
+        if State.eventMode and not inLobbyNow then
+            pcall(function()
+                Lobby.placedAt = Lobby.placedAt or setmetatable({}, { __mode = "k" })
+                for _, u in ipairs(ownedUnits()) do Lobby.placedAt[u] = Lobby.placedAt[u] or AutoPlaceModule.WaveNumber() end
             end)
         end
         if State.watching and State.eventMode and not inLobbyNow then
@@ -8758,6 +8775,7 @@ function Lobby.PickCard(options)
     local late = State.eventMode and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL
     if good and (Lobby.cfg.cardMode == "Safest" or late or hurt or not bestBad or bestBadCost > 0.8) then return good, "help" end
     if yen and bestBad and bestBadCost >= Lobby.AVOID then return yen, "yen over a heavy Bad card" end
+    if yen and not good and (Lobby.cfg.cardMode == "Safest" or late or hurt) then return yen, "help" end
     return bestBad or 1, "coins"
 end
 
