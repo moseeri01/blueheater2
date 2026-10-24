@@ -2938,6 +2938,7 @@ local function isEnemy(unit)
     if base then return tostring(base.Value) == "pve" end
     return stats:FindFirstChild("player") == nil and unit:FindFirstChild("HumanoidRootPart") ~= nil
 end
+AutoPlaceModule.IsEnemy = isEnemy
 
 -- Adds where the enemies are now to the stage path; returns true when it grew.
 local function samplePath()
@@ -4219,6 +4220,9 @@ end
 AutoPlaceModule.WEAK_SHARE = 0.4
 function AutoPlaceModule.EventWeak(t, role)
     if not State.eventMode or not t or not t.temp or role ~= "dps" then return false end
+    -- (a unit that hits flyers is never cleared: goku_ssj3 was, then a flyer walked in and took
+    -- the full base in one go - real game 2026-10-24)
+    if AutoPlaceModule.AirCapable(t.name, math.huge) then return false end
     local mine = AutoPlaceModule.MaxDps(t.name)
     if not mine then return false end
     local all = {}
@@ -4840,8 +4844,9 @@ local function tick()
     end
     -- Fool's Hunt: copies come one at a time, so money past this copy's price would sit unused
     -- (16k idle with 13 units in a real game): it goes into upgrades, the copy's price kept
-    if State.eventMode and AutoPlace.upgrade and not danger and cost and money and money > cost then
-        local wait = upgradeStep(money - cost, nil, nil, true)
+    -- (in danger too, damage units only: 35k sat unused while enemies were getting through)
+    if State.eventMode and AutoPlace.upgrade and cost and money and money > cost then
+        local wait = upgradeStep(money - cost, danger and "dps" or nil, nil, true)
         if wait then return wait end
     end
     if not danger and AutoPlace.upgrade and role == "dps" and (dpsPlaced or 0) > 0 then
@@ -7832,6 +7837,43 @@ function Lobby.JoinTower()
     return true
 end
 
+-- Fool's Hunt with Watch on: every new enemy once (wave, max HP, speed, flying, armor, regen)
+-- and, once a wave, our side (units, levels, damage per second from the unit data, base HP) into
+-- event_waves.txt - the numbers a fast strategy simulator is tuned on.
+function Lobby.RecordWaves()
+    Lobby.waveSeen = Lobby.waveSeen or setmetatable({}, { __mode = "k" })
+    Lobby.waveLog = Lobby.waveLog or { "# " .. os.date("%Y-%m-%d %H:%M:%S") }
+    local wave = AutoPlaceModule.WaveNumber()
+    local folder = unitsFolder()
+    local function num(st, n) local v = st:FindFirstChild(n) return v and tonumber(v.Value) or (v and tostring(v.Value)) or "-" end
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        if not Lobby.waveSeen[u] and AutoPlaceModule.IsEnemy(u) then
+            Lobby.waveSeen[u] = true
+            local st = u:FindFirstChild("_stats")
+            if st then
+                table.insert(Lobby.waveLog, string.format("E w%d %s hp %s base_hp %s speed %s base_speed %s fly %s armor %s regen %s barrier %s",
+                    wave, (num(st, "id") == "-" and u.Name or tostring(num(st, "id"))), tostring(num(st, "health")), tostring(num(st, "base_health")), tostring(num(st, "speed")),
+                    tostring(num(st, "base_speed")), tostring(num(st, "Flying")), tostring(num(st, "Armor")), tostring(num(st, "Regen")), tostring(num(st, "barrier"))))
+            end
+        end
+    end
+    if wave ~= Lobby.waveLast then
+        Lobby.waveLast = wave
+        local parts, dps = {}, 0
+        for _, u in ipairs(ownedUnits()) do
+            local lvl = AutoPlaceModule.StatNum(u, "upgrade") or 0
+            local d = (AutoPlaceModule.StatNum(u, "damage") or 0) / math.max(0.5, AutoPlaceModule.StatNum(u, "attack_cooldown") or 1)
+            dps = dps + d
+            table.insert(parts, string.format("%s:%d", tostring(unitType(u)), lvl))
+        end
+        local hp, hpMax = AutoPlaceModule.ScanBaseHp()
+        table.insert(Lobby.waveLog, string.format("W w%d units %d dps %d base %s/%s candy %s | %s", wave, #parts, math.floor(dps), tostring(hp), tostring(hpMax),
+            tostring(Lobby.candy), table.concat(parts, " ")))
+    end
+    while #Lobby.waveLog > 3000 do table.remove(Lobby.waveLog, 2) end
+    AutoPlaceModule.Catalog.save("event_waves_" .. tostring(math.floor(AutoPlaceModule.loadUnix or 0)) .. ".txt", table.concat(Lobby.waveLog, "\n"))
+end
+
 -- Every 5 s in the lobby (not while Watch is teaching): join again 20 s after a try.
 function Lobby.Loop()
     while not State.unloaded do
@@ -7861,6 +7903,10 @@ function Lobby.Loop()
                 if #Lobby.live > 60 then table.remove(Lobby.live, 1) end
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
             end)
+        end
+        if State.watching and State.eventMode and not inLobbyNow then
+            local ok, err = pcall(Lobby.RecordWaves)
+            Lobby.recordError = not ok and tostring(err) or nil
         end
         if inLobbyNow and not Lobby.listsFilled and Lobby.RefreshLists and os.clock() - (Lobby.lastRefresh or -1e9) > 30 then
             Lobby.lastRefresh = os.clock()
