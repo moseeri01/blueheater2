@@ -4383,7 +4383,10 @@ AutoPlaceModule.SUMMON_BUFF = { giselle_evolved = true, giselle = true }
 -- owner 2026-10-24: saber carries the early game, 2 upgrades are enough; pucci is placed when money
 -- is left over and then upgraded to the top (its skill speeds up the team's attacks)
 -- (jiraiya and emilia slow the enemies: placed, never upgraded)
-AutoPlaceModule.UP_CAP = { saber_evolved = 2, jiraiya_evolved = 0, emilia = 0 }
+-- (owner: before judar comes, bee_girl and sakamoto are both upgraded; then judar only)
+AutoPlaceModule.EARLY_CARRY = { bee_girl_evolved = true, sakamoto_evolved = true }
+-- (nagumo cuts HP: placed whenever it comes, no upgrades - owner 2026-10-24)
+AutoPlaceModule.UP_CAP = { saber_evolved = 2, jiraiya_evolved = 0, emilia = 0, nagumo_evolved = 0 }
 AutoPlaceModule.UP_FIRST = { pucci_heaven = true }
 function AutoPlaceModule.SummonerDown(units)
     for _, o in ipairs(units) do
@@ -4467,8 +4470,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 if AutoPlaceModule.AirCapable(k, math.huge) then v = v * 3 end
                 -- (owner: bee_girl carries the early game only; from wave 8 judar gets everything to the top)
                 local w = AutoPlaceModule.WaveNumber()
-                if k == "bee_girl_evolved" then v = v * (w < 8 and 50 or 0.1) end
-                if k == "judar_evolved" then v = v * (w >= 8 and 1000 or 10) end
+                -- (owner: judar takes every upgrade as soon as it is down)
+                if k == "judar_evolved" then v = v * 1e6 end
                 if not carry or v > carryV then carry, carryV = o, v end
             end
         end
@@ -4532,7 +4535,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                     and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(unitType(u)))
                 if airOnly and not isAir then
                     -- skip: only units that hit flyers this time
-                elseif State.eventMode and carry and rank == 2 and u ~= carry then
+                elseif State.eventMode and carry and rank == 2 and u ~= carry
+                    and not (unitType(carry) ~= "judar_evolved" and AutoPlaceModule.EARLY_CARRY[unitType(u) or ""]) then
                     -- skip: the carry goes to the top first
                 elseif not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
                     or (rank == pickRank and isAir == pickAir and score > pickScore) then
@@ -8885,6 +8889,8 @@ function Lobby.SpellStep(money)
         if id == "random_buff" then
             local keep = Lobby.buffMain
             -- (a sold or dead unit moves to _DEAD_UNITS: only one still in _UNITS counts)
+            -- (owner: once judar is down every buff goes to judar)
+            if target and unitType(target) == "judar_evolved" and keep and unitType(keep) ~= "judar_evolved" then keep = nil end
             if keep and keep.Parent and keep.Parent.Name == "_UNITS" and not (Lobby.spellBad or {})[keep] then target = keep else Lobby.buffMain = target end
         end
         local slot = spec and Lobby.SpellSlot(id)
