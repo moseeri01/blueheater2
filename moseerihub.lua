@@ -148,7 +148,7 @@ local Lobby = {
         -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
-        eventBrain = true, maxSpellsHeld = 2,
+        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3,
         eventAlways = { "judar_evolved", "cid_evolved", "bee_girl_evolved", "homura_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
         eventNever = { "armin", "stain_evolved", "narberal_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
@@ -286,7 +286,11 @@ end
 local function applyConfigData(data)
     if type(data) ~= "table" then return end
     if type(data.profile) == "string" then Profile.name = data.profile end
+    -- (the unit lists kept a saved copy of the FIRST defaults for good - Cream stayed on Always on the
+    -- owner's game after it was moved to Never: a saved copy older than the lists in the code is dropped)
+    local oldLists = type(data.lobby) == "table" and (tonumber(data.lobby.eventListsVer) or 0) < Lobby.cfg.eventListsVer
     for k, v in pairs(type(data.lobby) == "table" and data.lobby or {}) do
+        if oldLists and (k == "eventAlways" or k == "eventNever" or k == "eventListsVer") then v = Lobby.cfg[k] end
         if Lobby.cfg[k] ~= nil and type(v) == type(Lobby.cfg[k]) then Lobby.cfg[k] = v end
     end
     local w = data.webhook or {}
