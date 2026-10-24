@@ -4461,6 +4461,10 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
                 local v = (AutoPlaceModule.MaxDps(k) or 0) * (AutoPlaceModule.InList(AutoPlaceModule.RANK, k) and 100 or 1)
                 -- (owner: the first carry is best one that hits flyers too - maxed before flyers come at wave 10)
                 if AutoPlaceModule.AirCapable(k, math.huge) then v = v * 3 end
+                -- (owner: bee_girl carries the early game only; from wave 8 judar gets everything to the top)
+                local w = AutoPlaceModule.WaveNumber()
+                if k == "bee_girl_evolved" then v = v * (w < 8 and 50 or 0.1) end
+                if k == "judar_evolved" then v = v * (w >= 8 and 1000 or 10) end
                 if not carry or v > carryV then carry, carryV = o, v end
             end
         end
