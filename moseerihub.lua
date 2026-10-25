@@ -8496,7 +8496,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-104644"
+Lobby.VERSION = "20261025-105409"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8707,6 +8707,20 @@ function Lobby.Loop()
             end)
         end
         if State.eventMode and not inLobbyNow then pcall(Lobby.SampleDepth) end
+        -- (Dungeon Run "You Died!" - all lives lost, the run is over: its Continue collects the rewards
+        -- and leaves. Left alone it sat there until the idle kick - 2026-10-25)
+        if not inLobbyNow then
+            pcall(function()
+                if os.clock() - (Lobby.diedTapAt or -1e9) < 4 then return end
+                if not Lobby.ButtonFor("You Died!") then return end
+                local b = Lobby.ButtonFor("Continue")
+                if b then
+                    Lobby.diedTapAt = os.clock()
+                    Lobby.TapGui(b)
+                    pcall(Lobby.ShareLog, "dungeon: You Died! - tapped Continue")
+                end
+            end)
+        end
         if State.eventMode and not inLobbyNow and not Lobby.skillsSaved then Lobby.skillsSaved = true task.spawn(pcall, Lobby.SaveSkills) end
         -- (wave each unit was placed, for the shared game data: not only while Watch is on)
         if State.eventMode and not inLobbyNow then
