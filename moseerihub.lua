@@ -3609,7 +3609,9 @@ function AutoPlaceModule.HotbarTeam()
             -- (a slot whose copy was placed may keep showing that unit: skipped until the game
             -- announces a newer copy of it)
             local used = AutoPlaceModule.usedSlot[s]
-            local stale = used and AutoPlaceModule.BaseId(used.id) == AutoPlaceModule.BaseId(model.Name)
+            -- (at most 20 s: a slot showing the same unit kind again after that is a new copy - real game
+            -- 2026-10-25, wave 30 with 48k yen and two copies on the bar that were never seen)
+            local stale = used and AutoPlaceModule.BaseId(used.id) == AutoPlaceModule.BaseId(model.Name) and os.clock() - used.at < 20
             if stale then
                 for _, info in pairs(AutoPlaceModule.liveTemp) do
                     if AutoPlaceModule.BaseId(info.id) == AutoPlaceModule.BaseId(used.id) and (info.seen or 0) > used.at then stale = false end
@@ -5403,13 +5405,16 @@ local function tick()
     end
     AutoPlaceModule.status = string.format("Slot %d %s (%s): placing", slot, t.name, role)
     AutoPlaceModule.tickStep = "place"
+    -- (the time the placing STARTED: the game may announce the next copy of this kind before
+    -- tryPlace returns, and that copy must not count as the used one)
+    local placeStart = os.clock()
     if tryPlace(t, spot) then
         -- (event: the copy is used up - the placed unit may carry another uuid, so it is not
         -- counted from the map; the bar is read again on the next tick)
         if t.temp then
             AutoPlaceModule.full[t.uuid], AutoPlaceModule.badTemp[t.uuid] = true, true
             AutoPlaceModule.capFails = 0
-            if t.slot then AutoPlaceModule.usedSlot[t.slot] = { id = t.name, at = os.clock() } end
+            if t.slot then AutoPlaceModule.usedSlot[t.slot] = { id = t.name, at = placeStart } end
             AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
         end
         AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
@@ -8452,7 +8457,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-085954"
+Lobby.VERSION = "20261025-092218"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
