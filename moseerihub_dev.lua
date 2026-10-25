@@ -235,7 +235,7 @@ local function buildConfigData()
             openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath,
             mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true,
             prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule, autoShop = DungeonRun.autoShop ~= false,
-            goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, lostRooms = DungeonRun.lostRooms, flyMaps = DungeonRun.flyMaps,
+            goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, picksV2 = DungeonRun.picksV2, lostRooms = DungeonRun.lostRooms, flyMaps = DungeonRun.flyMaps,
             stuckTotal = DungeonRun.stuckTotal, lastStuck = DungeonRun.lastStuck,
             lives = DungeonRun.lives },
         unitAI = {
@@ -300,6 +300,9 @@ local function applyConfigData(data)
     for k, v in pairs(type(data.lobby) == "table" and data.lobby or {}) do
         if oldLists and (k == "eventAlways" or k == "eventNever" or k == "eventListsVer") then v = Lobby.cfg[k] end
         if Lobby.cfg[k] ~= nil and type(v) == type(Lobby.cfg[k]) then Lobby.cfg[k] = v end
+        -- (learned dungeon items and pictures have no default: they were saved but never read back, so
+        -- every reload - each room is a teleport - showed the generic picture again; 2026-10-26)
+        if (k == "dungeonItems" or k == "dungeonItemIcons" or k == "dungeonIcons4") and type(v) == "table" then Lobby.cfg[k] = v end
     end
     local w = data.webhook or {}
     Webhook.url = pick(w.url, "string", Webhook.url)
@@ -328,6 +331,8 @@ local function applyConfigData(data)
     DungeonRun.autoShop = d.autoShop ~= false
     DungeonRun.goldChests = d.goldChests == "now" and "now" or "end"
     DungeonRun.itemPrefs = type(d.itemPrefs) == "table" and d.itemPrefs or {}
+    DungeonRun.picksV2 = d.picksV2 == true or nil
+    DungeonRun.legacyPicks = not DungeonRun.picksV2 and next(DungeonRun.itemPrefs) ~= nil or nil
     DungeonRun.lostRooms = type(d.lostRooms) == "table" and d.lostRooms or {}
     DungeonRun.flyMaps = type(d.flyMaps) == "table" and d.flyMaps or {}
     DungeonRun.stuckTotal, DungeonRun.lastStuck = tonumber(d.stuckTotal), type(d.lastStuck) == "string" and d.lastStuck or nil
@@ -5426,7 +5431,7 @@ local ControlUp = {
 -- Control skills (time stop / freeze / stun) one at a time (owner 2026-10-26): two homura time
 -- stops fired together waste one - the enemies are already stopped, and after a stop they stay
 -- immune a moment. The next copy casts only once the running stop has ENDED plus the immunity gap.
--- The end is seen, not guessed: enemy spots are taken at the cast and 0.5 s later; the stop has
+-- The end is seen, not guessed: enemy spots are taken 0.4 s and 0.8 s after the cast; the stop has
 -- ended when most of them move again. Enemies that never stopped = a wasted cast. Stop length and
 -- gap: skill data when it has them, else measured and remembered (AutoPlace.stopTimes), else 3 s gap.
 ControlUp.STOP_GAP = 3
@@ -5501,7 +5506,7 @@ local function movedShare(a, b)
     return both, moved
 end
 function ControlUp.Cast(u, now)
-    ControlUp.stop = { unit = u, id = ControlUp.skillId(u), at = now, start = ControlUp.enemySpots() }
+    ControlUp.stop = { unit = u, id = ControlUp.skillId(u), at = now }
     local s = ControlUp.stats[u] or { casts = 0, wasted = 0 }
     ControlUp.stats[u] = s
     s.casts = s.casts + 1
@@ -5512,8 +5517,14 @@ function ControlUp.Watch(now)
     if not st or st.endedAt then return end
     AutoPlace.stopTimes = AutoPlace.stopTimes or {}
     local times = AutoPlace.stopTimes[st.id] or {}
+    -- (two snapshots after the stop has landed - it lands a moment after the cast, and the step taken
+    -- in between made every cast look wasted)
+    if not st.start then
+        if now - st.at >= 0.4 then st.start = ControlUp.enemySpots() end
+        return
+    end
     if not st.snap then
-        if now - st.at < 0.5 then return end
+        if now - st.at < 0.8 then return end
         st.snap = ControlUp.enemySpots()
         local both, moved = movedShare(st.start, st.snap)
         if both > 0 and moved * 2 > both then
@@ -5549,6 +5560,7 @@ function ControlUp.Clear(now)
     return st.wasted or now - st.endedAt >= ControlUp.gap(st.unit)
 end
 -- For the dump: each control unit's level, cooldown, reach, casts and wasted casts.
+AutoPlaceModule.ControlReport = function() return ControlUp.Report() end
 function ControlUp.Report()
     local out = {}
     for _, u in ipairs(ownedUnits()) do
@@ -6402,6 +6414,157 @@ end
 -- (to hold wave 1), then every farm, then the rest spread evenly with damage before buffs.
 -- In danger, the best-value damage unit first and nothing else (returns "upgrade" when none
 -- is left). 5th result: the team's strongest damage unit (best damage per ¥) is on the map.
+-- Last-wave boss chase (owner 2026-10-25, work/placement_method.md "Last-wave boss chase"): on the last
+-- wave (Fool's Hunt from wave 30 only) with a boss past the middle of the road and time left before it
+-- reaches our base, damage units that can no longer reach the road ahead of it are sold, and the
+-- strongest team damage unit the money (with the sale) buys goes on the spot covering the most road
+-- ahead of the boss, nearest our base. Once a game. The time stop then fires when the boss enters that
+-- unit's zone (FreezeMoment: "boss inside the damage zone"). chase / bossBase go into the AASTAT row.
+AutoPlaceModule.chase = {}
+function AutoPlaceModule.Boss()
+    local folder = unitsFolder()
+    local hps, top, topHp = {}, nil, 0
+    for _, e in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(e) then
+            local hp = AutoPlaceModule.StatNum(e, "base_health") or 0
+            hps[#hps + 1] = hp
+            if hp > topHp then top, topHp = e, hp end
+        end
+    end
+    table.sort(hps)
+    -- (what a normal enemy has, remembered for when the boss walks almost alone)
+    if #hps >= 3 then AutoPlaceModule.normalHp = hps[math.ceil(#hps / 2)] end
+    local normal = (#hps >= 3 and hps[math.ceil(#hps / 2)]) or (#hps == 2 and hps[1]) or AutoPlaceModule.normalHp
+    if top and normal and normal > 0 and topHp >= 5 * normal then return top end
+    return nil
+end
+-- Progress along the learned road (0 = enemy end, 1 = our base) of every road point, by distance to
+-- our base end (Ends), and of the road point nearest (x, z).
+local function roadProgs(pts, goal, x, z)
+    local far, near = 0, math.huge
+    local d = {}
+    for i, q in ipairs(pts) do
+        d[i] = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
+        far, near = math.max(far, d[i]), math.min(near, d[i])
+    end
+    local progs, at, ad = {}, 0, nil
+    for i, q in ipairs(pts) do
+        progs[i] = far > near and (far - d[i]) / (far - near) or 0
+        local dq = (q[1] - x) ^ 2 + (q[3] - z) ^ 2
+        if not ad or dq < ad then at, ad = progs[i], dq end
+    end
+    return progs, at
+end
+function AutoPlaceModule.BossChase(money, prices)
+    local c = AutoPlaceModule.chase
+    local w = AutoPlaceModule.WaveNumber()
+    if w < (c.wave or 0) then c = {} AutoPlaceModule.chase = c end -- a new game
+    c.wave = w
+    -- (did the boss reach our base: it left the map while past 90% of the road)
+    if c.boss and not c.boss.Parent and (c.lastProg or 0) >= 0.9 then c.reached, c.boss = true, nil end
+    if c.done or AutoPlace.manual or not AutoPlaceModule.LastWave() then return nil end
+    if State.eventMode and w < 30 then return nil end
+    -- (a boss once found is followed while it is on the map)
+    local boss = (c.boss and c.boss.Parent and c.boss) or AutoPlaceModule.Boss()
+    local bp = boss and rootPos(boss)
+    local pts = pathPoints()
+    local _, goal = AutoPlaceModule.Ends()
+    if not (bp and goal) or #pts < 8 then return nil end
+    local progs, bossProg = roadProgs(pts, goal, bp.X, bp.Z)
+    c.boss, c.lastProg = boss, bossProg
+    local now = os.clock()
+    if c.lastPos and now - c.lastAt > 0.2 then
+        local v = math.sqrt((bp.X - c.lastPos.X) ^ 2 + (bp.Z - c.lastPos.Z) ^ 2) / (now - c.lastAt)
+        -- (stopped or slowed to a crawl: keep the walking speed - slows are counted as time won)
+        if v > 0.3 then c.speed = v end
+    end
+    if not c.lastPos or now - c.lastAt > 0.2 then c.lastPos, c.lastAt = bp, now end
+    if bossProg < 0.5 or not c.speed then return nil end
+    local len = 0
+    for i = 2, #pts do len = len + math.min(10, math.sqrt((pts[i][1] - pts[i - 1][1]) ^ 2 + (pts[i][3] - pts[i - 1][3]) ^ 2)) end
+    local left = (1 - bossProg) * len / c.speed
+    if left < AutoPlaceModule.CHASE_NEED then
+        c.done = true
+        AutoPlaceModule.Note(string.format("boss chase: too late (%.0f s to our base)", left))
+        return nil
+    end
+    -- units that cannot reach any road ahead of the boss: sold, their money joins in
+    local function reaches(u)
+        local p = rootPos(u)
+        if not p then return true end
+        local r = AutoPlaceModule.StatNum(u, "range") or AutoPlaceModule.Range({ name = unitType(u) or "" })
+        for i, q in ipairs(pts) do
+            if progs[i] > bossProg and (q[1] - p.X) ^ 2 + (q[3] - p.Z) ^ 2 <= r * r then return true end
+        end
+        return false
+    end
+    local sell, saleGuess = {}, 0
+    for _, u in ipairs(ownedUnits()) do
+        local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+        if unitRole(u) == "dps" and not def.unsellable and not reaches(u) then
+            sell[#sell + 1] = u
+            saleGuess = saleGuess + 0.5 * (AutoPlaceModule.StatNum(u, "total_spent") or tonumber(def.cost) or 0)
+        end
+    end
+    -- the strongest team damage unit the money buys (a copy under its limit, or one freed by a sale)
+    local pick, pickCost, pickV
+    for s, t in pairs(AutoPlaceModule.team) do
+        local cost = t.cost or (prices or {})[s]
+        if (AutoPlaceModule.RoleOf(t) or "dps") == "dps" and cost and cost <= (money or 0) + saleGuess
+            and not AutoPlaceModule.full[t.uuid] then
+            local v = AutoPlaceModule.MaxDps(t.name) or 0
+            if not pickV or v > pickV then pick, pickCost, pickV = t, cost, v end
+        end
+    end
+    if not pick then return nil end
+    -- its spot: the free one covering the most road ahead of the boss, nearest our base first
+    local r = AutoPlaceModule.PlanRange(pick)
+    local kind = AutoPlaceModule.PlacementKind(pick)
+    local mine = {}
+    for _, u in ipairs(ownedUnits()) do
+        local p = rootPos(u)
+        if p then mine[#mine + 1] = p end
+    end
+    local spot, best
+    for _, cnd in ipairs(candidates or {}) do
+        if (kind == "any" or cnd.kind == kind) and not badSpots[spotKey(cnd, kind)] then
+            local free = true
+            for _, p in ipairs(mine) do
+                if (p.X - cnd.x) ^ 2 + (p.Z - cnd.z) ^ 2 < MIN_SPACING * MIN_SPACING then free = false break end
+            end
+            if free then
+                local r2 = r * r - (cnd.rise or 0) ^ 2
+                local n = 0
+                for i, q in ipairs(pts) do
+                    if progs[i] > bossProg + 0.02 and (q[1] - cnd.x) ^ 2 + (q[3] - cnd.z) ^ 2 <= r2 then n = n + progs[i] end
+                end
+                if n > 0 and (not best or n > best) then spot, best = cnd, n end
+            end
+        end
+    end
+    if not spot then
+        c.done = true
+        AutoPlaceModule.Note("boss chase: no free spot ahead of the boss")
+        return nil
+    end
+    local remote = getAARemote("sell_unit_ingame")
+    for _, u in ipairs(sell) do
+        if remote then pcall(function() remote:InvokeServer(u) end) end
+        AutoPlaceModule.Note(string.format("boss chase: sold %s (cannot reach the boss any more)", unitType(u) or "?"))
+    end
+    if #sell > 0 then return 0.3 end -- (the sale money arrives, the next tick places)
+    if (money or 0) < pickCost then return 0.2 end
+    AutoPlaceModule.status = string.format("Boss chase: %s ahead of the boss (%.0f s to our base)", pick.name, left)
+    if tryPlace(pick, spot) then
+        c.done, c.used = true, true
+        AutoPlaceModule.Note(string.format("boss chase: placed %s ahead of the boss at %d%% of the road (%.0f s to our base)",
+            pick.name, math.floor(bossProg * 100 + 0.5), left))
+        return 0.2
+    end
+    return 0.3
+end
+AutoPlaceModule.CHASE_NEED = 2 -- s the boss must still need to reach our base for the chase to start
+
 local function chooseNext(prices, danger)
     local list, dpsPlaced, farmsPlaced = {}, 0, 0
     local strongest, strongestDown
@@ -6873,6 +7036,11 @@ local function tick()
         AutoPlaceModule.rescue = nil
     end
     if AutoPlace.sellFarmsLast and AutoPlaceModule.LastWave() and AutoPlaceModule.SellFarm() then return 0.3 end
+    do
+        -- (last-wave boss chase: its own function, see AutoPlaceModule.BossChase)
+        local okC, waitC = pcall(AutoPlaceModule.BossChase, money, hudPrices)
+        if okC and waitC then return waitC end
+    end
     local danger = AutoPlaceModule.Danger()
     if danger and not AutoPlaceModule.danger then AutoPlaceModule.Note("base took damage: damage units first for 20 s") end
     AutoPlaceModule.danger = danger
@@ -7522,6 +7690,7 @@ function AutoPlaceModule.DumpStep()
         pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog,
         short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
         road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath(), hills = PV.HillSpots(),
+        control = AutoPlaceModule.ControlReport(),
         v2 = { rl = PV.Road().len, kind = PV.Kind(PV.Road().len), from = PV.Road().from, lanes = PV.Road().lanes, order = AutoPlaceModule.v2Why,
             margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog, fast = PV.FinishFast(), highStreak = PV.highStreak } }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
@@ -9677,12 +9846,16 @@ function DungeonRun.ItemText(id)
             if it.id == id and it.effect ~= "(seen in game)" then return it.name .. " " .. it.effect end
         end
     end
+    -- (the longest matching name: "elf_bow" is Elf Bow, not Bow)
     local norm = string.lower(id):gsub("[^a-z]", "")
+    local best, bestLen
     for name, effect in pairs(DungeonRun.WIKI_EFFECTS) do
         local n = name:gsub("[^a-z]", "")
-        if norm ~= "" and #n >= 3 and (norm:find(n, 1, true) or (#norm >= 6 and n:find(norm, 1, true))) then return name .. " " .. effect end
+        if norm ~= "" and #n >= 3 and (norm:find(n, 1, true) or (#norm >= 6 and n:find(norm, 1, true))) and (not bestLen or #n > bestLen) then
+            best, bestLen = name .. " " .. effect, #n
+        end
     end
-    return id
+    return best or id
 end
 -- What an item / curse is worth to THIS team (AA wiki effects, owner 2026-10-25): damage only by our
 -- share of that damage type (Archmage's Hat +250% magic x our magic share), cost cuts by size (more
@@ -9708,7 +9881,12 @@ function DungeonRun.ItemValue(text, lives)
         return -v, true
     end
     local share = DungeonRun.TeamShare()
-    if low:find("philosoph", 1, true) then return 10, false end
+    -- (Philosopher's Stone turns the chests held NOW into rare ones - worth the normal chests in hand, nothing
+    -- with none: owner 2026-10-26, it was bought first and early before)
+    if low:find("philosoph", 1, true) then
+        local res = type(DungeonRun.live) == "table" and type(DungeonRun.live._resources) == "table" and DungeonRun.live._resources or {}
+        return (tonumber(res.treasure) or 0) * 1.5, false
+    end
     if low:find("rare chest", 1, true) or (low:find("gold", 1, true) and low:find("chest", 1, true)) then return 4, false end
     if low:find("cost", 1, true) then return pct / 10 * ((DungeonRun.lastDepth or 0) < 10 and 1.3 or 1), false end
     -- (the shop writes "Phys Crit Chance": "phys" counts as physical)
@@ -9717,7 +9895,11 @@ function DungeonRun.ItemValue(text, lives)
         if low:find(word .. " dmg", 1, true) or low:find(word .. " damage", 1, true) then return pct / 100 * 4 * (share[t[1]] or 0), false end
         if low:find(word .. " crit", 1, true) then return pct / 100 * 1.5 * (share[t[1]] or 0), false end
     end
-    if low:find("chest luck", 1, true) then return pct / 40, false end
+    -- (chest luck pays on the chests still to come: more early in the run)
+    if low:find("chest luck", 1, true) then
+        local depth = DungeonRun.lastDepth or 0
+        return pct / 40 * (depth < 10 and 1.5 or (depth < 15 and 1 or 0.5)), false
+    end
     if low:find("cooldown", 1, true) or low:find("attack speed", 1, true) then return pct / 8, false end
     if low:find("range", 1, true) then return pct / 100 * 2, false end
     if low:find("boss", 1, true) then return pct / 50, false end
@@ -9800,12 +9982,20 @@ function DungeonRun.ShrineStep(st, seq)
     local rows, total, curses, gold = DungeonRun.ShrineOffer(page, lives, data)
     local accept = total > 0
     if lives ~= nil and lives <= 1 and curses > 0 and not gold then accept = false end
+    -- (My picks: an offered item that is not selected = DENY)
+    local unpicked
+    if DungeonRun.mode ~= "Auto" and type(data) == "table" then
+        for _, it in ipairs(data) do
+            local id = type(it) == "table" and it.id and string.lower(tostring(it.id))
+            if id and not DungeonRun.ItemSelected(id) then unpicked, accept = id, false break end
+        end
+    end
     local button = DungeonRun.FindButton(page, accept and "accept" or "deny")
     if not button then return false end
     DungeonRun.shrineTried = seq
     Lobby.TapGui(button)
     local line = string.format("SHRINE %s: %s | score %.1f%s", accept and "accept" or "deny", table.concat(rows, "; "), total,
-        (lives ~= nil and lives <= 1 and curses > 0 and not gold) and " (1 life: no curses)" or "")
+        unpicked and (" (not picked: " .. unpicked .. ")") or ((lives ~= nil and lives <= 1 and curses > 0 and not gold) and " (1 life: no curses)" or ""))
     DungeonRun.status = "shrine: " .. (accept and "accepted" or "denied")
     pcall(Lobby.ShareLog, "dungeon: " .. line)
     pcall(DungeonRun.Log, line .. " - tapped " .. button:GetFullName())
@@ -10061,7 +10251,11 @@ function DungeonRun.LiveRooms(nextT)
 end
 -- the game's own copy of the run (lobby after a reload, before any dungeon_changed came)
 function DungeonRun.FindLive()
-    local hold = DungeonRun.liveGc and 10 or DungeonRun.MISS_HOLD
+    -- (a found copy is kept 60 s while its rooms' depth is unchanged - the 10 s rescan of getgc in the
+    -- dungeon lobby was a hitch, lag review 2026-10-26)
+    local held = DungeonRun.liveGc
+    local same = held and DungeonRun.liveGcDepth == (DungeonRun.LiveRooms(rawget(held, "next") or {})[1] or {}).depth
+    local hold = held and (same and 60 or 0) or DungeonRun.MISS_HOLD
     if os.clock() - (DungeonRun.findAt or -1e9) < hold then return DungeonRun.liveGc end
     DungeonRun.findAt = os.clock()
     DungeonRun.liveGc = nil
@@ -10077,6 +10271,7 @@ function DungeonRun.FindLive()
                 if #rooms > 0 and d > bestDepth then DungeonRun.liveGc, bestDepth = t, d end
             end
         end
+        DungeonRun.liveGcDepth = bestDepth
     end)
     return DungeonRun.liveGc
 end
@@ -10307,7 +10502,7 @@ DungeonRun.ITEMS = {
     { id = "gold_branch", kind = "shop", name = "Golden Branch", effect = "-15% Placement/Upgrade Cost" },
     { id = "gold_shroom", kind = "shop", name = "Golden Mushroom", effect = "-30% Placement/Upgrade Cost" },
     { id = "bow2", kind = "shop", name = "Longbow", effect = "+30% Range" },
-    { id = "philosophers_stone", kind = "shop", name = "Philosopher's Stone", effect = "All chests become rare chests (id not seen yet)" },
+    { id = "philosophers_stone", kind = "shop", name = "Philosopher's Stone", effect = "Converts the chests held now to rare chests" },
     -- (curse ids from the run's _items; names / effects from the AA wiki's Dungeon page, 2026-10-25)
     { id = "_curse_money", kind = "shrine", name = "Curse of Money", effect = "-10% Hoard drops" },
     { id = "_curse_fly", kind = "shrine", name = "Curse of Flight", effect = "+20% chance of flying enemies" },
@@ -10330,10 +10525,12 @@ DungeonRun.WIKI_EFFECTS = {
     ["axe"] = "+50% Physical crit chance", ["solar cleaver"] = "+100% Physical crit chance", ["sylvanthorn"] = "+150% Range",
     ["elf bow"] = "+50% Range", ["reaper scythe"] = "+75% boss damage", ["celestial blade"] = "+777% True damage",
     ["scimitar"] = "+75% attack", ["sword"] = "+30% damage", ["ninja belt"] = "-12% attack speed",
-    ["glacial axe"] = "Enemies 30% slower", ["philosophers stone"] = "All chests become rare chests",
+    ["glacial axe"] = "Enemies 30% slower", ["philosophers stone"] = "Converts the chests held now to rare chests",
     ["shimmering moon fragment"] = "+1 star Star Remnant per chest",
     -- (not on the wiki: seen in a shop marked [*], 1100 coins - owner screenshot 2026-10-26)
     ["stormbringer"] = "-50% Attack cooldown",
+    -- (shop items from the owner's screenshots 2026-10-26, not on the wiki)
+    ["dagger"] = "+15% Attack", ["bow"] = "+20% Range",
     ["curse of wind"] = "Enemies +25% faster", ["curse of frenzy"] = "Enemies +50% faster", ["curse of burst"] = "+100% Burst trait",
     ["curse of shielding"] = "Enemies +3 shield", ["curse of armor"] = "+100% Armor trait", ["curse of chaos"] = "All curses random",
     ["curse of eruption"] = "+24 explosive death range", ["curse of explosion"] = "+12 explosive death range",
@@ -10432,13 +10629,63 @@ function DungeonRun.LearnItemIcons()
         saveConfig()
     end
 end
--- Which item to buy: WANT items first (in the shop's order), then the wish-list / default order;
--- never an AVOID item, never one whose known price is over the coins.
+-- Item picks (owner 2026-10-26: tap a row to select it, glowing = yes). itemPrefs[id] = "prefer"
+-- (selected) | "avoid" (not selected) | nil = the script's recommendation (an older save with item
+-- choices: nil was ANY = selected). Recommended = worth buying for this team (value > 0.3); a curse is
+-- recommended when it is not a dangerous one (> -4).
+function DungeonRun.ItemScore(id) return DungeonRun.ItemValue(DungeonRun.ItemText(id)) end
+function DungeonRun.ItemRecommended(id)
+    local v, curse = DungeonRun.ItemScore(id)
+    if curse then return v > -4 end
+    return v > 0.3
+end
+function DungeonRun.ItemSelected(id, prefs)
+    local p = (prefs or DungeonRun.itemPrefs or {})[id]
+    if p == "avoid" then return false end
+    if p == "prefer" or DungeonRun.legacyPicks then return true end
+    return DungeonRun.ItemRecommended(id)
+end
+-- Value stars for a page's items: blessings ranked by the team score (top third 3, middle 2, low 1);
+-- curses by danger (skulls, 3 = most dangerous). Returns stars[id] = { n = 1..3, curse = bool }.
+function DungeonRun.ItemStars(items)
+    local stars, groups = {}, { [false] = {}, [true] = {} }
+    for _, it in ipairs(items) do
+        local v, curse = DungeonRun.ItemScore(it.id)
+        table.insert(groups[curse and true or false], { id = it.id, v = v })
+    end
+    for curse, g in pairs(groups) do
+        table.sort(g, function(a, b) if curse then return a.v < b.v end return a.v > b.v end)
+        local k = #g
+        for i, e in ipairs(g) do
+            stars[e.id] = { n = i <= math.ceil(k / 3) and 3 or (i <= math.ceil(2 * k / 3) and 2 or 1), curse = curse }
+        end
+    end
+    return stars
+end
+-- "Recommended for your team": the 3-5 best blessings by the team score (5 at most, 3 when fewer are
+-- worth buying, never one worth nothing).
+function DungeonRun.TopItems(items)
+    local g, good = {}, 0
+    for _, it in ipairs(items) do
+        local v, curse = DungeonRun.ItemScore(it.id)
+        if not curse and v > 0 then
+            table.insert(g, { id = it.id, v = v })
+            if v > 0.3 then good = good + 1 end
+        end
+    end
+    table.sort(g, function(a, b) return a.v > b.v end)
+    local top = {}
+    for i = 1, math.min(#g, math.min(5, math.max(3, good))) do top[g[i].id] = i end
+    return top
+end
+-- Which item to buy: the wish-list first, then the item worth most to this team. My picks: only
+-- selected items (glowing rows), the best first; Auto: the script's own choice (worth > 0.3).
+-- Never one whose known price is over the coins.
 function DungeonRun.ShopPick(items, money)
     local auto = DungeonRun.mode == "Auto"
-    local prefs = auto and {} or DungeonRun.itemPrefs or {}
     local list = type(items) == "table" and items or {}
     local function idOf(it) return string.lower(tostring(type(it) == "table" and it.id or it)) end
+    local function allowed(id) return auto or DungeonRun.ItemSelected(id) end
     -- (the price on the page's row first: Bow 221 with 194 coins was tried and refused, 23:44 2026-10-25)
     local function affordable(id)
         -- (a refused item: only again with more coins than at the refusal)
@@ -10447,32 +10694,21 @@ function DungeonRun.ShopPick(items, money)
         local price = (DungeonRun.pagePrices or {})[id] or DungeonRun.PRICES[id]
         return not price or not money or money >= price
     end
-    -- (owner 2026-10-25: Philosopher's Stone first - every chest after it is rare - while the run has
-    -- chests to come; never when set to AVOID)
-    if (DungeonRun.lastDepth or 0) < 18 then
-        for i, it in ipairs(list) do
-            local id = idOf(it)
-            if id:find("philosoph", 1, true) and prefs[id] ~= "avoid" and affordable(id) then return i, id end
-        end
-    end
-    for i, it in ipairs(list) do
-        local id = idOf(it)
-        if prefs[id] == "prefer" and affordable(id) then return i, id end
-    end
     local wishes = auto and {} or DungeonRun.wishes()
     for _, w in ipairs(wishes) do
         for i, it in ipairs(list) do
             local id = idOf(it)
-            if id:find(w, 1, true) and prefs[id] ~= "avoid" and affordable(id) then return i, id end
+            if id:find(w, 1, true) and allowed(id) and affordable(id) then return i, id end
         end
     end
-    -- (no wish-list: the item worth most to THIS team - DungeonRun.ItemValue; worth almost nothing: kept)
+    -- (no wish-list: the item worth most to THIS team - DungeonRun.ItemValue; Auto keeps the coins for
+    -- one worth almost nothing, My picks buys what was selected)
     local best, bestI, bestId
     for i, it in ipairs(list) do
         local id = idOf(it)
-        if prefs[id] ~= "avoid" and affordable(id) then
+        if allowed(id) and affordable(id) then
             local v = DungeonRun.ItemValue(DungeonRun.ItemText(id))
-            if v > 0.3 and (not best or v > best) then best, bestI, bestId = v, i, id end
+            if (v > 0.3 or not auto) and (not best or v > best) then best, bestI, bestId = v, i, id end
         end
     end
     return bestI, bestId
@@ -10494,11 +10730,13 @@ function DungeonRun.PageStep(st, page)
             local ok, answer = DungeonRun.Call("dungeon_buy_shop", slot, st)
             pcall(DungeonRun.Log, string.format("dungeon_buy_shop(%d) %s -> %s, answered %s", slot, id, ok and "bought" or "nothing", clip(tostring(answer), 40)))
             pcall(Lobby.ShareLog, "dungeon: shop bought " .. id .. (ok and "" or " - refused"))
-            if ok then return 1 end
-            -- (refused: never tried again this run, and the shop is left at once)
-            DungeonRun.refused = DungeonRun.refused or {}
-            DungeonRun.refused[id] = tonumber(money) or math.huge
-            DungeonRun.buyStop = DungeonRun.liveSeq or 0
+            -- (refused: not tried again unless there is more money; the next pick runs at once and the shop
+            -- is left as soon as nothing affordable and wanted is left - a cheaper Dagger after a refused Lamp)
+            if not ok then
+                DungeonRun.refused = DungeonRun.refused or {}
+                DungeonRun.refused[id] = tonumber(money) or math.huge
+            end
+            return 1
         end
     elseif kind == "6" then
         local gold, normal = tonumber(st.goldKeys) or 0, tonumber(st.silverKeys) or 0
@@ -11002,51 +11240,99 @@ function DungeonRun.DumpPages()
     end
 end
 
--- The game's data modules, once per script load: every entry for a dungeon item / curse id we know,
--- with its fields (AAMacro/dungeon_data_dump.txt); an image / icon field becomes that item's picture.
+-- Item pictures from the game itself (owner 2026-10-26: most rows still showed the generic icon). Once per
+-- script load (again 60 s after a new id): every ModuleScript in ReplicatedStorage whose path names data /
+-- dungeon / item / relic / blessing / curse / shop / shrine is required and walked for the item ids we know
+-- (plus the ones seen so far); an image / icon field becomes that item's picture. The game's DungeonUI is
+-- searched too, for objects NAMED by an item id (its templates). Everything found goes to
+-- AAMacro/dungeon_items_dump.txt (pull it with adb when nothing is found).
+DungeonRun.SEED_IDS = { "sword1", "sword2", "bow1", "bow2", "icebane", "hook", "boots", "chest_mock_item", "gold_branch",
+    "gold_shroom", "dagger", "dagger1", "ninja_belt", "stormbringer", "axe", "genie_lamp", "philosophers_stone", "_curse_money",
+    "_curse_super_armored", "_curse_fly", "_curse_regen", "_curse_speed", "_curse_health", "_curse_shop" }
+DungeonRun.SCAN_WORDS = { "data", "dungeon", "item", "relic", "blessing", "curse", "shop", "shrine" }
+DungeonRun.IMAGE_KEYS = { "image", "icon", "img", "thumb", "texture", "decal" }
 function DungeonRun.ScanData()
-    if DungeonRun.dataScanned then return end
-    DungeonRun.dataScanned = true
+    if DungeonRun.dataScanned or os.clock() - (DungeonRun.scanAt or -1e9) < 60 then return end
+    DungeonRun.dataScanned, DungeonRun.scanAt = true, os.clock()
     local ids = {}
+    for _, id in ipairs(DungeonRun.SEED_IDS) do ids[id] = true end
     for _, kind in ipairs({ "shop", "shrine" }) do
         for _, it in ipairs(DungeonRun.ItemList(kind)) do ids[it.id] = true end
     end
-    local lines, found = { "# dungeon data " .. os.date("%Y-%m-%d %H:%M:%S") }, {}
+    for id in pairs(Lobby.cfg.dungeonItems or {}) do ids[id] = true end
+    local lines, maybe, found, modules = {}, {}, {}, 0
     Lobby.cfg.dungeonItemIcons = Lobby.cfg.dungeonItemIcons or {}
+    local icons = Lobby.cfg.dungeonItemIcons
+    local function imageOf(k, x)
+        local lk = string.lower(tostring(k))
+        for _, w in ipairs(DungeonRun.IMAGE_KEYS) do
+            if lk:find(w, 1, true) and (type(x) == "string" or type(x) == "number") then
+                local img = type(x) == "number" and ("rbxassetid://" .. x) or tostring(x)
+                if img:find("%d") then return img end
+            end
+        end
+    end
     pcall(function()
-        for _, m in ipairs(ReplicatedStorage.src.Data:GetDescendants()) do
-            if m:IsA("ModuleScript") then
-                local ok, mod = pcall(require, m)
-                local function walk(v, key, depth)
-                    if type(v) ~= "table" or depth > 4 or #lines > 600 then return end
-                    local id = ids[tostring(key)] and tostring(key) or (type(v.id) == "string" and ids[v.id] and v.id)
-                    if id then
-                        local fields = {}
-                        for k, x in pairs(v) do
-                            if type(x) == "string" or type(x) == "number" or type(x) == "boolean" then
-                                table.insert(fields, tostring(k) .. "=" .. clip(tostring(x), 60))
-                                local lk = string.lower(tostring(k))
-                                if (lk:find("image", 1, true) or lk:find("icon", 1, true)) and not Lobby.cfg.dungeonItemIcons[id] then
-                                    local img = type(x) == "number" and ("rbxassetid://" .. x) or tostring(x)
-                                    if img:find("%d") then
-                                        Lobby.cfg.dungeonItemIcons[id] = { image = img }
-                                        table.insert(found, id .. "=" .. img)
-                                    end
+        for _, m in ipairs(ReplicatedStorage:GetDescendants()) do
+            if m:IsA("ModuleScript") and #lines < 1500 then
+                local path = string.lower(m:GetFullName())
+                local hit = false
+                for _, w in ipairs(DungeonRun.SCAN_WORDS) do if path:find(w, 1, true) then hit = true break end end
+                if hit then
+                    local ok, mod = pcall(require, m)
+                    if ok and type(mod) == "table" then
+                        modules = modules + 1
+                        local dungeonish = path:find("dungeon", 1, true) or path:find("relic", 1, true) or path:find("blessing", 1, true) or path:find("curse", 1, true)
+                        local function walk(v, key, depth)
+                            if type(v) ~= "table" or depth > 5 or #lines > 1500 then return end
+                            local id = ids[tostring(key)] and tostring(key) or (type(v.id) == "string" and ids[v.id] and v.id)
+                            local fields, img = {}, nil
+                            for k, x in pairs(v) do
+                                if type(x) == "string" or type(x) == "number" or type(x) == "boolean" then
+                                    table.insert(fields, tostring(k) .. "=" .. clip(tostring(x), 60))
+                                    img = img or imageOf(k, x)
                                 end
                             end
+                            if id then
+                                table.sort(fields)
+                                table.insert(lines, m:GetFullName() .. " [" .. id .. "] " .. table.concat(fields, " "))
+                                if img and not icons[id] then icons[id] = { image = img } table.insert(found, id .. "=" .. img) end
+                            elseif img and dungeonish and #maybe < 300 then
+                                table.sort(fields)
+                                table.insert(maybe, m:GetFullName() .. " [" .. tostring(key) .. "] " .. table.concat(fields, " "))
+                            end
+                            for k, x in pairs(v) do walk(x, k, depth + 1) end
                         end
-                        table.sort(fields)
-                        table.insert(lines, m:GetFullName() .. " [" .. id .. "] " .. table.concat(fields, " "))
+                        walk(mod, m.Name, 0)
                     end
-                    for k, x in pairs(v) do walk(x, k, depth + 1) end
                 end
-                if ok then walk(mod, m.Name, 0) end
             end
         end
     end)
-    if hasFileApi() then writefile("AAMacro/dungeon_data_dump.txt", table.concat(lines, "\n")) end
+    -- the game's own windows: objects named by an item id (its templates)
+    local ui = {}
+    pcall(function()
+        local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+            local id = string.lower(d.Name)
+            if ids[id] then
+                local imgObj = (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d or d:FindFirstChildWhichIsA("ImageLabel", true)
+                local img = imgObj and tostring(imgObj.Image) or ""
+                if img ~= "" and img ~= DungeonRun.SHOP_ICON then
+                    table.insert(ui, d:GetFullName() .. " image=" .. img)
+                    if not icons[id] then icons[id] = { image = img } table.insert(found, id .. "=" .. img .. " (ui)") end
+                end
+            end
+        end
+    end)
+    if hasFileApi() then
+        writefile("AAMacro/dungeon_items_dump.txt", table.concat({ "# dungeon items " .. os.date("%Y-%m-%d %H:%M:%S") ..
+            " - " .. modules .. " modules read", "## entries for known ids", table.concat(lines, "\n"),
+            "## other entries with an image in dungeon / relic / blessing / curse modules", table.concat(maybe, "\n"),
+            "## GUI objects named by an item id", table.concat(ui, "\n") }, "\n"))
+    end
     if #found > 0 then
-        pcall(DungeonRun.Log, "item icons from data " .. table.concat(found, ", "))
+        pcall(DungeonRun.Log, "item icons from the game " .. table.concat(found, ", "))
         saveConfig()
     end
 end
@@ -11260,7 +11546,8 @@ end
 DungeonRun.COLORS = { bg = Color3.fromRGB(24, 24, 30), panel = Color3.fromRGB(44, 44, 54), on = Color3.fromRGB(60, 130, 240),
     prefer = Color3.fromRGB(40, 150, 80), avoid = Color3.fromRGB(180, 55, 55), text = Color3.fromRGB(235, 235, 240),
     frame = Color3.fromRGB(14, 14, 20), gold = Color3.fromRGB(255, 205, 60), dim = Color3.fromRGB(190, 190, 200),
-    preferEdge = Color3.fromRGB(110, 230, 140), avoidEdge = Color3.fromRGB(255, 120, 120) }
+    preferEdge = Color3.fromRGB(110, 230, 140), avoidEdge = Color3.fromRGB(255, 120, 120),
+    picked = Color3.fromRGB(62, 70, 92), glow = Color3.fromRGB(255, 215, 90) }
 function DungeonRun.OpenSetup()
     pcall(function() if DungeonRun.setupGui then DungeonRun.setupGui:Destroy() end end)
     pcall(DungeonRun.FindIcons)
@@ -11360,13 +11647,25 @@ function DungeonRun.OpenSetup()
             sub.TextColor3 = draft.mode == m[2] and C.text or C.dim
         end)
     end
-    -- one page per room type (owner 2026-10-25: tap the room TILE to open its page - its WANT / ANY /
-    -- AVOID, and SHOP: buying + the items like the game's shop window, SHRINE: the buffs, CHEST: gold
-    -- chests). Back returns; everything goes to the draft until Save & Close.
+    -- Select by tap (owner 2026-10-26): a selected row / room tile glows (border + brighter), tap again =
+    -- not selected. My picks: tap to change; Auto: read-only, the glow shows what the script picks.
+    local function glow(b, isOn)
+        local stroke
+        pcall(function()
+            stroke = Instance.new("UIStroke")
+            stroke.Thickness, stroke.Color, stroke.Parent = 2, C.glow, b
+        end)
+        table.insert(paint, function()
+            if not b.Parent then return end
+            local on = isOn()
+            b.BackgroundColor3 = on and C.picked or C.panel
+            if stroke then pcall(function() stroke.Transparency = on and 0 or 1 end) end
+        end)
+    end
     local pageFrame
     local function closePage() pcall(function() pageFrame:Destroy() end) pageFrame = nil repaint() end
-    -- (owner 2026-10-25: like the game's shop - icon, yellow name, effect under it, a WANT / ANY / AVOID
-    -- pill on the right; rows in groups: shop by what they do, shrine blessings first then curses by danger)
+    -- (owner 2026-10-25: like the game's shop - icon, yellow name, effect under it; rows in groups: shop
+    -- by what they do, shrine blessings first then curses by danger)
     local function itemGroup(it)
         local text = string.lower(it.name .. " " .. it.effect)
         if it.kind == "shrine" then
@@ -11380,6 +11679,9 @@ function DungeonRun.OpenSetup()
         if text:find("luck", 1, true) or text:find("chest", 1, true) then return 4, "Chest luck" end
         return 5, "Special"
     end
+    -- (owner 2026-10-26: "Recommended for your team" on top, open; the other groups folded - tap the
+    -- header; open groups are remembered for this session only)
+    DungeonRun.openGroups = DungeonRun.openGroups or {}
     local function itemList(kind, top, parent)
         local list = Instance.new("ScrollingFrame")
         list.Name, list.Position, list.Size = "List", UDim2.new(0, 8, 0, top), UDim2.new(1, -16, 0, 300 - top)
@@ -11387,42 +11689,64 @@ function DungeonRun.OpenSetup()
         list.Parent = parent
         pcall(function() Instance.new("UICorner").Parent = list end)
         local items = DungeonRun.ItemList(kind)
+        local stars, best = DungeonRun.ItemStars(items), DungeonRun.TopItems(items)
         local sorted = {}
         for i, it in ipairs(items) do
             local g, title = itemGroup(it)
+            if best[it.id] then g, title, i = 0, "Recommended for your team", best[it.id] end
             table.insert(sorted, { it = it, g = g, title = title, i = i })
         end
         table.sort(sorted, function(a, b) if a.g ~= b.g then return a.g < b.g end return a.i < b.i end)
-        local y, lastGroup = 4, nil
-        for _, e in ipairs(sorted) do
-            local it = e.it
-            if e.g ~= lastGroup then
-                lastGroup = e.g
-                local head = label(e.title, 8, y, 300, 20, 12, list)
-                head.Name, head.TextColor3 = "Group_" .. e.title, C.dim
-                y = y + 22
-            end
-            local row = Instance.new("Frame")
-            row.Name, row.Position, row.Size = "Row_" .. it.id, UDim2.new(0, 4, 0, y), UDim2.new(1, -14, 0, 58)
-            row.BackgroundColor3, row.BorderSizePixel = C.panel, 0
-            row.Parent = list
-            pcall(function() Instance.new("UICorner").Parent = row end)
-            DungeonRun.ItemIconOn(row, it, 6, 7, 44)
-            local name = label(it.name, 58, 6, 142, 20, 14, row)
-            name.TextColor3 = C.gold
-            local eff = label(it.effect, 58, 28, 142, 24, 11, row)
-            eff.TextColor3 = C.dim
-            -- the 3-way pill: WANT / ANY / AVOID, the chosen one lit
-            for j, o in ipairs({ { "WANT", "prefer", C.prefer }, { "ANY", nil, C.on }, { "AVOID", "avoid", C.avoid } }) do
-                local b = button(o[1], 204 + (j - 1) * 46, 15, 44, 28, function() draft.itemPrefs[it.id] = o[2] repaint() end, row)
-                b.Name, b.TextSize = "Pick_" .. it.id .. "_" .. o[1], 11
-                table.insert(paint, function()
-                    if b.Parent then b.BackgroundColor3 = draft.itemPrefs[it.id] == o[2] and o[3] or C.panel end
-                end)
-            end
-            y = y + 62
+        local counts = {}
+        for _, e in ipairs(sorted) do counts[e.g] = (counts[e.g] or 0) + 1 end
+        local layout
+        local function row(it, y)
+            local b = button("", 4, y, 336, 58, function()
+                if draft.mode == "Auto" then return end
+                draft.itemPrefs[it.id] = DungeonRun.ItemSelected(it.id, draft.itemPrefs) and "avoid" or "prefer"
+                repaint()
+            end, list)
+            b.Name, b.AutoButtonColor = "Pick_" .. it.id, false
+            DungeonRun.ItemIconOn(b, it, 6, 7, 44)
+            label(it.name, 58, 6, 196, 20, 14, b).TextColor3 = C.gold
+            local st = stars[it.id] or { n = 1 }
+            local mark = label(string.rep(st.curse and "☠" or "★", st.n), 256, 6, 74, 20, 13, b)
+            mark.Name, mark.TextXAlignment, mark.TextColor3 = "Stars_" .. it.id, Enum.TextXAlignment.Right, st.curse and C.avoidEdge or C.gold
+            label(it.effect, 58, 28, 270, 24, 11, b).TextColor3 = C.dim
+            glow(b, function()
+                if draft.mode == "Auto" then return DungeonRun.ItemRecommended(it.id) end
+                return DungeonRun.ItemSelected(it.id, draft.itemPrefs)
+            end)
         end
-        pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, y + 4) end)
+        layout = function()
+            list:ClearAllChildren()
+            local y, lastGroup, open = 4, nil, true
+            for _, e in ipairs(sorted) do
+                if e.g ~= lastGroup then
+                    lastGroup = e.g
+                    local key = kind .. "/" .. e.title
+                    open = e.g == 0 or DungeonRun.openGroups[key] == true
+                    local head = button("", 4, y, 336, 24, function()
+                        DungeonRun.openGroups[key] = not DungeonRun.openGroups[key] or nil
+                        layout()
+                    end, list)
+                    head.Name, head.BackgroundTransparency = "Head_" .. e.title, 1
+                    label(e.g == 0 and "" or (open and "▾" or "▸"), 4, 2, 14, 20, 12, head).TextColor3 = C.dim
+                    local t = label(e.title, 20, 2, 240, 20, 12, head)
+                    t.Name, t.TextColor3 = "Group_" .. e.title, e.g == 0 and C.gold or C.dim
+                    local n = label("(" .. counts[e.g] .. ")", 262, 2, 68, 20, 12, head)
+                    n.TextXAlignment, n.TextColor3 = Enum.TextXAlignment.Right, C.dim
+                    y = y + 26
+                end
+                if open then
+                    row(e.it, y)
+                    y = y + 62
+                end
+            end
+            pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, y + 4) end)
+            repaint()
+        end
+        layout()
     end
     local function openPage(t)
         pcall(function() if pageFrame then pageFrame:Destroy() end end)
@@ -11433,31 +11757,24 @@ function DungeonRun.OpenSetup()
         local page = pageFrame
         DungeonRun.IconOn(page, t, 0, 0, 30).Position = UDim2.new(0, 12, 0, 0)
         label(t .. " room", 50, 2, 200, 26, 16, page)
-        -- this room: WANT / ANY / AVOID
-        for i, o in ipairs({ { "WANT", "prefer", C.prefer }, { "ANY", nil, C.on }, { "AVOID", "avoid", C.avoid } }) do
-            local b = button(o[1], 12 + (i - 1) * 120, 34, 114, 32, function() draft.prefs[t] = o[2] repaint() end, page)
-            b.Name = "Room_" .. o[1]
-            table.insert(paint, function()
-                if b.Parent then b.BackgroundColor3 = draft.prefs[t] == o[2] and o[3] or C.panel end
-            end)
-        end
-        label("WANT = go there, AVOID = skip it, ANY = let the script decide", 12, 68, 356, 18, 11, page).TextColor3 = C.dim
+        label(draft.mode == "Auto" and "Auto picks these - glowing = yes (switch to My picks to change)" or "Tap to select - glowing = yes",
+            12, 32, 356, 20, 11, page).TextColor3 = C.dim
         if t == "SHOP" then
-            label("Buy in shops (WANT items first, never AVOID)", 12, 92, 280, 26, 13, page)
-            local shopBtn = button("", 300, 90, 68, 28, function() draft.autoShop = not draft.autoShop repaint() end, page)
+            label("Buy in shops", 12, 58, 280, 26, 13, page)
+            local shopBtn = button("", 300, 56, 68, 28, function() draft.autoShop = not draft.autoShop repaint() end, page)
             table.insert(paint, function()
                 if not shopBtn.Parent then return end
                 shopBtn.Text = draft.autoShop and "ON" or "OFF"
                 shopBtn.BackgroundColor3 = draft.autoShop and C.prefer or C.panel
             end)
-            itemList("shop", 124, page)
+            itemList("shop", 90, page)
         elseif t == "SHRINE" then
-            label("Offers are scored and ACCEPT / DENY is tapped on the game's page (its own call is not recorded yet)", 12, 92, 356, 28, 11, page)
-            itemList("shrine", 124, page)
+            label("Offers are scored; an offer with an item that is not selected is denied", 12, 54, 356, 30, 11, page)
+            itemList("shrine", 90, page)
         elseif t == "CHEST" then
-            label("Gold chests", 12, 94, 100, 28, 14, page)
+            label("Gold chests", 12, 62, 100, 28, 14, page)
             for i, c in ipairs({ { "Open now", "now" }, { "Keep for the end", "end" } }) do
-                local b = button(c[1], 112 + (i - 1) * 130, 92, 124, 30, function() draft.goldChests = c[2] repaint() end, page)
+                local b = button(c[1], 112 + (i - 1) * 130, 60, 124, 30, function() draft.goldChests = c[2] repaint() end, page)
                 table.insert(paint, function() if b.Parent then b.BackgroundColor3 = draft.goldChests == c[2] and C.on or C.panel end end)
             end
         end
@@ -11498,12 +11815,13 @@ function DungeonRun.OpenSetup()
         button("Back", 130, 312, 120, 34, closePage, pageFrame)
     end
     button("Items", 138, 366, 74, 32, openRunItems)
-    -- the five room tiles: icon, name and its choice; a tap opens the room's page
-    local tapHelp = label("Tap a room to set it up", 12, 140, 356, 22, 12)
+    -- the room tiles: icon and name; a tap selects / unselects the room (not selected = only when
+    -- nothing else is offered)
+    local tapHelp = label("Tap to select - glowing = yes", 12, 140, 356, 22, 12)
     -- Auto: nothing to choose, only what it will do (owner 2026-10-25)
     local summary = label("", 12, 140, 356, 116, 13)
     summary.Text = "What Auto does:\n- Rooms: the one your team's damage hits hardest; a room lost before counts harder\n"
-        .. "- Shops: buys cost-down items, then range\n- Gold (rare) chests: kept for the end - Secret Unit chance\n- Shrines: skipped until supported"
+        .. "- Shops: buys what is worth most to your team\n- Gold (rare) chests: kept for the end - Secret Unit chance\n- Shrines: scored, accepted when worth it"
     table.insert(paint, function()
         tapHelp.Visible = draft.mode ~= "Auto"
         summary.Visible = draft.mode == "Auto"
@@ -11512,30 +11830,25 @@ function DungeonRun.OpenSetup()
         -- (the tiles share the row's width: 4 since BATTLE has none - owner 2026-10-25)
         local n = #DungeonRun.ROOM_TYPES
         local w = math.floor((356 - (n - 1) * 8) / n)
-        local tile = button("", 12 + (i - 1) * (w + 8), 166, w, 86, function() openPage(t) end)
-        DungeonRun.IconOn(tile, t, 0, 6, 40)
+        local tile = button("", 12 + (i - 1) * (w + 8), 166, w, 86, function()
+            draft.prefs[t] = draft.prefs[t] ~= "avoid" and "avoid" or nil
+            repaint()
+        end)
+        tile.Name, tile.AutoButtonColor = "Tile_" .. t, false
+        DungeonRun.IconOn(tile, t, 0, 10, 40)
         local name = Instance.new("TextLabel")
-        name.BackgroundTransparency, name.TextColor3, name.Font, name.TextSize = 1, C.text, Enum.Font.GothamBold, 11
-        name.Position, name.Size = UDim2.new(0, 0, 0, 48), UDim2.new(1, 0, 0, 16)
+        name.BackgroundTransparency, name.TextColor3, name.Font, name.TextSize = 1, C.text, Enum.Font.GothamBold, 12
+        name.Position, name.Size = UDim2.new(0, 0, 0, 58), UDim2.new(1, 0, 0, 18)
         name.Text, name.Parent = t, tile
-        local state = Instance.new("TextLabel")
-        state.BackgroundTransparency, state.TextColor3, state.Font, state.TextSize = 1, C.text, Enum.Font.GothamBold, 12
-        state.Position, state.Size, state.Parent = UDim2.new(0, 0, 0, 64), UDim2.new(1, 0, 0, 18), tile
-        local stroke
-        pcall(function()
-            stroke = Instance.new("UIStroke")
-            stroke.Thickness, stroke.Parent = 3, tile
-        end)
-        table.insert(paint, function()
-            tile.Visible = draft.mode ~= "Auto"
-            local p = draft.prefs[t]
-            tile.BackgroundColor3 = p == "prefer" and C.prefer or (p == "avoid" and C.avoid or C.panel)
-            state.Text = p == "prefer" and "WANT" or (p == "avoid" and "AVOID" or "ANY")
-            if stroke then pcall(function() stroke.Color = p == "prefer" and C.preferEdge or (p == "avoid" and C.avoidEdge or C.panel) end) end
-        end)
+        glow(tile, function() return draft.prefs[t] ~= "avoid" end)
+        table.insert(paint, function() tile.Visible = draft.mode ~= "Auto" end)
+    end
+    -- the pages with settings and items (both modes: read-only in Auto)
+    for i, p in ipairs({ { "Shop items", "SHOP" }, { "Shrine", "SHRINE" }, { "Chests", "CHEST" } }) do
+        button(p[1], 12 + (i - 1) * 120, 258, 114, 26, function() openPage(p[2]) end).TextSize = 12
     end
     -- the next rooms with the score reason (Auto)
-    local nextLabel = label("", 12, 262, 356, 84, 12)
+    local nextLabel = label("", 12, 290, 356, 72, 12)
     table.insert(paint, function()
         local st = DungeonRun.Read()
         local lines = {}
@@ -11555,7 +11868,13 @@ function DungeonRun.OpenSetup()
     button("Copy report", 12, 366, 120, 32, function() pcall(DungeonRun.Report) end)
     button("Save & Close", 218, 366, 150, 32, function()
         DungeonRun.mode, DungeonRun.prefs, DungeonRun.shrineRule, DungeonRun.openRareAtEnd = draft.mode, draft.prefs, draft.shrineRule, draft.openRare
+        if DungeonRun.legacyPicks then
+            for _, kind in ipairs({ "shop", "shrine" }) do
+                for _, it in ipairs(DungeonRun.ItemList(kind)) do draft.itemPrefs[it.id] = draft.itemPrefs[it.id] or "prefer" end
+            end
+        end
         DungeonRun.autoShop, DungeonRun.goldChests, DungeonRun.itemPrefs = draft.autoShop, draft.goldChests, draft.itemPrefs
+        DungeonRun.picksV2, DungeonRun.legacyPicks = true, nil
         DungeonRun.acceptShrines = draft.shrineRule ~= "never"
         DungeonRun.ApplyPrefs()
         DungeonRun.blocked = nil
@@ -12486,7 +12805,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-003159"
+Lobby.VERSION = "20261026-010245"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -12586,6 +12905,9 @@ function Lobby.ShareGame(win, wave)
         candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units,
         -- (normal stages: BAD_SPOT count and whether the learned road reached our base)
         bad = not State.eventMode and (AutoPlaceModule.badCount or 0) or nil,
+        -- (last-wave boss chase used / the boss reached our base on the last wave)
+        chase = (AutoPlaceModule.chase or {}).used and 1 or 0,
+        bossBase = (AutoPlaceModule.chase or {}).lastProg ~= nil and ((AutoPlaceModule.chase or {}).reached and 1 or 0) or nil,
         -- (v2: road length, buff coverage % of the team's damage)
         rl = not State.eventMode and AutoPlaceModule.V2.lastLen or nil,
         bs = (function()
@@ -12948,13 +13270,30 @@ Lobby.VOTE_WAYS = { "remote" }
 -- The button for a text on screen (a card's title, a spell's name): the label's nearest
 -- button ancestor, else a button inside the label's card (3 levels up). Clicking it lets the
 -- game send its own call, with the right arguments.
-function Lobby.ButtonFor(text, root)
-    local want = string.lower(tostring(text)):gsub("^%s+", ""):gsub("%s+$", "")
+-- Every label / button text in PlayerGui, lower case without rich-text tags -> its objects. One walk
+-- answers all the ButtonFor questions of a loop ("You Died!", "Next", "Open Dungeon", "Dungeon"...
+-- each walked the whole PlayerGui: a 50-200 ms hitch every 5 s, lag review 2026-10-26).
+local function plainText(d) return (string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+function Lobby.TextIndex(root)
+    local index = {}
     root = root or Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     for _, d in ipairs(root and root:GetDescendants() or {}) do
         if d:IsA("TextLabel") or d:IsA("TextButton") then
-            local plain = string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
-            if plain == want and isOnScreen(d) and not isOwnGui(d) then
+            local plain = plainText(d)
+            if plain ~= "" then
+                index[plain] = index[plain] or {}
+                table.insert(index[plain], d)
+            end
+        end
+    end
+    return index
+end
+function Lobby.ButtonFor(text, root)
+    local want = (string.lower(tostring(text)):gsub("^%s+", ""):gsub("%s+$", ""))
+    local index = root and Lobby.TextIndex(root) or Scan.Cached("textIndex", Lobby.TextIndex)
+    for _, d in ipairs(index[want] or {}) do
+        do
+            if d.Parent and plainText(d) == want and isOnScreen(d) and not isOwnGui(d) then
                 -- the label itself or its closest container that holds a button (the card's
                 -- own frame comes before the frame holding all the cards)
                 local node = d
@@ -13674,7 +14013,8 @@ for name, fn in pairs({ show_roguelike_options = function(sec, o)
     task.spawn(pcall, function()
         -- (no time limit: a slow map load passed the old 5 s wait and left cards and spells unheard
         -- all game - real game 2026-10-24, Cursed Festival)
-        ReplicatedStorage:WaitForChild("endpoints"):WaitForChild("server_to_client"):WaitForChild(name).OnClientEvent:Connect(fn)
+        local conn = ReplicatedStorage:WaitForChild("endpoints"):WaitForChild("server_to_client"):WaitForChild(name).OnClientEvent:Connect(fn)
+        table.insert(State.connections, conn)
     end)
 end
 
