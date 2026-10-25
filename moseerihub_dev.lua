@@ -149,7 +149,7 @@ local Lobby = {
         -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
         -- simulator's damage per map place at full upgrade over the owner's roster (2026-10-24).
-        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3, shareData = true, shareNoticed = false, autoUpdate = true,
+        eventBrain = true, maxSpellsHeld = 2, eventListsVer = 3, shareData = true, shareNoticed = false, autoUpdate = true, dailyDoneOn = "",
         eventAlways = { "judar_evolved", "cid_evolved", "bee_girl_evolved", "homura_evolved", "sakamoto_evolved", "nagumo_evolved", "saber_evolved", "frieren_evolved", "monet_evolved", "jiraiya_evolved", "emilia" },
         eventNever = { "armin", "stain_evolved", "narberal_evolved", "hakari_evolved", "ghostkun_evolved", "demiurge_evolved", "sabo_evolved", "aokiji_evolved", "gildarts_evolved", "akainu_evolved", "natsu_evolved", "caesarclown_evolved", "vanilla_ice_evolved" } }, -- (config only: Watch logs without pausing the lobby automation)
     watchLog = {},
@@ -2119,7 +2119,7 @@ function AutoFarmModule.OnGameEnd()
         done = true
     end
     if not done then
-        notify("Auto " .. tostring(goal) .. ": could not find the button. Run Settings > Scan game on the result screen and send me the log.")
+        notify("Auto " .. tostring(goal) .. ": could not find the button. Settings > Tools > Copy full log on the result screen and send it.")
     end
     endHandling = false
 end
@@ -5894,7 +5894,7 @@ end
 local function shortStatus()
     local lines = { AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage), "Status: " .. AutoPlaceModule.status }
     if AutoPlaceModule.idleMoney then
-        table.insert(lines, string.format("Idle money: %d ¥ – turn on Auto upgrade", math.floor(AutoPlaceModule.idleMoney)))
+        table.insert(lines, string.format("Idle money: %d ¥ – turn on AUTO", math.floor(AutoPlaceModule.idleMoney)))
     end
     if AutoPlaceModule.danger then table.insert(lines, "DANGER: damage units first") end
     if AutoPlaceModule.problem then table.insert(lines, "Problem: " .. AutoPlaceModule.problem) end
@@ -7436,6 +7436,10 @@ task.spawn(function()
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
             pcall(Lobby.TowerResult, win)
+            if tostring(State.stage or ""):lower():find("daily", 1, true) then
+                Lobby.cfg.dailyDoneOn = os.date("%Y-%m-%d")
+                pcall(saveConfig)
+            end
             -- (Infinity Mansion: a won room offers a first-clear reward that must be claimed before the
             -- next room - left unclaimed, the game sat 20 min and was kicked, 2026-10-25. The call's
             -- arguments were never recorded: tried with none, the answer noted in share_log.txt)
@@ -8700,11 +8704,18 @@ for _, t in ipairs({ { "home", "Home" }, { "lobby", "Lobby" }, { "dungeon", "Dun
     { "macro", "Macro" }, { "settings", "Settings" } }) do
     UIRef.tabs[t[1]] = tabGroup:Tab({ Name = t[2], Image = "rbxassetid://10734950309" })
 end
--- Home: "Play" (left), "More" (right)
+-- Home: "Play" (left); "Auto join" and "Fool's Hunt" (right) are added by the Lobby block.
 UIRef.play = UIRef.tabs.home:Section({ Side = "Left" })
-UIRef.more = UIRef.tabs.home:Section({ Side = "Right" })
 UIRef.play:Header({ Text = "Play" })
-UIRef.more:Header({ Text = "More" })
+-- Settings sections are made here (in screen order) so the blocks below can fill them:
+-- set-once options and troubleshooting live there, not on Home.
+UIRef.set = {}
+for _, s in ipairs({ { "general", "Left", "General" }, { "webhook", "Left", "Discord" }, { "profile", "Left", "Profiles" },
+    { "perf", "Right", "Performance" }, { "tools", "Right", "Tools" }, { "advanced", "Right", "Advanced" } }) do
+    UIRef.set[s[1]] = UIRef.tabs.settings:Section({ Side = s[2] })
+    UIRef.set[s[1]]:Header({ Text = s[3] })
+end
+UIRef.more = UIRef.set.advanced
 -- Each tab is built inside its own do-block: Lua 5.1 allows only 200 active locals per
 -- function, and the section variables are not needed once a tab is built.
 local macroTab, refreshProfileUI
@@ -8760,7 +8771,7 @@ UIRef.savedDropdown = controlSection:Dropdown({
 }, "SavedMacros")
 UIRef.nameInput = controlSection:Input({
     Name = "Macro name",
-    Placeholder = "auto from stage",
+    Placeholder = "auto",
     AcceptedCharacters = "All",
     Callback = function(text)
         if type(text) == "string" then
@@ -8777,7 +8788,7 @@ fileSection:Button({ Name = "Export", Callback = ProfilesModule.Export })
 fileSection:Button({ Name = "Import folder", Callback = ProfilesModule.ImportFolder })
 UIRef.pasteInput = fileSection:Input({
     Name = "Paste JSON",
-    Placeholder = "paste here",
+    Placeholder = "paste",
     AcceptedCharacters = "All",
     Callback = ProfilesModule.ImportText,
 }, "PasteJSON")
@@ -8838,6 +8849,43 @@ Controls.homeAuto = home:Toggle({
         AutoPlaceModule.HomeAuto(on)
     end,
 }, "HomeAuto")
+Controls.homeMode = home:Dropdown({
+    Name = "Mode",
+    Multi = false,
+    Required = true,
+    Options = { "Fast farm", "Safe" },
+    Default = AutoPlace.preset == "Safe" and "Safe" or "Fast farm",
+    Callback = function(v)
+        if syncing or not configReady or type(v) ~= "string" or v == AutoPlace.preset then return end
+        AutoPlaceModule.ApplyPreset(v)
+    end,
+}, "HomeMode")
+UIRef.homeStatus = home:Paragraph({ Header = "Now", Body = "Waiting for a game" })
+UIRef.autoReplayToggle = home:Toggle({
+    Name = "Auto replay",
+    Default = AutoFarm.autoReplay,
+    Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoReplay")
+UIRef.autoNextToggle = home:Toggle({
+    Name = "Auto next stage",
+    Default = AutoFarm.autoNextStage,
+    Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoNext")
+UIRef.autoLeaveToggle = home:Toggle({
+    Name = "Auto leave on loss",
+    Default = AutoFarm.autoLeave,
+    Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoLeave")
+Controls.autoStart = home:Toggle({
+    Name = "Vote start",
+    Default = AutoFarm.autoStart,
+    Callback = function(on) AutoFarm.autoStart = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoStart")
+Controls.autoSkip = home:Toggle({
+    Name = "Skip waves",
+    Default = AutoFarm.autoSkip,
+    Callback = function(on) AutoFarm.autoSkip = on; refreshAutoStatus(); saveConfig() end,
+}, "AutoSkip")
 -- the player places the units; AUTO still upgrades them, buffs, uses skills, freezes, targets
 Controls.placeMyself = home:Toggle({
     Name = "Place units myself",
@@ -8925,43 +8973,6 @@ Controls.dontPlace = home:Dropdown({
         saveConfig()
     end,
 }, "AutoPlaceDontPlace")
-Controls.homeMode = home:Dropdown({
-    Name = "Mode",
-    Multi = false,
-    Required = true,
-    Options = { "Fast farm", "Safe" },
-    Default = AutoPlace.preset == "Safe" and "Safe" or "Fast farm",
-    Callback = function(v)
-        if syncing or not configReady or type(v) ~= "string" or v == AutoPlace.preset then return end
-        AutoPlaceModule.ApplyPreset(v)
-    end,
-}, "HomeMode")
-UIRef.homeStatus = home:Paragraph({ Header = "Now", Body = "Waiting for a game" })
-UIRef.autoReplayToggle = home:Toggle({
-    Name = "Auto replay",
-    Default = AutoFarm.autoReplay,
-    Callback = function(on) AutoFarm.autoReplay = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoReplay")
-UIRef.autoNextToggle = home:Toggle({
-    Name = "Auto next stage",
-    Default = AutoFarm.autoNextStage,
-    Callback = function(on) AutoFarm.autoNextStage = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoNext")
-UIRef.autoLeaveToggle = home:Toggle({
-    Name = "Auto leave on loss",
-    Default = AutoFarm.autoLeave,
-    Callback = function(on) AutoFarm.autoLeave = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoLeave")
-Controls.autoStart = home:Toggle({
-    Name = "Vote start",
-    Default = AutoFarm.autoStart,
-    Callback = function(on) AutoFarm.autoStart = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoStart")
-Controls.autoSkip = home:Toggle({
-    Name = "Skip waves",
-    Default = AutoFarm.autoSkip,
-    Callback = function(on) AutoFarm.autoSkip = on; refreshAutoStatus(); saveConfig() end,
-}, "AutoSkip")
 function AutoPlaceModule.StageLine()
     local stage = Stage.Pretty()
     if not stage then return "Lobby" end
@@ -8969,16 +8980,28 @@ function AutoPlaceModule.StageLine()
     return stage .. (wave and wave > 0 and (" · Wave " .. wave) or "")
 end
 function AutoPlaceModule.HomeLine()
-    local first = (AutoPlaceModule.StatusText and select(2, pcall(AutoPlaceModule.StatusText)) or ""):match("Status: ([^\n]*)")
-    local where = AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage or "lobby")
-    return where .. " | " .. (first or AutoPlaceModule.status or "Off")
+    local parts = { AutoPlace.enabled and (AutoPlace.preset == "Safe" and "Safe" or "Fast farm") or "AUTO off" }
+    local where = AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage or "Lobby")
+    table.insert(parts, where)
+    if where == "Lobby" then
+        if Lobby.statusText then table.insert(parts, Lobby.statusText) end
+    else
+        local units = #ownedUnits()
+        if units > 0 then table.insert(parts, units .. " units") end
+        local first = (AutoPlaceModule.StatusText and select(2, pcall(AutoPlaceModule.StatusText)) or ""):match("Status: ([^\n]*)")
+        table.insert(parts, first or AutoPlaceModule.status or "Off")
+        local card = State.eventMode and Lobby.cardsTaken and Lobby.cardsTaken[#Lobby.cardsTaken]
+        if card then table.insert(parts, "Card: " .. tostring(card[2])) end
+    end
+    if DungeonRun.enabled and DungeonRun.status then table.insert(parts, "Dungeon: " .. tostring(DungeonRun.status)) end
+    return table.concat(parts, " · ")
 end
 AutoPlaceModule.refreshHome = function()
     pcall(function() UIRef.homeStatus:UpdateBody(AutoPlaceModule.HomeLine()) end)
 end
 end
 
--- Auto Place: presets (Mode on Home) and Home > More (full status). Auto upgrade, damage
+-- Auto Place: presets (Mode on Home) and Settings > Advanced (full status). Auto upgrade, damage
 -- unit spots, smart freeze, sell farms at the end and auto target have no switch of their
 -- own: AUTO turns them on and Mode picks the spots (Fast farm = Fast clear, Safe = Safe).
 do
@@ -9022,7 +9045,7 @@ AutoPlaceModule.refreshUI = function()
 end
 end
 
--- Home > More: buff troubleshooting (buff rotation and unit skills have no switch of their
+-- Settings > Advanced: buff troubleshooting (buff rotation and unit skills have no switch of their
 -- own: AUTO turns them on; check interval, buff gap, buff length and min units keep their
 -- saved / default values)
 do
@@ -9033,7 +9056,7 @@ UnitAIModule.refreshLearnedUI = function()
     local kinds = {}
     for kind, e in pairs(UnitAI.learned) do table.insert(kinds, kind .. " (" .. e.name .. ")") end
     table.sort(kinds)
-    pcall(function() learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, ", ") or "nothing learned (uses use_active_attack)") end)
+    pcall(function() learnedParagraph:UpdateBody(#kinds > 0 and table.concat(kinds, ", ") or "none (default skill call)") end)
 end
 UnitAIModule.refreshLearnedUI()
 section:Button({ Name = "Forget learned buffs", Callback = UnitAIModule.ForgetLearned })
@@ -9063,6 +9086,7 @@ end
 function Lobby.Worlds(mode)
     local out, seen, rank = {}, {}, {}
     if mode == "Infinity Mansion" then return { "Infinity Mansion" } end
+    if mode == "Challenges" then return { "Daily, then normal", "Daily", "Normal" } end
     if mode == "Event" then
         local out = { "Any event" }
         for _, e in ipairs(Lobby.EventList()) do table.insert(out, e.name) end
@@ -9165,15 +9189,58 @@ function Lobby.Rooms(kind)
     return want
 end
 
+-- Every lobby room with the texts shown on it (billboards / surface labels), once per lobby visit,
+-- to AAMacro/lobby_rooms.txt - to tell Challenge, Daily Challenge and Raid rooms apart (all are
+-- number-only names: _lobbytemplate316 = Challenge, 320 = Daily, watched 2026-10-25).
+function Lobby.SaveRoomTexts()
+    if not hasFileApi() then return end
+    local lines = { "# lobby rooms " .. os.date("%Y-%m-%d %H:%M:%S") }
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Model") and d.Name:find("^_lobbytemplate") then
+            local texts, seen = {}, {}
+            for _, t in ipairs(d:GetDescendants()) do
+                if (t:IsA("TextLabel") or t:IsA("TextButton")) and t.Text ~= "" then
+                    local x = tostring(t.Text):gsub("<[^>]->", ""):gsub("%s+", " ")
+                    if not seen[x] and #texts < 12 then seen[x] = true table.insert(texts, x) end
+                end
+            end
+            local ok, cf = pcall(function() return d:GetPivot().Position end)
+            table.insert(lines, string.format("%s | %s | %s", d.Name, ok and string.format("%.0f,%.0f", cf.X, cf.Z) or "?", table.concat(texts, " / ")))
+        end
+    end
+    pcall(writefile, "AAMacro/lobby_rooms.txt", table.concat(lines, "\n"))
+end
+
+-- Challenges (watched 2026-10-25): walk-in rooms with the level already set - request_join_lobby(room)
+-- then request_start_game(room). Normal = _lobbytemplate316, Daily = _lobbytemplate320 (from Watch;
+-- AAMacro/lobby_rooms.txt lists each room's texts to confirm). Daily is played once a day: after a
+-- daily game the date is kept and "Daily, then normal" goes on with the normal room.
+Lobby.CHALLENGE_ROOMS = { Normal = "_lobbytemplate316", Daily = "_lobbytemplate320" }
+function Lobby.JoinChallenge()
+    local c = Lobby.cfg
+    local want = c.world == "Daily" and "Daily" or c.world == "Normal" and "Normal"
+        or (c.dailyDoneOn == os.date("%Y-%m-%d") and "Normal" or "Daily")
+    local room = Lobby.CHALLENGE_ROOMS[want]
+    local join, start = getAARemote("request_join_lobby"), getAARemote("request_start_game")
+    if not (join and start) then Lobby.Status("Auto join: the game's join calls were not found") return false end
+    local ok, reply = pcall(function() return join:InvokeServer(room) end)
+    if not ok or reply == false then Lobby.Status("Auto join: " .. want .. " challenge room refused") return false end
+    task.wait(1)
+    pcall(function() start:InvokeServer(room) end)
+    Lobby.Status("Auto join: " .. want .. " challenge (" .. room .. ")")
+    return true
+end
+
 function Lobby.Status(text)
     Lobby.statusText = text
-    pcall(function() UIRef.lobbyStatus:UpdateBody(text) end)
+    if AutoPlaceModule.refreshHome then pcall(AutoPlaceModule.refreshHome) end
 end
 
 -- Auto join, as watched in the game: walk into a room, lock the level (room, level id,
 -- friends only, difficulty), start. A room that refuses is skipped for the next one.
 function Lobby.Join()
     local c = Lobby.cfg
+    if c.mode == "Challenges" then return Lobby.JoinChallenge() end
     if c.mode == "Event" then
         -- watched: walking into an event room is all it takes, the room starts by itself. The
         -- join call alone (made from across the lobby) did not start it in the real game, so
@@ -9257,7 +9324,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-132301"
+Lobby.VERSION = "20261025-142202"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -9536,6 +9603,7 @@ function Lobby.Loop()
             local ok, err = pcall(Lobby.RecordWaves)
             Lobby.recordError = not ok and tostring(err) or nil
         end
+        if inLobbyNow and not Lobby.roomsSaved then Lobby.roomsSaved = true task.delay(10, pcall, Lobby.SaveRoomTexts) end
         if inLobbyNow and not Lobby.listsFilled and Lobby.RefreshLists and os.clock() - (Lobby.lastRefresh or -1e9) > 30 then
             Lobby.lastRefresh = os.clock()
             pcall(Lobby.RefreshLists, false)
@@ -10554,32 +10622,64 @@ local function set(key) return function(v) if syncing then return end Lobby.cfg[
 local function setList(key) return function(v) if syncing then return end Lobby.cfg[key] = namesOf(v) saveConfig() end end
 local function picked(list) local m = {} for _, n in ipairs(list) do m[n] = true end return m end
 
-local join = UIRef.tabs.lobby:Section({ Side = "Left" })
+-- (the lobby's status goes to the Home status line: Lobby.Status)
+local join = UIRef.tabs.home:Section({ Side = "Right" })
 join:Header({ Text = "Auto join" })
-UIRef.lobbyStatus = join:Paragraph({ Header = "Status", Body = "In the lobby: clean bag, open eggs, use a portal, else Auto join. Infinity Mansion learns your room from one tower game. Rewards wait for Watch." })
 join:Toggle({ Name = "Auto join", Default = Lobby.cfg.autoJoin, Callback = set("autoJoin") }, "LobbyAutoJoin")
-local worldDropdown
+-- (owner 2026-10-25: hard to see what is picked) one line says what Auto join starts; Event
+-- uses only the event picker, Infinity Mansion only Difficulty - the unused fields are hidden
+-- when this MacLib has SetVisibility, and the line leaves them out either way
+local worldDropdown, actDropdown, diffDropdown
+local joinLine = join:Paragraph({ Header = "Joins", Body = "" })
+local function joinRefresh()
+    local c = Lobby.cfg
+    local m = tostring(c.mode)
+    local usesStage = m ~= "Infinity Mansion"
+    local usesAct = m ~= "Event" and m ~= "Infinity Mansion" and m ~= "Challenges"
+    local usesDiff = m ~= "Event" and m ~= "Challenges"
+    local parts = { m }
+    if usesStage then table.insert(parts, c.world ~= "" and tostring(c.world) or "no stage picked") end
+    if usesAct then table.insert(parts, "Act " .. tostring(c.act)) end
+    if usesDiff then table.insert(parts, tostring(c.difficulty)) end
+    pcall(function() joinLine:UpdateBody(table.concat(parts, " · ")) end)
+    for _, d in ipairs({ { worldDropdown, usesStage }, { actDropdown, usesAct }, { diffDropdown, usesDiff } }) do
+        pcall(function() d[1]:SetVisibility(d[2]) end)
+    end
+end
 join:Dropdown({ Name = "Join mode", Multi = false, Required = true,
-    Options = { "Story", "Infinite", "Legend", "Raid", "Infinity Mansion", "Event" }, Default = Lobby.cfg.mode,
+    Options = { "Event", "Challenges", "Story", "Infinite", "Legend", "Raid", "Infinity Mansion" }, Default = Lobby.cfg.mode,
     Callback = function(v)
         if syncing or type(v) ~= "string" then return end
+        local changed = v ~= Lobby.cfg.mode
         Lobby.cfg.mode = v
+        local list = Lobby.Worlds(v)
+        -- a stage from the old mode's list would not match this one (only on a real change, and
+        -- only when the list is known: the game data can be missing at start)
+        if changed and #list > 0 and not table.find(list, Lobby.cfg.world) then
+            Lobby.cfg.world = (v == "Event" or v == "Infinity Mansion" or v == "Challenges") and list[1] or ""
+        end
         saveConfig()
+        local was = syncing
+        syncing = true
         pcall(function()
             worldDropdown:ClearOptions()
-            worldDropdown:InsertOptions(Lobby.Worlds(v))
+            worldDropdown:InsertOptions(list)
+            if Lobby.cfg.world ~= "" then worldDropdown:UpdateSelection(Lobby.cfg.world) end
         end)
+        syncing = was
+        joinRefresh()
     end }, "LobbyMode")
 worldDropdown = join:Dropdown({ Name = "Stage", Multi = false, Required = false,
     Options = Lobby.Worlds(Lobby.cfg.mode), Default = Lobby.cfg.world ~= "" and Lobby.cfg.world or nil,
-    Callback = function(v) if syncing or type(v) ~= "string" then return end Lobby.cfg.world = v saveConfig() end }, "LobbyWorld")
-join:Dropdown({ Name = "Act", Multi = false, Required = true, Options = { "1", "2", "3", "4", "5", "6" },
-    Default = Lobby.cfg.act, Callback = set("act") }, "LobbyAct")
-join:Dropdown({ Name = "Difficulty", Multi = false, Required = true, Options = { "Normal", "Hard" },
-    Default = Lobby.cfg.difficulty, Callback = set("difficulty") }, "LobbyDifficulty")
-join:Toggle({ Name = "Friends only (join)", Default = Lobby.cfg.joinFriends, Callback = set("joinFriends") }, "LobbyJoinFriends")
+    Callback = function(v) if syncing or type(v) ~= "string" then return end Lobby.cfg.world = v saveConfig() joinRefresh() end }, "LobbyWorld")
+actDropdown = join:Dropdown({ Name = "Act", Multi = false, Required = true, Options = { "1", "2", "3", "4", "5", "6" },
+    Default = Lobby.cfg.act, Callback = function(v) set("act")(v) joinRefresh() end }, "LobbyAct")
+diffDropdown = join:Dropdown({ Name = "Difficulty", Multi = false, Required = true, Options = { "Normal", "Hard" },
+    Default = Lobby.cfg.difficulty, Callback = function(v) set("difficulty")(v) joinRefresh() end }, "LobbyDifficulty")
+joinRefresh()
+join:Toggle({ Name = "Friends only", Default = Lobby.cfg.joinFriends, Callback = set("joinFriends") }, "LobbyJoinFriends")
 -- (stays on across teleports until turned off: the script restarts in every stage)
-join:Toggle({ Name = "Watch (teach me once)", Default = Lobby.cfg.watch, Callback = function(on)
+UIRef.set.tools:Toggle({ Name = "Watch game calls", Default = Lobby.cfg.watch, Callback = function(on)
     local was = State.watching
     if Lobby.cfg.watch ~= on then Lobby.cfg.watch = on saveConfig() end
     if not Lobby.SetWatch(on) then notify("Watch needs hookmetamethod (this executor has none).") return end
@@ -10590,7 +10690,7 @@ join:Toggle({ Name = "Watch (teach me once)", Default = Lobby.cfg.watch, Callbac
 end }, "LobbyWatch")
 
 local portals, items, eggs = Lobby.BagNames()
-local portal = UIRef.tabs.lobby:Section({ Side = "Right" })
+local portal = UIRef.tabs.lobby:Section({ Side = "Left" })
 portal:Header({ Text = "Portals" })
 portal:Toggle({ Name = "Use portals", Default = Lobby.cfg.usePortals, Callback = set("usePortals") }, "LobbyUsePortals")
 local portalDropdown = portal:Dropdown({ Name = "Portal", Multi = false, Required = false, Options = portals,
@@ -10652,26 +10752,27 @@ UIRef.lobbyEggs = gifts:Dropdown({ Name = "Eggs to open", Multi = true, Required
     Default = picked(Lobby.cfg.eggs), Callback = setList("eggs") }, "LobbyEggs")
 gifts:Toggle({ Name = "Claim rewards", Default = Lobby.cfg.claim, Callback = set("claim") }, "LobbyClaim")
 gifts:Paragraph({ Header = "Never buys", Body = "Daily, quests, level and battle pass rewards; eggs you already own." })
+local quick = UIRef.tabs.home:Section({ Side = "Right" })
+quick:Header({ Text = "Fool's Hunt" })
+quick:Toggle({ Name = "Event Auto Place", Default = Lobby.cfg.eventBrain ~= false, Callback = set("eventBrain") }, "EventBrain")
+quick:Toggle({ Name = "Vote cards", Default = Lobby.cfg.eventCards, Callback = set("eventCards") }, "EventCards")
+quick:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = set("eventSpells") }, "EventSpells")
+UIRef.set.general:Toggle({ Name = "Auto update", Default = Lobby.cfg.autoUpdate ~= false, Callback = set("autoUpdate") }, "EventAutoUpdate")
+UIRef.set.general:Toggle({ Name = "Share game data", Default = Lobby.cfg.shareData ~= false, Callback = set("shareData") }, "EventShare")
+task.delay(5, pcall, Lobby.ShareNotice)
 local event = UIRef.tabs.event:Section({ Side = "Left" })
 event:Header({ Text = "Fool's Hunt" })
-event:Paragraph({ Header = "How", Body = "Lobby > Join mode: Event joins it. Home AUTO places the random units. The map changes every game." })
-event:Toggle({ Name = "Vote cards", Default = Lobby.cfg.eventCards, Callback = set("eventCards") }, "EventCards")
+event:Paragraph({ Header = "How", Body = "Home: Join mode Event, then AUTO. Switches are on Home; fine-tuning is here." })
 event:Dropdown({ Name = "Card choice", Multi = false, Required = true, Options = { "Most coins", "Safest" },
     Default = Lobby.cfg.cardMode, Callback = set("cardMode") }, "EventCardMode")
-event:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = set("eventSpells") }, "EventSpells")
-event:Toggle({ Name = "Event Auto Place", Default = Lobby.cfg.eventBrain ~= false, Callback = set("eventBrain") }, "EventBrain")
-event:Toggle({ Name = "Share game data", Default = Lobby.cfg.shareData ~= false, Callback = set("shareData") }, "EventShare")
-event:Toggle({ Name = "Auto update", Default = Lobby.cfg.autoUpdate ~= false, Callback = set("autoUpdate") }, "EventAutoUpdate")
-event:Paragraph({ Header = "Shared", Body = "Every game's result: map, wave, win, cards, units (level, trait, golden). No name or account info." })
-task.delay(5, pcall, Lobby.ShareNotice)
 event:Dropdown({ Name = "Always place", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
     Default = picked(Lobby.cfg.eventAlways or {}), Callback = setList("eventAlways") }, "EventAlways")
-event:Dropdown({ Name = "Never place (X)", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
+event:Dropdown({ Name = "Never place", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
     Default = picked(Lobby.cfg.eventNever or {}), Callback = setList("eventNever") }, "EventNever")
 event:Dropdown({ Name = "Spells kept waiting", Multi = false, Required = true, Options = { "1", "2", "3" },
     Default = tostring(Lobby.cfg.maxSpellsHeld or 2), Callback = function(v) if syncing then return end Lobby.cfg.maxSpellsHeld = tonumber(v) or 2 saveConfig() end }, "EventSpellsHeld")
-event:Paragraph({ Header = "Event Auto Place", Body = "Its own brain for Fool's Hunt (normal stages keep the usual Auto Place). Always place: placed first, never X'd as weak. Never place: X'd at once so the slot rolls again. The rest: placed when not far below the team. Every X and placement says why in the Home log." })
-event:Paragraph({ Header = "Cards", Body = "Most coins: the Bad card that hurts the team least (+0.3 coins each), a Good card when the base is hurt. Safest: Good cards first." })
+event:Paragraph({ Header = "Units", Body = "Always place: placed first, never removed. Never place: removed at once so the slot rolls again." })
+event:Paragraph({ Header = "Cards", Body = "Most coins: the least harmful Bad card. Safest: Good cards first." })
 end
 
 -- TAB: Dungeon (data first; see MODULE: Dungeon Run)
@@ -10701,13 +10802,10 @@ end
 do
 local settingsTab = UIRef.tabs.settings
 
-local generalSection = settingsTab:Section({ Side = "Left" })
-local webhookSection = settingsTab:Section({ Side = "Left" })
-local profileSection = settingsTab:Section({ Side = "Left" })
-Controls.perfSection = settingsTab:Section({ Side = "Right" })
-local toolsSection = settingsTab:Section({ Side = "Right" })
+local generalSection, webhookSection, profileSection = UIRef.set.general, UIRef.set.webhook, UIRef.set.profile
+Controls.perfSection = UIRef.set.perf
+local toolsSection = UIRef.set.tools
 
-profileSection:Header({ Text = "Profiles" })
 local profileNameText = Profile.name
 local profileDropdown
 
@@ -10734,7 +10832,7 @@ profileDropdown = profileSection:Dropdown({
 }, "ProfileList")
 Controls.profileName = profileSection:Input({
     Name = "Profile name",
-    Placeholder = "e.g. Namak farm",
+    Placeholder = "name",
     Default = Profile.name,
     AcceptedCharacters = "All",
     Callback = function(text) profileNameText = text or "" end,
@@ -10761,7 +10859,6 @@ profileSection:Button({
     end,
 })
 
-generalSection:Header({ Text = "General" })
 UIRef.antiAfkToggle = generalSection:Toggle({
     Name = "Anti-AFK",
     Default = false,
@@ -10781,10 +10878,9 @@ generalSection:Toggle({
     end,
 }, "PlaceOnPath")
 
-webhookSection:Header({ Text = "Discord" })
 Controls.webhookUrl = webhookSection:Input({
     Name = "Webhook URL",
-    Placeholder = "https://discord.com/api/webhooks/...",
+    Placeholder = "paste URL",
     Default = Webhook.Masked(),
     AcceptedCharacters = "All",
     Callback = function(text) Webhook.SetUrl(text) end,
@@ -10807,7 +10903,6 @@ webhookSection:Button({
 })
 
 -- Performance: all off by default, saved in config (Tools.perf)
-Controls.perfSection:Header({ Text = "Performance" })
 for _, p in ipairs({ { "lowGraphics", "Low graphics", "PerfLowGraphics" }, { "hideEffects", "Hide effects", "PerfHideEffects" },
     { "noDecor", "Hide map decor", "PerfNoDecor" }, { "white", "White screen", "PerfWhiteScreen" } }) do
     Controls["perf_" .. p[1]] = Controls.perfSection:Toggle({
@@ -10830,7 +10925,6 @@ Controls.perf_fpsCap = Controls.perfSection:Dropdown({
         ToolsModule.SetPerf("fpsCap", v); saveConfig()
     end,
 }, "PerfFpsCap")
-toolsSection:Header({ Text = "Tools" })
 toolsSection:Button({ Name = "Copy game report", Callback = AutoPlaceModule.MapReport })
 toolsSection:Button({ Name = "Save unit catalog", Callback = function() pcall(AutoPlaceModule.SaveCatalog) end })
 toolsSection:Button({ Name = "Copy full log", Callback = RecordingModule.CopyLog })
