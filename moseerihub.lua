@@ -7288,6 +7288,21 @@ task.spawn(function()
             session.lossStreak = win and 0 or (session.lossStreak or 0) + 1
             pcall(AutoPlaceModule.OnResult, win)
             pcall(Lobby.TowerResult, win)
+            -- (Infinity Mansion: a won room offers a first-clear reward that must be claimed before the
+            -- next room - left unclaimed, the game sat 20 min and was kicked, 2026-10-25. The call's
+            -- arguments were never recorded: tried with none, the answer noted in share_log.txt)
+            if win and tostring(State.stage or ""):lower():find("infinity mansion", 1, true) then
+                task.spawn(function()
+                    task.wait(2)
+                    local r = getAARemote("claim_first_clear_rewards")
+                    if not r then return end
+                    local ok, res = pcall(function()
+                        if r:IsA("RemoteEvent") then r:FireServer() return "fired" end
+                        return r:InvokeServer()
+                    end)
+                    pcall(Lobby.ShareLog, "tower first-clear claim: " .. tostring(ok) .. " " .. tostring(res))
+                end)
+            end
             task.spawn(function(w)
                 local ok, err = pcall(Lobby.ShareGame, win, w)
                 if not ok then
@@ -8481,7 +8496,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-104239"
+Lobby.VERSION = "20261025-104644"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
