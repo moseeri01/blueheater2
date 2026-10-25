@@ -235,6 +235,7 @@ local function buildConfigData()
             mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true,
             prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule, autoShop = DungeonRun.autoShop ~= false,
             goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, lostRooms = DungeonRun.lostRooms, flyMaps = DungeonRun.flyMaps,
+            stuckTotal = DungeonRun.stuckTotal, lastStuck = DungeonRun.lastStuck,
             lives = DungeonRun.lives },
         unitAI = {
             autoAbilities = UnitAI.autoAbilities,
@@ -327,6 +328,7 @@ local function applyConfigData(data)
     DungeonRun.itemPrefs = type(d.itemPrefs) == "table" and d.itemPrefs or {}
     DungeonRun.lostRooms = type(d.lostRooms) == "table" and d.lostRooms or {}
     DungeonRun.flyMaps = type(d.flyMaps) == "table" and d.flyMaps or {}
+    DungeonRun.stuckTotal, DungeonRun.lastStuck = tonumber(d.stuckTotal), type(d.lastStuck) == "string" and d.lastStuck or nil
     -- (every room is a teleport and the script reloads there: Auto dungeon has to come back on)
     pendingToggles.dungeon = d.enabled == true
     local u = data.unitAI or {}
@@ -8438,6 +8440,115 @@ function DungeonRun.OpenWindowStep(st)
     return 2
 end
 
+-- DUNGEON SCREENS (2026-10-25: every stuck run so far was a screen nobody handled). DungeonRun.Screen()
+-- names the one on screen; the watchdog (DungeonRun.Watchdog, lobby loop) taps its primary button when
+-- it stays 20 s with no progress (no dungeon_changed / room entered / lives change).
+--   screen          detected by                                    action (who)                     next screen
+--   click_continue  TextLabel "(Click anywhere to continue)"       tap the popup (Lobby.ClickAnywhere) next reward / room result
+--   you_died        label "You Died!"                              Continue, then chests, continue_death, lobby (Lobby.DiedStep) run over -> lobby
+--   shrine_page     DungeonUI ShrineRoom on screen / page _t "7"   accept by GUI (ShrineStep)        room choice
+--   shop_page       DungeonUI ShopSelection / page _t "1"          buy_shop + continue_shop (PageStep) next page / room choice
+--   chest_page      DungeonUI OpenTreasure / page _t "6"           open_chest(true) + continue_shop  room choice
+--   room_popup      DungeonUI button "Enter" (LevelInfo)           Enter after 8 s (EnterPopupStep)  loading into the room
+--   room_choice     DungeonUI LevelAttributes tiles on screen      dungeon_enter_room (LiveStep)     room popup / loading
+--   start_page      DungeonUI StartHolder.Main.Start               dungeon_start / tap Start         room choice
+--   room_result     Dungeon Room + result screen                   Next, then Open Dungeon (Lobby.Loop) room choice / You Died
+--   in_room         Dungeon Room level data, no result yet         Auto Place plays it               room result
+--   lobby           _MAP_CONFIG.IsLobby                            open the window (OpenWindowStep)  room choice / start page
+--   run over        dungeon_changed({})                            next run when keys (TryStart)     start page / lobby
+DungeonRun.PRIMARY = {
+    room_popup = { "enter" }, room_result = { "next", "open dungeon" }, chest_page = { "open", "continue", "close" },
+    shop_page = { "continue", "leave", "close" }, shrine_page = { "accept", "take", "claim" }, start_page = { "start" },
+    room_choice = {},
+}
+function DungeonRun.Screen()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return "none" end
+    if Lobby.ClickLabel() then return "click_continue", gui end
+    local died = Lobby.ButtonFor("You Died!")
+    if died then return "you_died", died:FindFirstAncestorWhichIsA("LayerCollector") or gui end
+    local ui = gui:FindFirstChild("DungeonUI")
+    if ui and (not ui:IsA("LayerCollector") or ui.Enabled) then
+        for _, p in ipairs({ { "ShrineRoom", "shrine_page" }, { "ShopSelection", "shop_page" }, { "OpenTreasure", "chest_page" } }) do
+            local page = ui:FindFirstChild(p[1], true)
+            if page and isOnScreen(page) then return p[2], page end
+        end
+        if Lobby.ButtonFor("Enter", ui) then return "room_popup", ui end
+        if DungeonRun.ChoiceOpen() then return "room_choice", ui end
+        local start = DungeonRun.StartButton()
+        if start then return "start_page", start.Parent end
+    end
+    if DungeonRun.InRoom() then
+        if AutoFarmModule.ResultsShowing() then return "room_result", gui end
+        return "in_room", gui
+    end
+    if DungeonRun.InLobby() then return "lobby", gui end
+    return "none", gui
+end
+-- A visible button under root whose text / label / name is the word (exact text first, then contains).
+function DungeonRun.FindButton(root, word)
+    local best
+    for _, b in ipairs(root and root:GetDescendants() or {}) do
+        if b:IsA("GuiButton") and isOnScreen(b) and not isOwnGui(b) then
+            local texts = { string.lower(b.Name) }
+            if b:IsA("TextButton") then table.insert(texts, string.lower(tostring(b.Text))) end
+            for _, d in ipairs(b:GetDescendants()) do
+                if d:IsA("TextLabel") then table.insert(texts, string.lower(tostring(d.Text))) end
+            end
+            for _, t in ipairs(texts) do
+                if t == word then return b end
+                if not best and t:find(word, 1, true) then best = b end
+            end
+        end
+    end
+    return best
+end
+-- The same dungeon screen for 20 s with nothing moving: tap its primary button (one tap per 10 s), log
+-- "STUCK <screen> -> ...", count it (shared in the AASTAT row) and dump the screen to dungeon_ui_dump.
+-- In the room, in the lobby and on You Died! (its own careful sequence) nothing is tapped here.
+DungeonRun.STUCK_AFTER, DungeonRun.STUCK_EVERY = 20, 10
+function DungeonRun.Watchdog()
+    if not DungeonRun.enabled then return end
+    local name, root = DungeonRun.Screen()
+    local progress = table.concat({ tostring(DungeonRun.liveSeq or 0), tostring(DungeonRun.enteredAt or 0), tostring(DungeonRun.selSeq or 0) }, ":")
+    local w = DungeonRun.watch
+    if not w or w.name ~= name or w.progress ~= progress then
+        DungeonRun.watch = { name = name, progress = progress, since = os.clock() }
+        return
+    end
+    if name == "in_room" or name == "lobby" or name == "none" or name == "click_continue" or name == "you_died" then return end
+    if os.clock() - w.since < DungeonRun.STUCK_AFTER or os.clock() - (w.tapAt or -1e9) < DungeonRun.STUCK_EVERY then return end
+    w.tapAt = os.clock()
+    local button
+    for _, word in ipairs(DungeonRun.PRIMARY[name] or {}) do
+        button = DungeonRun.FindButton(root, word)
+        if button then break end
+    end
+    if button then Lobby.TapGui(button) end
+    DungeonRun.stuck = (DungeonRun.stuck or 0) + 1
+    DungeonRun.lastStuck = name
+    DungeonRun.stuckTotal = (DungeonRun.stuckTotal or 0) + 1
+    local line = "STUCK " .. name .. " -> " .. (button and ("tapped " .. button.Name) or "no button to tap")
+    pcall(Lobby.ShareLog, "dungeon: " .. line)
+    pcall(DungeonRun.Log, line)
+    -- the screen's buttons and texts, so an unknown screen can be handled later
+    pcall(function()
+        if not hasFileApi() then return end
+        local lines = { "# " .. line .. " " .. os.date("%Y-%m-%d %H:%M:%S") }
+        for _, d in ipairs(root:GetDescendants()) do
+            if #lines >= 200 then break end
+            if (d:IsA("GuiButton") or d:IsA("TextLabel")) and isOnScreen(d) then
+                table.insert(lines, d:GetFullName() .. " | " .. d.ClassName .. ((d:IsA("TextLabel") or d:IsA("TextButton")) and (" | text=" .. clip(tostring(d.Text), 50)) or ""))
+            end
+        end
+        local path = "AAMacro/dungeon_ui_dump.txt"
+        local old = isfile(path) and readfile(path) or ""
+        if #old > 300000 then old = "" end
+        writefile(path, old .. "\n" .. table.concat(lines, "\n"))
+    end)
+    saveConfig()
+end
+
 -- The room popup ("Dungeon Room / <map> / Depth n / Difficulty xN" with a green Enter) left open: a
 -- friend's run stood there (2026-10-25). With it on screen 8 s and no room entered meanwhile, Enter is
 -- tapped by GUI (10 s apart at most) - also the fallback when dungeon_enter_room changed nothing.
@@ -10848,7 +10959,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-214522"
+Lobby.VERSION = "20261025-215004"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -10943,6 +11054,9 @@ function Lobby.ShareGame(win, wave)
         candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units,
         -- (normal stages: BAD_SPOT count and whether the learned road reached our base)
         bad = not State.eventMode and (AutoPlaceModule.badCount or 0) or nil,
+        -- (dungeon games: stuck screens since the last shared dungeon game, the last one by name)
+        stuck = DungeonRun.InRoom() and (DungeonRun.stuckTotal or 0) or nil,
+        stuckAt = DungeonRun.InRoom() and DungeonRun.lastStuck or nil,
         pathOk = (function()
             if State.eventMode or not AutoPlaceModule.Reaches then return nil end
             return AutoPlaceModule.Reaches(AutoPlaceModule.PathPoints()) == true
@@ -10954,6 +11068,7 @@ function Lobby.ShareGame(win, wave)
         body = HttpService:JSONEncode(data)
     end
     local sent, why = Webhook.post(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
+    if sent and data.stuck then DungeonRun.stuckTotal, DungeonRun.lastStuck = 0, nil saveConfig() end
     AutoPlaceModule.Note("game data " .. (sent and "shared" or ("NOT shared - " .. tostring(why))))
     Lobby.ShareLog("sent " .. tostring(sent) .. " " .. tostring(why) .. " (" .. #body .. " chars)")
 end
@@ -11064,6 +11179,46 @@ end
 -- 2 open a gold chest left, 3 open a chest left (the server may want them first), 4 one direct
 -- dungeon_continue_death(), 5 in a room: back to the lobby. Never two sends at once, nothing
 -- repeated (18:05-18:16 2026-10-25: taps every 5 s and three calls in one second, none answered).
+-- "(Click anywhere to continue)" reward popups - every mode (dungeon money, stage / raid / event / lobby
+-- rewards, owner 2026-10-25): no button, a tap on the popup dismisses one item. Up to 6 items per call,
+-- 2 s apart; each item's text logged once. Never while a room choice is open (it needs a real choice).
+Lobby.CLICK_WORDS = { "click anywhere", "tap anywhere" }
+function Lobby.ClickLabel()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if d:IsA("TextLabel") then
+            local t = string.lower(tostring(d.Text))
+            for _, w in ipairs(Lobby.CLICK_WORDS) do
+                if t:find(w, 1, true) and isOnScreen(d) and not isOwnGui(d) then return d end
+            end
+        end
+    end
+end
+function Lobby.ClickAnywhere()
+    for _ = 1, 6 do
+        local label = Lobby.ClickLabel()
+        if not label or DungeonRun.ChoiceOpen() then return end
+        -- the popup: a button around the label, else its top frame under the ScreenGui
+        local node, target = label, nil
+        while node.Parent and not node.Parent:IsA("LayerCollector") do
+            if node:IsA("GuiButton") then target = node break end
+            node = node.Parent
+        end
+        target = target or node
+        local parts = {}
+        for _, d in ipairs(target:GetDescendants()) do
+            if d:IsA("TextLabel") and d ~= label and isOnScreen(d) and tostring(d.Text) ~= "" then table.insert(parts, clip(tostring(d.Text), 40)) end
+        end
+        local item = table.concat(parts, " / ")
+        if item ~= Lobby.lastClickItem then
+            Lobby.lastClickItem = item
+            pcall(Lobby.ShareLog, "reward popup: " .. clip(item, 120) .. " - tapped to continue")
+        end
+        Lobby.TapGui(target)
+        task.wait(2)
+    end
+end
+
 function Lobby.DiedStep(inLobbyNow)
     if not Lobby.ButtonFor("You Died!") then Lobby.died = nil return end
     if DungeonRun.enabled and not DungeonRun.pendingStart then
@@ -11154,6 +11309,8 @@ function Lobby.Loop()
         if State.eventMode and not inLobbyNow then pcall(Lobby.SampleDepth) end
         pcall(DungeonRun.DumpUI)
         pcall(DungeonRun.DumpPages)
+        pcall(Lobby.ClickAnywhere)
+        pcall(DungeonRun.Watchdog)
         -- (Dungeon Run "You Died!" - all lives lost, the run is over: its Continue collects the rewards
         -- and leaves. Left alone it sat there until the idle kick - 2026-10-25. It shows in the lobby too)
         pcall(Lobby.DiedStep, inLobbyNow)
