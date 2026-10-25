@@ -2853,7 +2853,8 @@ function UnitAIModule.StartBuff()
                 local ok, err = pcall(BuffRot.tick)
                 if not ok then BuffInfo.problem = "rotation error: " .. clip(tostring(err), 80) end
             end
-            task.wait(0.25)
+            -- (0.25 s only while a buff rotation is known: each pass reads every unit's stats)
+            task.wait(next(BuffRot.groups) and 0.25 or 1)
         end
     end)
 end
@@ -2943,9 +2944,19 @@ end
 
 -- A hard stage (normal modes only): Hard / Nightmare difficulty, a challenge (Daily Challenge was
 -- lost at wave 3 with 4 farms and one damage unit down), or a stage lost here lately.
-AutoPlaceModule.LONG_RANGE = 1.3      -- range this many times a team unit's = "long range" (bestSpot)
-AutoPlaceModule.COVER_DECAY = 0.7     -- normal stages: road already covered by k damage units counts 0.7^k (bestSpot)
-AutoPlaceModule.HARD_CARRY_LEVEL = 4  -- hard stage: farm upgrades wait until a damage unit is this level
+-- Auto Place v2 knobs (work/placement_method.md; the functions follow placedOf below)
+local PV = {}
+AutoPlaceModule.V2 = PV
+PV.SHORT_ROAD, PV.LONG_ROAD = 250, 350 -- road kinds by the road length (studs): short < 250 <= middle <= 350 < long
+PV.ROAD_STEP = 2.5                     -- lane road point spacing (studs)
+PV.CARRY_LEVEL = 4                     -- short / middle maps: the carry's upgrades to this level come in the order
+PV.NEAR_BEST = 0.9                     -- other damage units stand by the carry when that spot is within 10% of the best
+PV.MARGIN_HIGH, PV.MARGIN_LOW = 1.5, 1.2 -- spending: margin >= high = farms, < low = damage upgrades first
+PV.ENEMY_SPEED = 6                     -- enemy walk speed (studs / s) until measured
+PV.CONE_HALF = math.rad(45)            -- cone attacks: this far either side of the heading
+PV.LINE_HALF = 2.5                     -- line attacks: this wide either side
+PV.REC_TYPE = 1.25                     -- the level's _recommended_damage_types deal this much more
+PV.SLOW_GAIN = 1.3                     -- enemies stay this much longer where a slow unit reaches the same road
 function AutoPlaceModule.Hard()
     if State.eventMode then return false end
     local d = string.lower(tostring(Stage.difficulty or ""))
@@ -3016,37 +3027,6 @@ function AutoPlaceModule.Ends()
         return goal, spawn, true
     end
     return spawn, goal, false
-end
-
--- Road points to SCORE spots with (normal stages): the learned path, plus - while it does not reach
--- our base (PathShort) - points every 2.5 studs on a straight line from its point nearest our base to
--- the base. Spots still come from the learned road and must reach it; this only makes the end of a
--- stub that leads on toward the base worth more than its middle by the spawn.
-AutoPlaceModule.STUB_LEAD = 30
-AutoPlaceModule.STUB_STALL = 10
-function AutoPlaceModule.ScorePath(pts)
-    -- (not in Fast clear: forward on purpose; only a stub that stopped growing STUB_STALL s ago - the
-    -- enemies held / killed by the spawn, Future City; a road still being learned is the hold's job,
-    -- and scoring it toward the base early moved flyer and long-range spots - flying_focus)
-    if State.eventMode or #pts < 8 or AutoPlaceModule.Mode() == "Fast clear" or not AutoPlaceModule.PathShort()
-        or os.clock() - (AutoPlaceModule.pathGrewAt or 0) < AutoPlaceModule.STUB_STALL then return pts end
-    local _, goal = AutoPlaceModule.Ends()
-    if not goal then return pts end
-    local best, bd
-    for _, q in ipairs(pts) do
-        local d = (q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2
-        if not bd or d < bd then best, bd = q, d end
-    end
-    local out = {}
-    for i, q in ipairs(pts) do out[i] = q end
-    -- (30 studs on at most: enough to pull units to the stub end that leads on; the whole line to the
-    -- base outweighed the real road - a long-range unit stood on the road edge, flyers waited)
-    local len = math.sqrt(bd)
-    for s = 2.5, math.min(len, AutoPlaceModule.STUB_LEAD), 2.5 do
-        local t = s / len
-        out[#out + 1] = { best[1] + (goal.X - best[1]) * t, best[2], best[3] + (goal.Z - best[3]) * t }
-    end
-    return out
 end
 
 function AutoPlaceModule.PathShort()
@@ -3163,52 +3143,25 @@ function AutoPlaceModule.Lanes()
     end
     return out
 end
--- One lane's bends in walking order, entrance first: numbered bends by number, the named ones
--- ("final", "spawn") at the end they stand nearer. Direction by the game's names (24 real scans,
--- 2026-10-25): player LANES run "final" (enemy end) -> high .. low -> "spawn" (our base); pve LANES
--- run "spawn" (enemy end) -> 1 .. n -> "final". The base marker is no guide there (132-197 studs off
--- the road end on Mountain Temple / Puppet Island / Sacred Planet); it is used only with no names.
+-- One lane's bends in walking order, entrance first (24 real scans, 2026-10-25): player LANES run "final"
+-- (enemy end) -> numbered bends high to low -> "spawn" (our base), pve LANES the other way round (PV.LaneOrder).
 -- No bend name a number: chained from the bend farthest from our base, nearest bend next.
 function AutoPlaceModule.LaneOrder(bends, g, side)
+    local fixed = PV.LaneOrder(bends, side)
+    if fixed then return fixed end
     local function d2(a, b) return (a.x - b.x) ^ 2 + (a.z - b.z) ^ 2 end
-    local nums, named = {}, {}
-    for _, b in ipairs(bends) do
-        if tonumber(b.name) then nums[#nums + 1] = b else named[#named + 1] = b end
-    end
     local chain = {}
-    if #nums >= 2 then
-        table.sort(nums, function(a, b) return tonumber(a.name) > tonumber(b.name) end)
-        for _, b in ipairs(nums) do chain[#chain + 1] = b end
-        local head, tail = {}, {}
-        for _, b in ipairs(named) do
-            if d2(b, nums[1]) <= d2(b, nums[#nums]) then head[#head + 1] = b else tail[#tail + 1] = b end
+    local start, sd = 1, -1
+    for i, p in ipairs(bends) do if d2(p, g) > sd then start, sd = i, d2(p, g) end end
+    local used = { [start] = true }
+    chain[1] = bends[start]
+    while #chain < #bends do
+        local last, bi, bd = chain[#chain], nil, nil
+        for i, p in ipairs(bends) do
+            if not used[i] and (not bd or d2(last, p) < bd) then bi, bd = i, d2(last, p) end
         end
-        for _, b in ipairs(head) do table.insert(chain, 1, b) end
-        for _, b in ipairs(tail) do chain[#chain + 1] = b end
-    else
-        local start, sd = 1, -1
-        for i, p in ipairs(bends) do if d2(p, g) > sd then start, sd = i, d2(p, g) end end
-        local used = { [start] = true }
-        chain[1] = bends[start]
-        while #chain < #bends do
-            local last, bi, bd = chain[#chain], nil, nil
-            for i, p in ipairs(bends) do
-                if not used[i] and (not bd or d2(last, p) < bd) then bi, bd = i, d2(last, p) end
-            end
-            used[bi] = true
-            chain[#chain + 1] = bends[bi]
-        end
-    end
-    local first = (side == "pve") and "spawn" or "final"
-    local last = (side == "pve") and "final" or "spawn"
-    local flip
-    if #chain >= 2 and (chain[1].name == last or chain[#chain].name == first) then flip = true
-    elseif #chain >= 2 and (chain[1].name == first or chain[#chain].name == last) then flip = false
-    else flip = #chain >= 2 and d2(chain[1], g) < d2(chain[#chain], g) end
-    if flip then
-        local rev = {}
-        for i = #chain, 1, -1 do rev[#rev + 1] = chain[i] end
-        chain = rev
+        used[bi] = true
+        chain[#chain + 1] = bends[bi]
     end
     return chain
 end
@@ -3286,8 +3239,11 @@ local function pathPoints()
     end
     if not State.eventMode and not AutoPlaceModule.sameMapDone[key] and os.clock() - (AutoPlaceModule.sameMapAt[key] or -1e9) >= 1 then
         AutoPlaceModule.sameMapAt[key] = os.clock()
-        if #cur == 0 or not AutoPlaceModule.Reaches(cur) then
-            local same, done = AutoPlaceModule.SameMapPath(key)
+        -- (v2: the map's lanes are the road at load on every normal stage; learned points only add to it)
+        local lanesNow = AutoPlaceModule.LanePath()
+        if lanesNow or #cur == 0 or not AutoPlaceModule.Reaches(cur) then
+            local same, done
+            if lanesNow then same, done = lanesNow, true else same, done = AutoPlaceModule.SameMapPath(key) end
             -- (no complete road seen on this map: the game's lane bends)
             if not done then
                 local lanes = AutoPlaceModule.LanePath()
@@ -3500,7 +3456,8 @@ local TRAITS = {
     unique = { dmg = 4, spa = 0.9, range = 1.1, cap = 1 },
     divine = { dmg = 1.2, spa = 0.9, range = 1.2 },
     celestial = { dmg = 1.3, range = 1.1 },
-    golden = { dmg = 1.3 },
+    golden = { money = 1.5 }, -- ("gives much more money" - game Traits text; owner 2026-10-25: no damage. x1.5 is a
+                              -- guess, the data has no number - AutoPlaceModule.GOLDEN_MONEY)
     reaper = { dmg = 1.15 },
     godspeed = { spa = 0.8 },
     sniper = { range = 1.25 },
@@ -3517,14 +3474,14 @@ TRAITS.ethereal, TRAITS.neuroplasticity = TRAITS.celestial, TRAITS.adept
 local ROMAN = { i = 1, ii = 2, iii = 3 }
 
 function AutoPlaceModule.TraitMods(traits)
-    local m = { dmg = 1, spa = 1, range = 1 }
+    local m = { dmg = 1, spa = 1, range = 1, money = 1 }
     for _, raw in ipairs(traits or {}) do
         local text = string.lower(tostring(raw))
         local word = text:match("^%a+") or text
         local lvl = tonumber(text:match("(%d+)%s*$")) or ROMAN[text:match("%s([iv]+)%s*$") or ""] or 1
         local t = TRAITS[word]
         if t then
-            for _, k in ipairs({ "dmg", "spa", "range" }) do
+            for _, k in ipairs({ "dmg", "spa", "range", "money" }) do
                 local v = t[k]
                 if type(v) == "table" then v = v[math.max(1, math.min(#v, lvl))] end
                 if v then m[k] = m[k] * v end
@@ -3764,12 +3721,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             end
             if ok then
                 local near = c.part ~= nil and AutoPlaceModule.badParts[c.part] == true
-                -- (normal stages: spots by an earlier BAD_SPOT are tried last)
-                if not near and attacks and not State.eventMode and not AutoPlaceModule.rescue then
-                    for _, b in ipairs(AutoPlaceModule.badAreas or {}) do
-                        if (b[1] - c.x) ^ 2 + (b[2] - c.z) ^ 2 < 64 then near = true break end
-                    end
-                end
                 for _, b in ipairs(refused) do
                     local dx, dz = b[1] - c.x, b[2] - c.z
                     if dx * dx + dz * dz < BAD_REACH * BAD_REACH then near = true break end
@@ -3794,6 +3745,29 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         if trust == "name" or (trust ~= "height" and #nf + #nr > 0 and comparable) then free, nearRefused = nf, nr end
     end
     if #free == 0 then free = nearRefused end
+    -- v2 (normal stages): damage / slow by PV.Rank, buff / support by PV.BuffRank; farms below
+    if not State.eventMode and role ~= "farm" then
+        local list
+        if (role == "buff" or role == "support") and (#helpers > 0 or #farms > 0) then
+            list = PV.BuffRank(free, (range and range > 0 and range ~= DEFAULT_RANGE) and range or BUFF_REACH)
+        elseif attacks then
+            local top, sub
+            list, top, sub = PV.Rank(free, AutoPlaceModule.placingT, role, reach, back)
+            -- (placement_dump.json: the top spots of the last few damage placements)
+            local log = {}
+            for i = 1, math.min(30, #list) do
+                local e = list[i]
+                log[i] = { x = math.floor(e.c.x * 10) / 10, z = math.floor(e.c.z * 10) / 10, n = math.floor(e.cov * 10) / 10,
+                    p = math.floor(e.p * 100) / 100, kind = e.c.kind }
+            end
+            table.insert(AutoPlaceModule.scoredLog, { unit = AutoPlaceModule.placingName, range = reach, as = sub, buff = AutoPlaceModule.RangeBuff(),
+                defRange = AutoPlaceModule.DefRangeAt(AutoPlaceModule.placingName or "", 0),
+                best = math.floor(PV.Best(reach, PV.Shape(AutoPlaceModule.placingName or ""), candidates) * 10) / 10,
+                wave = AutoPlaceModule.WaveNumber(), top = log })
+            while #AutoPlaceModule.scoredLog > 4 do table.remove(AutoPlaceModule.scoredLog, 1) end
+        end
+        if list then return list[skip + 1] and list[skip + 1].c end
+    end
     if role == "farm" then
         if #farms == 0 then return free[#free - skip] end
         -- farms side by side (one support unit then reaches them all), on low-value spots
@@ -3820,8 +3794,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
     end
     if role ~= "buff" and role ~= "support" then
         local r = (range and range > 0) and range or DEFAULT_RANGE
-        -- (scores only: the road not learned yet is taken as straight from the known end to our base)
-        local pts = AutoPlaceModule.ScorePath(pts)
         -- Fast clear: prefer spots near the enemy spawn (kills early, waves end sooner);
         -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
         local mode = AutoPlaceModule.Mode()
@@ -3841,7 +3813,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             mode = (AutoPlaceModule.WaveNumber() < (short and 20 or 0)) and "Safe" or "Balanced"
         end
         local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
-        if not State.eventMode then spawn, goal = AutoPlaceModule.Ends() end
         -- (Fool's Hunt: a copy goes next to one of its own kind, inside its reach, so Merge can fold
         -- them - spread over the map, three fujitoras never could)
         local kin = {}
@@ -3853,92 +3824,20 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 end
             end
         end
-        -- (normal stages, owner 2026-10-25: units went down near the enemy spawn) each road point
-        -- weighs by how far along it is (1 = at our base): single-target units hold the last
-        -- stretch, area units lean the same way but less; a long-range unit leaves the spots a
-        -- shorter-range team unit covers best (half of that short cover is taken off its score)
-        local weight, shortR = {}, nil
-        -- (measured from our base only: maps with several spawn lanes, e.g. Dungeon city rooms)
-        if not State.eventMode then
-            -- (over the road learned so far, nearest point to our base = 1: on Ant Kingdom the whole
-            -- known road was 130-210 studs from the base, 1 - d / far only spanned 0-0.37 and every
-            -- damage unit stood at the spawn end)
-            local far, near = 0, math.huge
-            if goal then
-                for _, q in ipairs(pts) do
-                    local dq = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
-                    far, near = math.max(far, dq), math.min(near, dq)
-                end
-            end
-            for i, q in ipairs(pts) do
-                local prog = (i - 1) / math.max(1, #pts - 1)
-                if far > near then prog = (far - math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)) / (far - near) end
-                -- (Safe: steeper, with a half-strength spot factor below - the old (1 - nearSpawn)^2 on
-                -- top of 0.5 + prog put all 6 damage units on the last 25 studs of known road)
-                if mode == "Safe" then weight[i] = aoe and (0.6 + 0.8 * prog) or (0.25 + 1.5 * prog)
-                elseif mode == "Fast clear" then weight[i] = 1 -- (forward on purpose: no lean to the base)
-                else weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog) end
-            end
-            -- road already in reach of k of our damage units is worth COVER_DECAY^k to the next one:
-            -- Ant Kingdom (2026-10-25 dump) had six damage units on one spot, together covering 22% of
-            -- the known road; with this about 75% in the replay (work/ sim on the dump)
-            local reach = {}
-            for _, u in ipairs(ownedUnits()) do
-                if unitRole(u) == "dps" then
-                    local p = rootPos(u)
-                    local ur = AutoPlaceModule.StatNum(u, "range") or AutoPlaceModule.Range({ name = unitType(u) or "" })
-                    if p and ur and ur > 0 then reach[#reach + 1] = { p.X, p.Z, ur * ur } end
-                end
-            end
-            if #reach > 0 then
-                for i, q in ipairs(pts) do
-                    local k = 0
-                    for _, e in ipairs(reach) do
-                        if (q[1] - e[1]) ^ 2 + (q[3] - e[2]) ^ 2 <= e[3] then k = k + 1 end
-                    end
-                    if k > 0 then weight[i] = weight[i] * AutoPlaceModule.COVER_DECAY ^ k end
-                end
-            end
-            for _, tm in pairs(AutoPlaceModule.team) do
-                local tr = (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" and tm.name ~= AutoPlaceModule.placingName and AutoPlaceModule.Range(tm)
-                if tr and tr > 0 and tr * AutoPlaceModule.LONG_RANGE <= r and (not shortR or tr < shortR) then shortR = tr end
-            end
-        end
-        -- previous point of the same lane: the latest of the 10 samples before within 8 studs
-        local laneOf, hitAt = nil, {}
-        if aoe and not State.eventMode then
-            laneOf = {}
-            for i = 2, #pts do
-                for j = i - 1, math.max(1, i - 10), -1 do
-                    if (pts[j][1] - pts[i][1]) ^ 2 + (pts[j][3] - pts[i][3]) ^ 2 <= 64 then laneOf[i] = j break end
-                end
-            end
-        end
         local scored = {}
         for _, c in ipairs(free) do
             local n, passes, inside = 0, 0, false
             local r2 = r * r - (c.rise or 0) ^ 2
-            local s2 = shortR and (shortR * shortR - (c.rise or 0) ^ 2)
-            local shortN = 0
-            for i, q in ipairs(pts) do
+            for _, q in ipairs(pts) do
                 local dx, dz = q[1] - c.x, q[3] - c.z
                 local hit = dx * dx + dz * dz <= r2
-                if hit then n = n + (weight[i] or 1) end
-                if s2 and dx * dx + dz * dz <= s2 then shortN = shortN + (weight[i] or 1) end
-                if laneOf then
-                    -- (normal stages: an entry = in range while the previous point of the same lane
-                    -- was not - on Shibuya the samples alternate between two lanes 135 studs apart,
-                    -- so comparing with the previous sample gave one straight lane 5+ "passes")
-                    local j = laneOf[i]
-                    if hit and not (j and hitAt[j]) then passes = passes + 1 end
-                    hitAt[i] = hit
-                elseif hit and not inside then passes = passes + 1 end
+                if hit then n = n + 1 end
+                if hit and not inside then passes = passes + 1 end
                 inside = hit
             end
             -- area attacks hit the whole crowd: a spot where the road passes by two or three
             -- times (a bend, a U-turn) is worth more than one long straight
             if aoe and passes > 1 then n = n * (1 + 0.5 * (passes - 1)) end
-            n = n - 0.5 * shortN
             -- back: a trap unit that also hits flyers (Usopp) guards the last stretch before
             -- our base in every mode (owner): whatever slips past the front line meets its traps
             if spawn and goal and (back or mode == "Fast clear" or mode == "Safe") then
@@ -3948,9 +3847,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 -- (back alone leans softer than Safe: a spot that still covers a lot of road
                 -- near the base beats a tiny corner right at the gate)
                 if mode == "Fast clear" and not back then n = n * nearSpawn ^ 2
-                -- (normal stages: half-strength - the steep road weights lean too; squared on top put
-                -- every unit on the last 25 studs of known road, Ant Kingdom dump 2026-10-25)
-                elseif mode == "Safe" and not State.eventMode then n = n * (1 - 0.5 * nearSpawn)
                 elseif mode == "Safe" then n = n * (1 - nearSpawn) ^ 2
                 else n = n * (1 - nearSpawn) end
             end
@@ -3960,18 +3856,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             table.insert(scored, { c = c, n = n })
         end
         table.sort(scored, function(a, b) return a.n > b.n end)
-        -- (placement_dump.json: the top spots of the last few damage placements, to look at later)
-        if not State.eventMode then
-            local top = {}
-            for i = 1, math.min(30, #scored) do
-                local e = scored[i]
-                top[i] = { x = math.floor(e.c.x * 10) / 10, z = math.floor(e.c.z * 10) / 10, n = math.floor(e.n * 100) / 100, kind = e.c.kind }
-            end
-            local log = AutoPlaceModule.scoredLog
-            table.insert(log, { unit = AutoPlaceModule.placingName, range = r, defRange = AutoPlaceModule.DefRangeAt(AutoPlaceModule.placingName or "", 0),
-                buff = AutoPlaceModule.RangeBuff(), aoe = aoe == true, mode = mode, wave = AutoPlaceModule.WaveNumber(), top = top })
-            while #log > 4 do table.remove(log, 1) end
-        end
         return scored[skip + 1] and scored[skip + 1].c
     end
     return free[skip + 1]
@@ -4171,6 +4055,7 @@ function AutoPlaceModule.RefreshTeam()
         AutoPlaceModule.hotbarAt = os.clock()
         return hot
     end
+    AutoPlaceModule.hotbarAt = nil
     if type(getgc) == "function" then
         pcall(function()
             for _, v in ipairs(getgc(true)) do
@@ -4443,6 +4328,736 @@ local function placedOf(uuid)
         if v and normUuid(v.Value) == want then table.insert(list, u) end
     end
     return list
+end
+
+-- ===== Auto Place v2 (work/placement_method.md, normal stages only; Fool's Hunt keeps its own brain) =====
+-- One method: the road from the game's lanes, a spot score per unit against the best spot for its range
+-- on this map, an order by road kind and the spending by margin. Each rule has a named v2_* test.
+-- A bend chain in the game's own order: player LANES "final" (enemy end) -> numbered bends high to low
+-- -> "spawn" (our base); pve LANES the other way round. Numbers always win; nil with fewer than 2.
+function PV.LaneOrder(bends, side)
+    local nums, fin, sp = {}, nil, nil
+    for _, b in ipairs(bends) do
+        local name = string.lower(tostring(b.name))
+        if tonumber(b.name) then nums[#nums + 1] = b
+        elseif name == "final" then fin = b
+        elseif name == "spawn" then sp = b end
+    end
+    if #nums < 2 then return nil end
+    table.sort(nums, function(a, b) return tonumber(a.name) > tonumber(b.name) end)
+    local chain = {}
+    if fin then chain[1] = fin end
+    for _, b in ipairs(nums) do chain[#chain + 1] = b end
+    if sp then chain[#chain + 1] = sp end
+    if side == "pve" then
+        local rev = {}
+        for i = #chain, 1, -1 do rev[#rev + 1] = chain[i] end
+        chain = rev
+    end
+    return chain
+end
+
+-- The road: every lane (both on two-lane maps) as points every ROAD_STEP studs, enemy end first; each
+-- point has p = how far along its lane (0 enemy end, 1 our base) and w = road length it stands for.
+-- Points the enemies walked more than 4 studs off the lanes are added with the p of the nearest lane
+-- point. No lanes: the learned road in walking order. len = the longest lane (shared as `rl`).
+function PV.Road()
+    local key = stageKey()
+    local learned = pathPoints()
+    local c = PV.road
+    if c and c.key == key and #learned < c.n + math.max(10, math.floor(c.n * 0.1)) and os.clock() - c.at < 5 then return c end
+    local goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
+    local g = goal and { x = goal.X, z = goal.Z } or { x = 0, z = 0 }
+    local lanes = AutoPlaceModule.Lanes()
+    local useSide = "player"
+    for _, lane in ipairs(lanes) do if lane.side == "pve" and #lane.bends >= 2 then useSide = "pve" end end
+    local pts, longest, nLanes = {}, 0, 0
+    for _, lane in ipairs(lanes) do
+        local chain = lane.side == useSide and #lane.bends >= 2 and AutoPlaceModule.LaneOrder(lane.bends, g, lane.side)
+        if chain and #chain >= 2 then
+            local total = 0
+            for i = 2, #chain do total = total + math.sqrt((chain[i].x - chain[i - 1].x) ^ 2 + (chain[i].z - chain[i - 1].z) ^ 2) end
+            if total > 0 then
+                nLanes = nLanes + 1
+                longest = math.max(longest, total)
+                local along = 0
+                for i = 2, #chain do
+                    local a, b = chain[i - 1], chain[i]
+                    local seg = math.sqrt((b.x - a.x) ^ 2 + (b.z - a.z) ^ 2)
+                    local n = math.max(1, math.ceil(seg / PV.ROAD_STEP))
+                    for k = 0, n - 1 do
+                        local t = k / n
+                        pts[#pts + 1] = { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t,
+                            p = (along + seg * t) / total, w = seg / n, lane = nLanes }
+                    end
+                    along = along + seg
+                end
+                local e = chain[#chain]
+                pts[#pts + 1] = { e.x, e.y, e.z, p = 1, w = 0, lane = nLanes }
+            end
+        end
+    end
+    local from = nLanes > 0 and "lanes" or "learned"
+    if nLanes > 0 then
+        local extra = {}
+        for _, q in ipairs(learned) do
+            local bd, bp = math.huge, 0
+            for _, r in ipairs(pts) do
+                local d = (r[1] - q[1]) ^ 2 + (r[3] - q[3]) ^ 2
+                if d < bd then bd, bp = d, r.p end
+            end
+            if bd > 16 then extra[#extra + 1] = { q[1], q[2], q[3], p = bp, w = PV.ROAD_STEP, extra = true, lane = nLanes + 1 } end
+        end
+        for _, q in ipairs(extra) do pts[#pts + 1] = q end
+    elseif #learned >= 2 then
+        -- (the learned road in sample order; a sample joins the lane of the latest of the 10 before it
+        -- within 8 studs, else it starts a new lane - two roads sampled in turn stay two lanes)
+        local laneOf, prevOf, n = {}, {}, 0
+        for i, q in ipairs(learned) do
+            for j = i - 1, math.max(1, i - 10), -1 do
+                if (learned[j][1] - q[1]) ^ 2 + (learned[j][3] - q[3]) ^ 2 <= 64 then laneOf[i], prevOf[i] = laneOf[j], j break end
+            end
+            if not laneOf[i] then n = n + 1 laneOf[i] = n end
+        end
+        local along, total = {}, {}
+        for i, q in ipairs(learned) do
+            local j = prevOf[i]
+            along[i] = j and along[j] + math.sqrt((learned[j][1] - q[1]) ^ 2 + (learned[j][3] - q[3]) ^ 2) or 0
+            total[laneOf[i]] = math.max(total[laneOf[i]] or 0, along[i])
+        end
+        for i, q in ipairs(learned) do
+            local l = laneOf[i]
+            pts[#pts + 1] = { q[1], q[2], q[3], p = (total[l] or 0) > 0 and along[i] / total[l] or 0, w = PV.ROAD_STEP, lane = l }
+            longest = math.max(longest, total[l] or 0)
+        end
+    end
+    PV.road = { key = key, n = #learned, at = os.clock(), pts = pts, len = longest, lanes = nLanes, from = from }
+    PV.lastLen = math.floor(longest + 0.5)
+    return PV.road
+end
+
+-- short < SHORT_ROAD <= middle <= LONG_ROAD < long
+function PV.Kind(len)
+    if len < PV.SHORT_ROAD then return "short" end
+    if len > PV.LONG_ROAD then return "long" end
+    return "middle"
+end
+
+-- Road length (studs) a unit at c reaches with range r and its attack shape, and the mean p of that
+-- road. circle = everything in range; cone = the best of 16 headings, CONE_HALF either side; line = the
+-- best of 16 headings, LINE_HALF wide. c.rise (height above the road) shortens the reach on the map.
+function PV.Cover(c, r, shape, road)
+    road = road or PV.Road()
+    local flat = r * r - (c.rise or 0) ^ 2
+    if flat <= 0 then return 0, 0 end
+    if shape == "cone" or shape == "line" then
+        local best, bestP, cosHalf = 0, 0, math.cos(PV.CONE_HALF)
+        for k = 0, 15 do
+            local a = k * math.pi / 8
+            local ux, uz = math.cos(a), math.sin(a)
+            local s, sp = 0, 0
+            for _, q in ipairs(road.pts) do
+                local dx, dz = q[1] - c.x, q[3] - c.z
+                local d2 = dx * dx + dz * dz
+                if d2 <= flat then
+                    local along = dx * ux + dz * uz
+                    local ok
+                    if shape == "line" then ok = along >= 0 and math.abs(dx * uz - dz * ux) <= PV.LINE_HALF
+                    else ok = along >= math.sqrt(d2) * cosHalf end
+                    if ok then s, sp = s + q.w, sp + q.w * q.p end
+                end
+            end
+            if s > best then best, bestP = s, sp / s end
+        end
+        return best, bestP
+    end
+    local s, sp = 0, 0
+    for _, q in ipairs(road.pts) do
+        if (q[1] - c.x) ^ 2 + (q[3] - c.z) ^ 2 <= flat then s, sp = s + q.w, sp + q.w * q.p end
+    end
+    return s, s > 0 and sp / s or 0
+end
+
+-- The best road cover any spot on this map gives for this range and shape (cov / best = spot score).
+-- cands = the spot candidates (bestSpot's list); cached per stage, range, shape and road size.
+function PV.Best(r, shape, cands)
+    local road = PV.Road()
+    cands = cands or candidates or {}
+    local key = string.format("%s|%.1f|%s|%d|%d", road.key, r, shape, #cands, #road.pts)
+    PV.bestCache = PV.bestCache or {}
+    if PV.bestCache[key] then return PV.bestCache[key] end
+    local list = {}
+    for _, c in ipairs(cands) do list[#list + 1] = { c = c, cov = (PV.Cover(c, r, "circle", road)) } end
+    table.sort(list, function(a, b) return a.cov > b.cov end)
+    local best = list[1] and list[1].cov or 0
+    if shape ~= "circle" then
+        best = 0
+        for i = 1, math.min(60, #list) do best = math.max(best, (PV.Cover(list[i].c, r, shape, road))) end
+    end
+    PV.bestCache[key] = best
+    return best
+end
+
+-- The game's Attacks entry of a unit's main attack (and of its active skill).
+function PV.Attack(name, field)
+    local def = AutoPlaceModule.UnitDef(name)
+    local id = def and (field and def[field] or def.primary_attack_no_upgrades or def.primary_attack)
+    if type(id) ~= "string" then return nil end
+    if attacksModule == nil then
+        attacksModule = false
+        pcall(function()
+            local ok, mod = pcall(require, ReplicatedStorage.src.Data:FindFirstChild("Attacks"))
+            if ok and type(mod) == "table" then attacksModule = mod end
+        end)
+    end
+    local e = attacksModule and attacksModule[id]
+    return type(e) == "table" and e or nil
+end
+function PV.Shape(name)
+    local e = PV.Attack(name)
+    if e and e.cone ~= nil then return "cone" end
+    if e and e.line ~= nil then return "line" end
+    return "circle"
+end
+-- slow / freeze / stun in its main attack or its active skill
+PV.SLOW_UNITS = {}
+function PV.IsSlow(name)
+    if PV.SLOW_UNITS[name] then return true end
+    for _, f in ipairs({ false, "active_attack" }) do
+        local e = PV.Attack(name, f or nil)
+        if e and (e.slow ~= nil or e.freeze ~= nil or e.stun ~= nil) then return true end
+    end
+    return false
+end
+
+-- Our damage against these enemies: x the room's / level's weakness (_weak_against amplification), /
+-- its strength (_strong_against), x REC_TYPE for the level's _recommended_damage_types, and the
+-- resistance cards taken against that type (x100 / (100 + resist)).
+local function normType(k) return (string.lower(tostring(k or "")):gsub("_damage$", "")) end
+function PV.TypeFactor(name)
+    local def = AutoPlaceModule.UnitDef(name) or {}
+    local kind = normType(def._base_damage_type or "physical")
+    local f = 1
+    local ok, d = pcall(Stage.levelData)
+    if ok and type(d) == "table" then
+        for _, w in pairs(type(d._weak_against) == "table" and d._weak_against or {}) do
+            if type(w) == "table" and normType(w.damage_type) == kind then f = f * math.max(1, tonumber(w.amplification) or 1) end
+        end
+        for _, w in pairs(type(d._strong_against) == "table" and d._strong_against or {}) do
+            local k = type(w) == "table" and w.damage_type or w
+            local a = type(w) == "table" and tonumber(w.amplification)
+            if normType(k) == kind then f = f * ((a and a < 1 and a) or (a and a > 1 and 1 / a) or 0.5) end
+        end
+        for _, k in pairs(type(d._recommended_damage_types) == "table" and d._recommended_damage_types or {}) do
+            if normType(k) == kind then f = f * PV.REC_TYPE end
+        end
+    end
+    for k, res in pairs(Lobby.resTaken or {}) do
+        if normType(k) == kind and tonumber(res) then f = f * 100 / (100 + tonumber(res)) end
+    end
+    return f
+end
+
+-- A team copy's damage per second against this map: its rolls and trait (Stats), area x AOE_VALUE, x
+-- TypeFactor. The carry = the strongest placeable damage copy (the better-trait copy of a unit wins; a
+-- Unique-trait copy always).
+function PV.Power(t)
+    local s = AutoPlaceModule.Stats(t)
+    return s.damage / math.max(0.1, s.cooldown) * (AutoPlaceModule.IsAoe(t.name) and AutoPlaceModule.AOE_VALUE or 1) * PV.TypeFactor(t.name)
+end
+function PV.Carry()
+    local best, bv, bs
+    for s = 1, 6 do
+        local t = AutoPlaceModule.team[s]
+        if t and (AutoPlaceModule.RoleOf(t) or "dps") == "dps" and AutoPlaceModule.SlotTarget(s, t) > 0
+            and (not AutoPlaceModule.full[t.uuid] or #placedOf(t.uuid) > 0) then
+            -- (owner 2026-10-24: the Unique-trait copy is upgraded first, to the top - it is the carry)
+            local v = PV.Power(t) * (AutoPlaceModule.TraitMods(t.traits).cap == 1 and 1e6 or 1)
+            if not bv or v > bv then best, bv, bs = t, v, s end
+        end
+    end
+    return best, bs
+end
+-- the carry's copy on the map (highest level)
+function PV.CarryUnit()
+    local t = PV.Carry()
+    if not t then return nil end
+    local pick, lv
+    for _, u in ipairs(placedOf(t.uuid)) do
+        local l = AutoPlaceModule.StatNum(u, "upgrade") or 0
+        if not lv or l > lv then pick, lv = u, l end
+    end
+    return pick, lv
+end
+
+-- What a placement is for: carry (also a trap that hits flyers - it guards the base end), slow, damage,
+-- or the role itself (farm, buff, support).
+function PV.SpotRole(t, role, back)
+    if role ~= "dps" then return role end
+    local carry = PV.Carry()
+    if back or (t and carry and t.uuid == carry.uuid) or not carry then return "carry" end
+    if t and PV.IsSlow(t.name) and PV.CarryUnit() then return "slow" end
+    return "damage"
+end
+
+-- The longest lane (LANE_MIN+ studs) none of our damage units reaches; nil with one lane or all reached.
+PV.LANE_MIN = 30
+function PV.UncoveredLane(road)
+    local len, hit = {}, {}
+    local reach = {}
+    for _, u in ipairs(ownedUnits()) do
+        local p = unitRole(u) == "dps" and rootPos(u)
+        if p then reach[#reach + 1] = { p, AutoPlaceModule.StatNum(u, "range") or unitReach(u) } end
+    end
+    if #reach == 0 then return nil end
+    local n = 0
+    for _, q in ipairs(road.pts) do
+        if not len[q.lane] then n = n + 1 end
+        len[q.lane] = (len[q.lane] or 0) + q.w
+        if not hit[q.lane] then
+            for _, e in ipairs(reach) do
+                if (e[1].X - q[1]) ^ 2 + (e[1].Z - q[3]) ^ 2 <= e[2] * e[2] then hit[q.lane] = true break end
+            end
+        end
+    end
+    if n < 2 then return nil end
+    local best, bl
+    for l, total in pairs(len) do
+        if not hit[l] and total >= PV.LANE_MIN and (not bl or total > bl) then best, bl = l, total end
+    end
+    return best
+end
+
+-- The spot for a damage / slow unit (bestSpot, normal stages). free = its free spots of its kind.
+--   carry : best cover in the base half of the road (mean p of its road >= 0.5)
+--   damage: best spot within BUFF_REACH of the carry when its cover is within NEAR_BEST of the best one
+--   slow  : best spot reaching the carry's road (same bend) on the enemy side of it (lower mean p)
+-- falling back to the best cover. Returns the ordered list (choice first) and the best cover.
+function PV.Rank(free, t, role, r, back)
+    local road = PV.Road()
+    local shape = PV.Shape(t and t.name or "")
+    local list = {}
+    for _, c in ipairs(free) do
+        local cov, p = PV.Cover(c, r, "circle", road)
+        if cov > 0 or AutoPlaceModule.rescue then list[#list + 1] = { c = c, cov = cov, p = p } end
+    end
+    table.sort(list, function(a, b) return a.cov > b.cov end)
+    if shape ~= "circle" then
+        local top = {}
+        for i = 1, math.min(60, #list) do
+            local e = list[i]
+            e.cov, e.p = PV.Cover(e.c, r, shape, road)
+            if e.cov > 0 or AutoPlaceModule.rescue then top[#top + 1] = e end
+        end
+        list = top
+        table.sort(list, function(a, b) return a.cov > b.cov end)
+    end
+    local sub = PV.SpotRole(t, role, back)
+    local top = list[1] and list[1].cov or 0
+    local want
+    -- (a lane of LANE_MIN+ studs that no damage unit reaches - a second road, "A new path has opened!" -
+    -- gets the next damage unit: the spots reaching it, best cover first)
+    local gap = (sub == "damage" or sub == "slow") and PV.UncoveredLane(road)
+    if gap then
+        want = function(e)
+            for _, q in ipairs(road.pts) do
+                if q.lane == gap and (q[1] - e.c.x) ^ 2 + (q[3] - e.c.z) ^ 2 <= r * r then return true end
+            end
+            return false
+        end
+        sub = sub .. "+lane"
+    end
+    if want then
+        -- (decided above)
+    elseif sub == "carry" then
+        want = function(e) return e.p >= 0.5 end
+    elseif sub == "damage" or sub == "slow" then
+        local cu = PV.CarryUnit()
+        local cp = cu and rootPos(cu)
+        if cp and sub == "damage" then
+            want = function(e) return (e.c.x - cp.X) ^ 2 + (e.c.z - cp.Z) ^ 2 <= BUFF_REACH * BUFF_REACH and e.cov >= PV.NEAR_BEST * top end
+        elseif cp then
+            local cr = AutoPlaceModule.StatNum(cu, "range") or unitReach(cu)
+            local seg, csum, cw = {}, 0, 0
+            for _, q in ipairs(road.pts) do
+                if (q[1] - cp.X) ^ 2 + (q[3] - cp.Z) ^ 2 <= cr * cr then seg[#seg + 1] = q csum, cw = csum + q.w * q.p, cw + q.w end
+            end
+            local cpMean = cw > 0 and csum / cw or 0
+            want = function(e)
+                if e.p >= cpMean then return false end
+                for _, q in ipairs(seg) do
+                    if (q[1] - e.c.x) ^ 2 + (q[3] - e.c.z) ^ 2 <= r * r then return true end
+                end
+                return false
+            end
+        end
+    end
+    local out = {}
+    if want then for _, e in ipairs(list) do if want(e) then out[#out + 1] = e end end end
+    for _, e in ipairs(list) do if not (want and want(e)) then out[#out + 1] = e end end
+    return out, top, sub
+end
+
+-- Buff / support: the spot whose reach holds the most team damage (each damage unit by its damage per
+-- second, the carry twice).
+function PV.BuffRank(free, reach)
+    local units = {}
+    local cu = PV.CarryUnit()
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" then
+            local p = rootPos(u)
+            local dmg = AutoPlaceModule.StatNum(u, "damage") or 1
+            local cd = AutoPlaceModule.StatNum(u, "attack_cooldown") or 1
+            if p then units[#units + 1] = { p = p, v = math.max(0.01, dmg / math.max(0.1, cd)) * (u == cu and 2 or 1) } end
+        end
+    end
+    local list = {}
+    for _, c in ipairs(free) do
+        local v = 0
+        for _, e in ipairs(units) do
+            if (e.p.X - c.x) ^ 2 + (e.p.Z - c.z) ^ 2 <= reach * reach then v = v + e.v end
+        end
+        list[#list + 1] = { c = c, v = v + (c.score or 0) * 1e-6 }
+    end
+    table.sort(list, function(a, b) return a.v > b.v end)
+    return list
+end
+
+-- cov / best of a unit on the map, 0-100 (-1: unknown)
+function PV.CovBest(u)
+    local p = rootPos(u)
+    local range = AutoPlaceModule.StatNum(u, "range") or unitReach(u)
+    if not p or not range or range <= 0 then return -1 end
+    local road = PV.Road()
+    if #road.pts < 2 then return -1 end
+    local shape = PV.Shape(unitType(u) or "")
+    local cov = PV.Cover({ x = p.X, z = p.Z }, range, shape, road)
+    local best = PV.Best(range, shape)
+    if best <= 0 then return -1 end
+    return math.floor(100 * math.min(1, cov / best) + 0.5)
+end
+
+-- Share of the team's damage (damage per second) standing inside a buff / support unit's reach, 0-100;
+-- -1 with no buff or support unit down.
+function PV.BuffShare()
+    local dps, buffs = {}, {}
+    for _, u in ipairs(ownedUnits()) do
+        local role, p = unitRole(u), rootPos(u)
+        if p and role == "dps" then
+            local v = (AutoPlaceModule.StatNum(u, "damage") or 1) / math.max(0.1, AutoPlaceModule.StatNum(u, "attack_cooldown") or 1)
+            dps[#dps + 1] = { p = p, v = v }
+        elseif p and (role == "buff" or role == "support") then
+            local r = AutoPlaceModule.StatNum(u, "range") or BUFF_REACH
+            buffs[#buffs + 1] = { p = p, r = math.max(BUFF_REACH, r) }
+        end
+    end
+    if #buffs == 0 or #dps == 0 then return -1 end
+    local all, inside = 0, 0
+    for _, d in ipairs(dps) do
+        all = all + d.v
+        for _, b in ipairs(buffs) do
+            if (b.p.X - d.p.X) ^ 2 + (b.p.Z - d.p.Z) ^ 2 <= b.r * b.r then inside = inside + d.v break end
+        end
+    end
+    return all > 0 and math.floor(100 * inside / all + 0.5) or -1
+end
+
+-- Enemy walk speed (studs / s), measured from the enemies' moves between ticks; ENEMY_SPEED until then.
+-- The game's unit data has only a speed multiplier (1 for most enemies) and the challenge
+-- enemy_speed_scale, no studs per second.
+PV.seen = setmetatable({}, { __mode = "k" })
+-- Kill depth: an enemy gone from the map before the last 5% of the road died there (one that reaches
+-- our base end is a leak - the base-hit rule). PV.kills = road positions of the last 10, per stage.
+PV.track, PV.kills = {}, {}
+function PV.RoadPos(p, road)
+    local bd, bp = math.huge, 0
+    for _, q in ipairs((road or PV.Road()).pts) do
+        local d = (q[1] - p.X) ^ 2 + (q[3] - p.Z) ^ 2
+        if d < bd then bd, bp = d, q.p end
+    end
+    return bp
+end
+function PV.SpeedStep()
+    local folder = unitsFolder()
+    local now = os.clock()
+    local road = PV.Road()
+    -- (a new stage, or a new game - the wave number went down: the enemies cleared at the end were no kills)
+    local w = AutoPlaceModule.WaveNumber()
+    if PV.killsKey ~= road.key or w < (PV.killWave or 0) then PV.kills, PV.track, PV.killsKey = {}, {}, road.key end
+    PV.killWave = w
+    local track = {}
+    for _, e in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(e) then
+            local p = rootPos(e)
+            if p and #road.pts > 0 then track[e] = PV.RoadPos(p, road) end
+            local last = PV.seen[e]
+            if p and last and now - last.t >= 0.2 and now - last.t <= 3 then
+                local v = math.sqrt((p.X - last.x) ^ 2 + (p.Z - last.z) ^ 2) / (now - last.t)
+                if v > 0.2 and v < 60 then PV.speed = PV.speed and (0.9 * PV.speed + 0.1 * v) or v end
+            end
+            if p and (not last or now - last.t >= 0.2) then PV.seen[e] = { x = p.X, z = p.Z, t = now } end
+        end
+    end
+    for e, p in pairs(PV.track) do
+        if track[e] == nil and p < 0.95 then
+            table.insert(PV.kills, p)
+            while #PV.kills > 10 do table.remove(PV.kills, 1) end
+        end
+    end
+    PV.track = track
+end
+-- mean road position where the last enemies died; nil with fewer than 5 kills seen
+function PV.KillDepth()
+    if #PV.kills < 5 then return nil end
+    local s = 0
+    for _, p in ipairs(PV.kills) do s = s + p end
+    return s / #PV.kills
+end
+
+-- Margin = our power / threat, and how deep the enemies get (PV.KillDepth: where they die, 0-1 along the road).
+--   threat = HP on the map (+ shield, x1.2 regenerating), at least the last wave's peak x wave / (wave - 1)
+--   power  = sum over our damage units of damage / s x TypeFactor x its live damage_multiplier x seconds an enemy stays in reach
+--            (road in reach / enemy speed, x SLOW_GAIN where a slow unit reaches the same road)
+-- nil margin while there is no threat, no damage unit down or fewer than 5 kills seen (KillDepth).
+PV.peak = {}
+function PV.Threat()
+    local folder = unitsFolder()
+    local hp, list = 0, {}
+    for _, e in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(e) then
+            local st = e:FindFirstChild("_stats")
+            local hum = e:FindFirstChildOfClass("Humanoid")
+            local h = (hum and tonumber(hum.Health)) or nil
+            local function num(n) local v = st and st:FindFirstChild(n) return v and tonumber(v.Value) end
+            h = h or num("health") or num("base_health") or 0
+            h = h + (num("shield") or 0)
+            local rg = st and st:FindFirstChild("Regen")
+            if rg and (rg.Value == true or (tonumber(rg.Value) or 0) > 0) then h = h * 1.2 end
+            hp = hp + h
+            local p = rootPos(e)
+            if p then list[#list + 1] = p end
+        end
+    end
+    local w = AutoPlaceModule.WaveNumber()
+    PV.peak[w] = math.max(PV.peak[w] or 0, hp)
+    local prev = w > 1 and PV.peak[w - 1]
+    if prev and prev > 0 then hp = math.max(hp, prev * w / (w - 1)) end
+    return hp, list
+end
+function PV.Margin()
+    local threat = PV.Threat()
+    local road = PV.Road()
+    local depth = PV.KillDepth()
+    local speed = PV.speed or PV.ENEMY_SPEED
+    local slows = {}
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" and PV.IsSlow(unitType(u) or "") then
+            local p = rootPos(u)
+            if p then slows[#slows + 1] = { p, (AutoPlaceModule.StatNum(u, "range") or unitReach(u)) } end
+        end
+    end
+    local power, any = 0, false
+    for _, u in ipairs(ownedUnits()) do
+        local p = rootPos(u)
+        if p and unitRole(u) == "dps" then
+            any = true
+            local name = unitType(u) or ""
+            local r = AutoPlaceModule.StatNum(u, "range") or unitReach(u)
+            local cov = PV.Cover({ x = p.X, z = p.Z }, r, PV.Shape(name), road)
+            local slowed = false
+            for _, s in ipairs(slows) do
+                if (s[1].X - p.X) ^ 2 + (s[1].Z - p.Z) ^ 2 <= (r + s[2]) ^ 2 then slowed = true break end
+            end
+            -- (the unit's own numbers when its _stats has none)
+            local def = AutoPlaceModule.UnitDef(name) or {}
+            local dps = (AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0)
+                / math.max(0.1, AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(def))
+            dps = dps * (AutoPlaceModule.IsAoe(name) and AutoPlaceModule.AOE_VALUE or 1) * PV.TypeFactor(name)
+                * (AutoPlaceModule.StatNum(u, "damage_multiplier") or 1) -- (live buffs: cards, shrine, shop items, buff units)
+            power = power + dps * cov / math.max(0.1, speed) * (slowed and PV.SLOW_GAIN or 1)
+        end
+    end
+    -- (unknown until 5 enemies died here: before that the power estimate has nothing to be checked against)
+    local margin = (any and threat > 0 and depth ~= nil) and power / threat or nil
+    return margin, depth, threat, power
+end
+-- "high" (money to farms), "low" (damage upgrades, carry first) or "normal" (the order of the road kind)
+function PV.Spend(danger)
+    local margin, depth = PV.Margin()
+    PV.lastMargin, PV.lastDepth = margin, depth
+    if danger or (depth and depth > 0.5) or (margin and margin < PV.MARGIN_LOW) then return "low" end
+    if margin and margin >= PV.MARGIN_HIGH and depth and depth < 0.5 then return "high" end
+    return "normal"
+end
+PV.ORDER = {
+    short = { "carry", "carryUp", "slow", "farms", "rest" },
+    middle = { "carry", "farms", "carryUp", "slow", "rest" },
+    long = { "carry", "farms", "farmUps", "rest" },
+    high = { "carry", "farms", "farmUps", "rest" },
+    low = { "carry", "carryMax", "damageUps", "rest" },
+}
+function PV.Steps(danger)
+    local spend = PV.Spend(danger)
+    if spend ~= "normal" then return PV.ORDER[spend], spend end
+    local kind = PV.Kind(PV.Road().len)
+    return PV.ORDER[kind], kind
+end
+
+-- The hill spots beside the road (for the wave-1 dump): candidates on a part named like a hill or
+-- raised 2.5+ studs over the road (roofs look the same), with how high and by which sign.
+function PV.HillSpots()
+    local pts = pathPoints()
+    if not candidates and #pts >= 2 then candidates, candidatesFor = buildCandidates(pts), #pts end
+    local out = {}
+    for _, c in ipairs(candidates or {}) do
+        if c.kind == "hill" and #out < 80 then
+            out[#out + 1] = { x = math.floor(c.x * 10) / 10, z = math.floor(c.z * 10) / 10, rise = c.rise and math.floor(c.rise * 10) / 10 or nil,
+                by = c.hillBy, part = c.part and c.part.Name or nil }
+        end
+    end
+    return out
+end
+
+-- Buff units (owner 2026-10-25, work/placement_method.md "Buff units - how many and how far").
+-- Kind from the game data: summon (buffs summons only: SUMMON_BUFF), farm (a farm / money / income key
+-- in its attacks), rotating (a cast buff - its active attack - that passes between copies), damage
+-- (an always-on aura: support, or a buff with no cast).
+PV.FARM_BUFF = {}
+PV.SHORT_WAVES = 15      -- a stage with at most this many waves (and not infinite) is short: 1 copy each
+PV.BUFF_STEP = 0.1       -- buff added per upgrade level (x the team damage / s it reaches): a guess, no number in the data
+PV.SHORT_BUFF_LEVEL = 2  -- short stages: buff upgrades stop here (where the buff % stops growing much: a guess)
+local function hasKey(v, words, depth)
+    if type(v) ~= "table" or depth > 3 then return false end
+    for k, x in pairs(v) do
+        local key = string.lower(tostring(k))
+        for _, w in ipairs(words) do if key:find(w, 1, true) then return true end end
+        if hasKey(x, words, depth + 1) then return true end
+    end
+    return false
+end
+function PV.BuffKind(name)
+    local base = AutoPlaceModule.BaseId(name)
+    if AutoPlaceModule.SUMMON_BUFF[name] or AutoPlaceModule.SUMMON_BUFF[base] then return "summon" end
+    local act, main = PV.Attack(name, "active_attack"), PV.Attack(name)
+    local money = { "farm", "money", "income" }
+    if PV.FARM_BUFF[name] or PV.FARM_BUFF[base] or hasKey(act, money, 1) or hasKey(main, money, 1) then return "farm" end
+    local def = AutoPlaceModule.UnitDef(name) or {}
+    -- (or a placed copy casts a buff - its _stats.active_attack - or a buff rotation was learned for it: BuffRot)
+    for _, u in ipairs(ownedUnits()) do
+        if unitType(u) == name then
+            local st = u:FindFirstChild("_stats")
+            local aa = st and st:FindFirstChild("active_attack")
+            if aa and tostring(aa.Value):find("buff", 1, true) and AutoPlaceModule.RoleFromDef(name) ~= "support" then return "rotating" end
+        end
+    end
+    if AutoPlaceModule.RoleFromDef(name) ~= "support" and ((type(def.active_attack) == "string"
+        and (act ~= nil or tostring(def.active_attack):find("buff", 1, true))) or BuffRot.groups[name] ~= nil) then return "rotating" end
+    return "damage"
+end
+-- Waves in this stage from the level data (math.huge = infinite; nil = unknown): its own count field,
+-- else the waves table of src.Data.Waves[level.waves].
+function PV.WaveCount()
+    local key = stageKey()
+    if PV.wavesFor == key then return PV.waves end
+    PV.wavesFor, PV.waves = key, nil
+    local ok, d = pcall(Stage.levelData)
+    if not (ok and type(d) == "table") then return nil end
+    if d.infinite == true or string.lower(tostring(d._gamemode or "")) == "infinite" then PV.waves = math.huge return PV.waves end
+    for _, k in ipairs({ "wave_count", "max_wave", "max_waves", "waves_count", "_waves" }) do
+        if tonumber(d[k]) then PV.waves = tonumber(d[k]) return PV.waves end
+    end
+    if type(d.waves) == "string" then
+        pcall(function()
+            local mod = ReplicatedStorage.src.Data:FindFirstChild("Waves")
+            local mods = { mod }
+            for _, m in ipairs(mod and mod:GetDescendants() or {}) do if m:IsA("ModuleScript") then mods[#mods + 1] = m end end
+            for _, m in ipairs(mods) do
+                local okR, t = pcall(require, m)
+                local e = okR and type(t) == "table" and t[d.waves]
+                if type(e) == "table" then
+                    if e.infinite then PV.waves = math.huge return end
+                    local n = 0
+                    for _ in pairs(type(e.waves) == "table" and e.waves or {}) do n = n + 1 end
+                    if n > 0 then PV.waves = n return end
+                end
+            end
+        end)
+    end
+    return PV.waves
+end
+-- long = more than SHORT_WAVES waves, infinite, Fool's Hunt, or the wave count unknown
+function PV.LongStage()
+    if State.eventMode then return true end
+    local n = PV.WaveCount()
+    return n == nil or n > PV.SHORT_WAVES
+end
+-- damage units on the map outside every copy of this buff unit
+function PV.OutOfBuffReach(name)
+    local copies, out = {}, false
+    for _, u in ipairs(ownedUnits()) do
+        if unitType(u) == name then
+            local p = rootPos(u)
+            if p then copies[#copies + 1] = { p, math.max(BUFF_REACH, AutoPlaceModule.StatNum(u, "range") or unitReach(u) or 0) } end
+        end
+    end
+    for _, u in ipairs(ownedUnits()) do
+        local p = unitRole(u) == "dps" and rootPos(u)
+        if p then
+            local inside = false
+            for _, c in ipairs(copies) do
+                if (c[1].X - p.X) ^ 2 + (c[1].Z - p.Z) ^ 2 <= c[2] * c[2] then inside = true break end
+            end
+            if not inside then out = true end
+        end
+    end
+    return out
+end
+-- Copies of a buff / support unit to place: summon buff 0 with no summoner down; short stage 1;
+-- long: rotating its rotation's need (BuffNeed, its cap), others 1, 2 when damage units stand out of
+-- the first copy's reach.
+function PV.BuffCopies(t, placed)
+    local kind = PV.BuffKind(t.name)
+    if kind == "summon" and not AutoPlaceModule.SummonerDown(ownedUnits()) then return 0, kind end
+    if not PV.LongStage() then return 1, kind end
+    if kind == "rotating" then return AutoPlaceModule.BuffNeed(t), kind end
+    if (placed or 0) >= 1 and PV.OutOfBuffReach(t.name) then return 2, kind end
+    return 1, kind
+end
+-- An upgrade of a buff / support unit, per yen: BUFF_STEP x the team damage / s in its reach (summon
+-- buffs: only with a summoner down; farm buffs: not); 0 past SHORT_BUFF_LEVEL on a short stage.
+-- Compared with the damage upgrades' damage / s per yen in upgradeStep.
+function PV.BuffUpScore(u, level, cost)
+    local name = unitType(u) or ""
+    local kind = PV.BuffKind(name)
+    if kind == "farm" then return 0 end
+    if kind == "summon" and not AutoPlaceModule.SummonerDown(ownedUnits()) then return 0 end
+    if not PV.LongStage() and level >= PV.SHORT_BUFF_LEVEL then return 0 end
+    local p = rootPos(u)
+    if not p then return 0 end
+    local reach = math.max(BUFF_REACH, AutoPlaceModule.StatNum(u, "range") or 0)
+    local dps = 0
+    for _, o in ipairs(ownedUnits()) do
+        local q = unitRole(o) == "dps" and rootPos(o)
+        if q and (q.X - p.X) ^ 2 + (q.Z - p.Z) ^ 2 <= reach * reach then
+            local def = AutoPlaceModule.UnitDef(unitType(o) or "") or {}
+            dps = dps + (AutoPlaceModule.StatNum(o, "damage") or tonumber(def.damage) or 0)
+                / math.max(0.1, AutoPlaceModule.StatNum(o, "attack_cooldown") or AutoPlaceModule.DefCd(def))
+        end
+    end
+    return PV.BUFF_STEP * dps / math.max(1, cost or 1)
+end
+
+-- an air-capable damage unit of ours on the map (flyers: upgrades go to those - upgradeStep)
+function PV.AirDown()
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" and AutoPlaceModule.AirCapable(unitType(u) or "", AutoPlaceModule.StatNum(u, "upgrade") or 0) then return true end
+    end
+    return false
+end
+-- flyers matter now: air need, flyers on the map, or most enemies seen this stage fly
+function PV.AirStage()
+    return AutoPlaceModule.airNeed == true or AutoPlaceModule.flying ~= nil
+        or (AutoPlaceModule.seenFly or 0) / math.max(1, AutoPlaceModule.seenN or 0) >= 0.5
 end
 
 -- Air focus is a quota, not a lock: while flyers are about, the air-capable share of the
@@ -4783,6 +5398,7 @@ AutoPlaceModule.GROWTH = 17
 -- road length (studs) under which a map counts as short (a first guess: tuned from the noted lengths)
 AutoPlaceModule.SHORT_ROAD = 350
 AutoPlaceModule.FARM_COUNT = { speedwagon = 3, bulma = 1 }
+AutoPlaceModule.GOLDEN_MONEY = 1.5 -- Golden trait: money x this (a guess - the game data has no number)
 function AutoPlaceModule.IsShiny(u)
     local st = u:FindFirstChild("_stats")
     local v = st and st:FindFirstChild("shiny")
@@ -4960,14 +5576,8 @@ function AutoPlaceModule.RangeBuff()
     return math.max(1, math.min(1.6, ratios[math.ceil(#ratios / 2)]))
 end
 function AutoPlaceModule.CarryName()
-    local best, bv
-    for _, tm in pairs(AutoPlaceModule.team) do
-        if (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" then
-            local v = AutoPlaceModule.Value(tm, tm.cost)
-            if not bv or v > bv then best, bv = tm.name, v end
-        end
-    end
-    return best
+    local t = PV.Carry()
+    return t and t.name
 end
 function AutoPlaceModule.PlanRange(t)
     local r = AutoPlaceModule.Range(t)
@@ -4983,73 +5593,33 @@ function AutoPlaceModule.PlanRange(t)
     return r
 end
 
--- After a damage unit goes down (normal stages): its share of the learned road inside its range, and
--- where it stands along the road. BAD_SPOT when it covers under half of what its range could on this
--- road (owner asked for "cov < 25%", but on a 600-stud road no single unit reaches that), or when it
--- stands in the spawn-side 20% of the road before wave 10. Noted, counted for the shared game row
--- (bad), kept for the dump; the next units avoid 8 studs around it.
-AutoPlaceModule.badLog, AutoPlaceModule.badCount, AutoPlaceModule.badAreas = {}, 0, {}
-AutoPlaceModule.BAD_COVER = 0.7 -- BAD_SPOT under this share of the best spot's road cover for the range
+-- After a damage unit goes down (normal stages): cov / best = the road in its reach against the best spot
+-- for its range and shape on this map. BAD_SPOT under BAD_COVER: noted, counted for the shared game row
+-- (bad) and kept for the dump - measurement only, it steers nothing.
+AutoPlaceModule.badLog, AutoPlaceModule.badCount = {}, 0
+AutoPlaceModule.BAD_COVER = 0.7
 function AutoPlaceModule.CheckSpot(name, spot, range)
-    local pts = AutoPlaceModule.PathPoints()
-    if State.eventMode or #pts < 8 or not range or range <= 0 then return end
+    if State.eventMode or not range or range <= 0 then return end
+    local road = PV.Road()
+    if #road.pts < 8 then return end
     local w = AutoPlaceModule.WaveNumber()
-    if w < (AutoPlaceModule.badWave or 0) then
-        AutoPlaceModule.badLog, AutoPlaceModule.badCount, AutoPlaceModule.badAreas = {}, 0, {}
-    end
+    if w < (AutoPlaceModule.badWave or 0) then AutoPlaceModule.badLog, AutoPlaceModule.badCount = {}, 0 end
     AutoPlaceModule.badWave = w
-    local inside, len = 0, 0
-    for i, q in ipairs(pts) do
-        if (q[1] - spot.x) ^ 2 + (q[3] - spot.z) ^ 2 <= range * range then inside = inside + 1 end
-        if i > 1 then len = len + math.min(10, math.sqrt((q[1] - pts[i - 1][1]) ^ 2 + (q[3] - pts[i - 1][3]) ^ 2)) end
-    end
-    local cov = inside / #pts
-    -- (against the best spot for this range on this map - 24 real scans: at range 15 the best single
-    -- spot reaches 9% of the road on Spirit World, 27% on Walled City; a fixed share flags whole maps)
-    local could = math.min(1, 2 * range / math.max(1, len))
-    if candidates and #candidates > 0 then
-        local best = 0
-        for _, c in ipairs(candidates) do
-            local n = 0
-            for _, q in ipairs(pts) do
-                if (q[1] - c.x) ^ 2 + (q[3] - c.z) ^ 2 <= range * range then n = n + 1 end
-            end
-            if n > best then best = n end
-        end
-        if best > 0 then could = best / #pts end
-    end
-    local _, goal = AutoPlaceModule.Ends()
-    local prog
-    if goal then
-        local far, near, nd, nq = 0, math.huge, nil, nil
-        for _, q in ipairs(pts) do
-            local dq = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
-            far, near = math.max(far, dq), math.min(near, dq)
-            local ds = (q[1] - spot.x) ^ 2 + (q[3] - spot.z) ^ 2
-            if not nd or ds < nd then nd, nq = ds, dq end
-        end
-        if far > near then prog = (far - nq) / (far - near) end
-    end
-    local bad = cov < AutoPlaceModule.BAD_COVER * could or (prog ~= nil and prog < 0.2 and w < 10)
-    if not bad then return end
+    if not candidates then candidates, candidatesFor = buildCandidates(pathPoints()), #pathPoints() end
+    local shape = PV.Shape(name)
+    local cov, prog = PV.Cover(spot, range, shape, road)
+    local best = PV.Best(range, shape, candidates)
+    if best <= 0 or cov >= AutoPlaceModule.BAD_COVER * best then return end
     AutoPlaceModule.badCount = AutoPlaceModule.badCount + 1
-    table.insert(AutoPlaceModule.badLog, { unit = name, cov = math.floor(cov * 100 + 0.5), could = math.floor(could * 100 + 0.5),
-        prog = prog and math.floor(prog * 100 + 0.5) or -1, wave = w, x = math.floor(spot.x), z = math.floor(spot.z), range = range })
-    table.insert(AutoPlaceModule.badAreas, { spot.x, spot.z })
-    AutoPlaceModule.Note(string.format("BAD_SPOT %s cov %d%% (could %d%%) at %d%% along the road", name, math.floor(cov * 100 + 0.5),
-        math.floor(could * 100 + 0.5), prog and math.floor(prog * 100 + 0.5) or -1))
+    table.insert(AutoPlaceModule.badLog, { unit = name, cov = math.floor(cov), best = math.floor(best), score = math.floor(100 * cov / best + 0.5),
+        prog = math.floor(prog * 100 + 0.5), wave = w, x = math.floor(spot.x), z = math.floor(spot.z), range = range })
+    AutoPlaceModule.Note(string.format("BAD_SPOT %s cov %d of best %d studs (%d%%) at %d%% along the road", name, math.floor(cov),
+        math.floor(best), math.floor(100 * cov / best + 0.5), math.floor(prog * 100 + 0.5)))
 end
-
-function AutoPlaceModule.HardLow(units)
-    if not AutoPlaceModule.Hard() then return false end
-    local top = 0
-    for _, o in ipairs(units or ownedUnits()) do
-        if unitRole(o) == "dps" then top = math.max(top, AutoPlaceModule.StatNum(o, "upgrade") or 0) end
-    end
-    return top < AutoPlaceModule.HARD_CARRY_LEVEL
-end
-local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap)
+local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
     local remote = getAARemote("upgrade_unit_ingame")
+    -- (normal stages: flyers on the map - upgrades only on units that hit them, when one is down; farms by their own call)
+    if not State.eventMode and PV.AirStage() and (onlyRole == "dps" or onlyRole == nil) and PV.AirDown() then airOnly = true end
     if not remote then return nil end
     -- (owner 2026-10-24: the always-on aura unit (hoshino) is placed early and upgraded to the top
     -- once the damage units are; rotation buffers never)
@@ -5111,7 +5681,6 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap)
         and AutoPlaceModule.WaveNumber() < (AutoPlaceModule.shortRoad and 4 or 6)
         and AutoPlaceModule.UnitDef("judar_evolved") ~= nil -- (only with the owner's roster in the game data)
         and not (AutoPlaceModule.EARLY_CARRY[carryKind] or (AutoPlaceModule.InList(AutoPlaceModule.RANK, carryKind) and not AutoPlaceModule.UP_CAP[carryKind]))
-    local hardLow = AutoPlaceModule.HardLow(units)
     local topOf = {}
     for _, o in ipairs(units) do
         local k = unitType(o) or ""
@@ -5124,7 +5693,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap)
         local capLvl = AutoPlaceModule.UP_CAP[unitType(u) or ""]
         if State.eventMode and Lobby.shieldTaken and AutoPlaceModule.ShieldBreaker(unitType(u) or "") and not AutoPlaceModule.InList(AutoPlaceModule.RANK, unitType(u)) then capLvl = 0 end
         if capLvl and (AutoPlaceModule.StatNum(u, "upgrade") or 0) >= capLvl then never = true end
-        if role ~= "buff" and not never and (not onlyRole or role == onlyRole) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
+        if (role ~= "buff" or not State.eventMode) and not never and (not onlyRole or role == onlyRole) and (not onlyUnit or u == onlyUnit) and (upgradeFails[u] or 0) < now and ControlUp.allowed(u, focus)
             and not AutoPlaceModule.OutOfReach(u) then
             local stats = u:FindFirstChild("_stats")
             local lvl = stats and stats:FindFirstChild("upgrade")
@@ -5143,11 +5712,13 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap)
             if can and waitCap and cost and cost > waitCap and not (money and cost <= money) then can = false end
             if can then
                 local rank = AutoPlaceModule.UP_FIRST[unitType(u) or ""] and 1 or RANK[role] or 2
-                if hardLow and role == "farm" then rank = 3 end
                 -- (an upgrade price not in the data: about the unit's price times the next level)
                 local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
                 local guess = (tonumber(def.cost) or 1000) * (level + 1)
                 local score = (rank == 2) and (upgradeGain(u, level) / math.max(1, cost or guess)) or -level
+                -- (normal stages: a buff / support upgrade competes with the damage upgrades by the damage it adds)
+                local buffUp = not State.eventMode and (role == "buff" or role == "support")
+                if buffUp then rank, score = 2, PV.BuffUpScore(u, level, cost or guess) end
                 -- fusion halves go by value like everything else (Vegito is only ~16% more than
                 -- the two at level 7, a forced push starved better upgrades: near loss in Hard
                 -- Room 45); a level that adds no damage (Vego 6) still moves on toward the fusion
@@ -5182,6 +5753,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap)
                 elseif State.eventMode and carry and rank == 2 and u ~= carry and u ~= carry2 and not spare
                     and not (unitType(carry) ~= "judar_evolved" and unitType(carry) ~= "cid_evolved" and AutoPlaceModule.EARLY_CARRY[unitType(u) or ""]) then
                     -- skip: the carry goes to the top first
+                elseif buffUp and score <= 0 then
+                    -- skip: this buff adds nothing worth its price now
                 elseif not pick or rank < pickRank or (rank == pickRank and isAir and not pickAir)
                     or (rank == pickRank and isAir == pickAir and score > pickScore) then
                     pick, pickLevel, pickRank, pickCost, pickScore, pickRole, pickAir = u, level, rank, cost, score, role, isAir
@@ -5306,6 +5879,7 @@ end
 function AutoPlaceModule.RoleOf(t)
     local fromDef = AutoPlaceModule.RoleFromDef(t.name)
     if fromDef then return fromDef end
+    if AutoPlaceModule.FARM_COUNT[AutoPlaceModule.BaseId(t.name)] then return "farm" end
     if AutoPlace.roles[t.name] then return AutoPlace.roles[t.name] end
     if UnitAI.learned[t.name] then return "buff" end
     return nil
@@ -5441,7 +6015,9 @@ function AutoPlaceModule.FarmPays(u, level, cost)
     -- (portals run past wave 15: a fixed 15-wave horizon stopped every farm upgrade there, so
     -- at least 8 waves are always counted; farms are sold on the last wave anyway)
     local left = math.max(AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber(), 8)
-    return cost / (nextAmount - now) <= left / 2
+    -- (a Golden farm earns more from the same upgrade)
+    local gain = (nextAmount - now) * (AutoPlaceModule.HasTrait(u, "golden") and AutoPlaceModule.GOLDEN_MONEY or 1)
+    return cost / gain <= left / 2
 end
 
 function AutoPlaceModule.LastWave()
@@ -5492,8 +6068,14 @@ local function chooseNext(prices, danger)
                 local v = AutoPlaceModule.Value(t, cost)
                 if not strongest or v > strongest then strongest, strongestDown = v, placed > 0 end
             end
+            -- (v2 money units: speedwagon x3 + bulma x1, any more only take a place on the map)
+            if role == "farm" and not State.eventMode and AutoPlaceModule.FARM_COUNT[AutoPlaceModule.BaseId(t.name)] then
+                target = math.min(target, AutoPlaceModule.FARM_COUNT[AutoPlaceModule.BaseId(t.name)])
+            end
             -- buff units: only as many as the rotation needs (6 Erwins = money not spent on damage)
-            if role == "buff" then target = math.min(target, AutoPlaceModule.BuffNeed(t)) end
+            -- (normal stages: PV.BuffCopies - by kind and stage length, buff and support alike)
+            if (role == "buff" or role == "support") and not State.eventMode then target = math.min(target, (PV.BuffCopies(t, placed)))
+            elseif role == "buff" then target = math.min(target, AutoPlaceModule.BuffNeed(t)) end
             local resting = (AutoPlaceModule.noSpot[t.uuid] or 0) > os.clock()
             if role == "farm" and AutoPlace.sellFarmsLast and AutoPlaceModule.LastWave() then resting = true end
             if not AutoPlaceModule.full[t.uuid] and not resting and placed < target then
@@ -5504,6 +6086,7 @@ local function chooseNext(prices, danger)
     end
     -- (no price known for any damage unit yet: values are all 0, nothing to wait for)
     strongestDown = strongestDown ~= false or (strongest or 0) <= 0
+    AutoPlaceModule.placeable = list
     if #list == 0 then return nil, nil, nil, dpsPlaced, strongestDown end
     -- damage unit with the most damage per ¥ (traits and rolls included); cheaper on a tie,
     -- so with no prices known yet this is the cheapest one
@@ -5535,15 +6118,13 @@ local function chooseNext(prices, danger)
         end
         return best
     end
-    -- the best-value damage unit, then the farms, then support (cheaper upgrades before upgrading)
-    -- (hard stage: a farm only while fewer farms than damage units are down - Daily Challenge lost
-    -- at wave 3 with 4 farms and one damage unit)
-    local pick = ((dpsPlaced == 0 or (AutoPlaceModule.Hard() and farmsPlaced >= dpsPlaced)) and bestDps())
-        or cheapest("farm") or cheapest("support")
-    -- (normal stages: the first support / aura unit (hoshino) goes down once 2 damage units are, before
-    -- more damage units - on Shibuya it never came: a damage unit was always picked first)
-    local sup = not State.eventMode and dpsPlaced >= 2 and cheapest("support")
-    if sup and sup.placed == 0 and not (pick and pick.role == "support") then pick = sup end
+    -- the best-value damage unit, then the farms, then support (normal stages: v2Plan sets the order first)
+    -- (a Golden farm copy first among the farms: it earns more)
+    local goldFarm
+    for _, e in ipairs(list) do
+        if e.role == "farm" and AutoPlaceModule.TraitMods(e.t.traits).money > 1 and (not goldFarm or e.cost < goldFarm.cost) then goldFarm = e end
+    end
+    local pick = (dpsPlaced == 0 and bestDps()) or goldFarm or cheapest("farm") or cheapest("support")
     -- air share below its quota: the next damage unit is an air-capable one (if one is left)
     if not pick and AutoPlaceModule.airNeed then
         local best = bestDps()
@@ -5781,6 +6362,67 @@ function AutoPlaceModule.EventChoose(money)
     return 0.5
 end
 
+-- v2 order (normal stages): the steps of PV.Steps in turn - the first one not done yet acts.
+--   carry: place the carry | carryUp: its upgrades to CARRY_LEVEL | carryMax: its upgrades to the top
+--   slow: place a slow unit | farms: place the money units | farmUps: farm upgrades that pay back
+--   damageUps: damage upgrades | rest: the normal choice below (chooseNext, value per ¥)
+-- Returns a wait, or a team entry to place (t, role, slot), or nothing (go on with the rest).
+local function v2Plan(money, danger)
+    -- (flying enemies on the map, or most enemies seen here fly: the air rules below choose - owner rule, not in the spec)
+    if PV.AirStage() then AutoPlaceModule.v2Why = "air" return nil end
+    local steps, why = PV.Steps(danger)
+    AutoPlaceModule.v2Why = why
+    local list = AutoPlaceModule.placeable or {}
+    local function entry(test)
+        local best
+        for _, e in ipairs(list) do
+            if test(e) and (not best or e.cost < best.cost or (e.cost == best.cost and e.slot < best.slot)) then best = e end
+        end
+        return best
+    end
+    local carry = PV.Carry()
+    for _, step in ipairs(steps) do
+        if step == "rest" then return nil end
+        if step == "carry" and carry and #placedOf(carry.uuid) == 0 then
+            local e = entry(function(x) return x.t.uuid == carry.uuid end)
+            if e then return nil, e.t, e.role, e.slot end
+        elseif (step == "carryUp" or step == "carryMax") and AutoPlace.upgrade then
+            local cu, lv = PV.CarryUnit()
+            if cu and (step == "carryMax" or lv < PV.CARRY_LEVEL) then
+                local wait = upgradeStep(money, "dps", nil, nil, nil, cu)
+                if wait then return wait end
+            end
+        elseif step == "slow" then
+            local e = entry(function(x) return x.role == "dps" and x.placed == 0 and PV.IsSlow(x.t.name) end)
+            if e then return nil, e.t, e.role, e.slot end
+        elseif step == "farms" then
+            -- (a Golden copy first: it earns more)
+            local e = entry(function(x) return x.role == "farm" and AutoPlaceModule.TraitMods(x.t.traits).money > 1 end)
+                or entry(function(x) return x.role == "farm" end)
+            if e then return nil, e.t, e.role, e.slot end
+        elseif step == "farmUps" and AutoPlace.upgrade then
+            local wait = upgradeStep(money, "farm")
+            if wait then return wait end
+        elseif step == "damageUps" then
+            -- (a new damage copy when it adds more damage per ¥ than the best upgrade, else the upgrade)
+            local e, ev
+            for _, x in ipairs(list) do
+                if x.role == "dps" then
+                    local v = AutoPlaceModule.Value(x.t, x.cost ~= math.huge and x.cost or nil)
+                    if not e or v > ev then e, ev = x, v end
+                end
+            end
+            if e and (not AutoPlace.upgrade or ev >= AutoPlaceModule.BestUpgradeScore()) then return nil, e.t, e.role, e.slot end
+            if AutoPlace.upgrade then
+                local wait = upgradeStep(money, "dps")
+                if wait then return wait end
+            end
+            if e then return nil, e.t, e.role, e.slot end
+        end
+    end
+    return nil
+end
+
 local function tick()
     AutoPlaceModule.idleMoney = nil
     -- (where the last tick got to, for the live status: a step that never returns shows here)
@@ -5789,11 +6431,13 @@ local function tick()
     if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
     local grew = samplePath()
     if grew then AutoPlaceModule.pathGrewAt = os.clock() end
+    if not State.eventMode then pcall(PV.SpeedStep) end
     if grew and #pathPoints() % 20 == 0 then saveConfig() end
     pcall(AutoPlaceModule.DumpStep)
-    if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
+    -- (an empty team is read again at most every 15 s on a normal stage: each read walks all memory - getgc)
+    if not next(AutoPlaceModule.team) and (State.eventMode or os.clock() - (AutoPlaceModule.teamReadAt or -1e9) >= 15) then AutoPlaceModule.RefreshTeam() end
     -- event hotbar: new random units arrive during the game (read again every 5 s)
-    if AutoPlaceModule.hotbarAt and os.clock() - AutoPlaceModule.hotbarAt > 5 then AutoPlaceModule.RefreshTeam() end
+    if State.eventMode and AutoPlaceModule.hotbarAt and os.clock() - AutoPlaceModule.hotbarAt > 5 then AutoPlaceModule.RefreshTeam() end
     -- part of the team came only from units on the map (no traits/rolls): read again now and then
     -- (once per game: getgc walks every table in memory, and the team often never shows up)
     if os.clock() - (AutoPlaceModule.teamReadAt or 0) > 15 and not AutoPlaceModule.extraTeamRead then
@@ -5919,6 +6563,11 @@ local function tick()
         if wait then return wait end
         t, role, slot = et, er, et.slot
     end
+    if not ev and not State.eventMode and not AutoPlace.manual then
+        local wait, vt, vrole, vslot = v2Plan(money, danger)
+        if wait then return wait end
+        if vt then t, role, slot = vt, vrole, vslot end
+    end
     if not ev then
     -- Fool's Hunt: 20 units at most on the map (seen in the real game); then the money goes into
     -- upgrades instead of refused placements
@@ -5949,8 +6598,8 @@ local function tick()
         if t and AutoPlaceModule.hotbarAt and #ownedUnits() >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) then t = nil end
     end
     -- (lost twice here: no farm upgrades until every damage unit is down)
-    if not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and strongestDown
-        and (AutoPlaceModule.Losses() < 2 or (t == nil or role ~= "dps")) and not AutoPlaceModule.HardLow()
+    if State.eventMode and not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and strongestDown
+        and (AutoPlaceModule.Losses() < 2 or (t == nil or role ~= "dps"))
         and (not t or (role ~= "farm" and role ~= "support")) then
         -- once the strongest damage unit and every farm are down, farm upgrades pay for
         -- themselves quickly (speedwagon 200 -> 500 per wave), so they come before spreading
@@ -5967,7 +6616,10 @@ local function tick()
             if untilT > os.clock() then resting = resting + 1 end
         end
         if AutoPlace.upgrade then
-            local wait = upgradeStep(money)
+            -- (normal stages, flyers on the map: air upgrades first - upgradeStep - then farms)
+            local wait
+            if PV.AirStage() and not State.eventMode then wait = upgradeStep(money) or upgradeStep(money, "farm")
+            else wait = upgradeStep(money) end
             if wait then return wait end
         end
         if resting > 0 then
@@ -6037,7 +6689,7 @@ local function tick()
     local kind = AutoPlaceModule.PlacementKind(t)
     local aoe = AutoPlaceModule.IsAoe(t.name)
     local back = AutoPlaceModule.IsTrap(t.name) and AutoPlaceModule.AirCapable(t.name, 0)
-    AutoPlaceModule.placingName = t.name
+    AutoPlaceModule.placingName, AutoPlaceModule.placingT = t.name, t
     local spot = bestSpot(unknown and (unknownTries % 3) or 0, role, range, kind, aoe, back) or bestSpot(0, role, range, kind, aoe, back)
     if not spot then
         -- no spot of this kind (e.g. a hill unit on a map without free hills): let the
@@ -6070,7 +6722,7 @@ local function tick()
             AutoPlaceModule.full[t.uuid], AutoPlaceModule.badTemp[t.uuid] = true, true
             AutoPlaceModule.capFails = 0
             if t.slot then AutoPlaceModule.usedSlot[t.slot] = { id = t.name, at = placeStart } end
-            AutoPlaceModule.hotbarAt, AutoPlaceModule.hotbarSig = 0, nil
+            AutoPlaceModule.hotbarAt = 0
         end
         AutoPlaceModule.failsBy[t.uuid], recentBad = 0, {}
         t.spotRefused = 0
@@ -6457,7 +7109,7 @@ function AutoPlaceModule.DumpStep()
             end
             table.insert(units, { id = unitType(u) or "?", role = unitRole(u), range = range, x = math.floor(p.X * 10) / 10,
                 y = math.floor(p.Y * 10) / 10, z = math.floor(p.Z * 10) / 10, level = AutoPlaceModule.StatNum(u, "upgrade") or 0,
-                cov = #pts > 0 and math.floor(100 * inside / #pts + 0.5) or -1 })
+                cov = #pts > 0 and math.floor(100 * inside / #pts + 0.5) or -1, covBest = PV.CovBest(u) })
         end
     end
     local function base(side)
@@ -6471,7 +7123,9 @@ function AutoPlaceModule.DumpStep()
         version = Lobby and Lobby.VERSION, time = os.date("%Y-%m-%d %H:%M:%S"), spawn = xz(s), base = xz(g), swapped = swapped,
         pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog,
         short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
-        road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath() }
+        road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath(), hills = PV.HillSpots(),
+        v2 = { rl = PV.Road().len, kind = PV.Kind(PV.Road().len), from = PV.Road().from, lanes = PV.Road().lanes, order = AutoPlaceModule.v2Why,
+            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName() } }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
@@ -11149,7 +11803,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-230634"
+Lobby.VERSION = "20261025-232251"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -11219,8 +11873,10 @@ function Lobby.UnitRows()
             end
             cov = math.floor(100 * inside / #pts + 0.5)
         end
+        -- (7th: cov / best for its range on this map, 0-100 - Auto Place v2)
+        local okB, covBest = pcall(AutoPlaceModule.V2.CovBest, u)
         table.insert(rows, { unitType(u) or "?", AutoPlaceModule.StatNum(u, "upgrade") or 0, trait,
-            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1, cov })
+            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1, cov, (not State.eventMode and okB) and covBest or -1 })
     end
     return rows
 end
@@ -11244,6 +11900,13 @@ function Lobby.ShareGame(win, wave)
         candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units,
         -- (normal stages: BAD_SPOT count and whether the learned road reached our base)
         bad = not State.eventMode and (AutoPlaceModule.badCount or 0) or nil,
+        -- (v2: road length, buff coverage % of the team's damage)
+        rl = not State.eventMode and AutoPlaceModule.V2.lastLen or nil,
+        bs = (function()
+            if State.eventMode then return nil end
+            local ok, v = pcall(AutoPlaceModule.V2.BuffShare)
+            return ok and v or nil
+        end)(),
         -- (dungeon games: stuck screens since the last shared dungeon game, the last one by name)
         stuck = DungeonRun.InRoom() and (DungeonRun.stuckTotal or 0) or nil,
         stuckAt = DungeonRun.InRoom() and DungeonRun.lastStuck or nil,
