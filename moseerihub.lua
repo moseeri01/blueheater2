@@ -5053,7 +5053,9 @@ function AutoPlaceModule.EventChoose(money)
             -- (under 6 damage units any damage copy goes down - Snowy Town was lost at wave 7 with 4 units;
             -- Arlem only never: 5000 for a hit every 60 s)
             local thin = role == "dps" and AutoPlaceModule.DamageCount(units) < 6 and t.name ~= "armin"
-            if (AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or AutoPlace.skip[t.name]) and not thin then why = "on the never / skip list"
+            -- (the owner's Never list always wins - shared data 2026-10-25: natsu, sabo, narberal, vanilla_ice,
+            -- akainu were placed in 52 games while the team was thin, all left at level 0)
+            if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or (AutoPlace.skip[t.name] and not thin) then why = "on the never / skip list"
             -- (place-only units - nagumo, jiraiya, emilia: one of each; three nagumos took three places)
             elseif AutoPlaceModule.UP_CAP[t.name] == 0 and AutoPlaceModule.CountKind(units, t.name) >= 1 then why = "one is enough"
             elseif role == "farm" then
@@ -8457,7 +8459,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-092218"
+Lobby.VERSION = "20261025-092714"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
