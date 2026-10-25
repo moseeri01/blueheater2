@@ -2961,6 +2961,8 @@ local function pathPoints()
     return AutoPlace.paths[key]
 end
 
+AutoPlaceModule.PathPoints = function() return pathPoints() end
+
 local function rootPos(model)
     local root = model:FindFirstChild("HumanoidRootPart")
     if root then
@@ -7265,6 +7267,7 @@ task.spawn(function()
             -- (per-game card memory starts empty: a Replay keeps the script running)
             Lobby.cardsTaken, Lobby.badTaken, Lobby.resTaken, Lobby.regenTaken, Lobby.shieldTaken = nil, nil, nil, nil, nil
             Lobby.candy, Lobby.pendingVote, Lobby.spells, Lobby.buffMain = nil, nil, nil, nil
+            Lobby.depthByWave, Lobby.lastDepth = {}, nil
             -- (mainSeen is kept across games, as before: resetting it let weak copies fill the early map)
             AutoPlaceModule.capSeen, AutoPlaceModule.capFails = nil, 0
             startSnap, gameWave = playerSnapshot(), 0
@@ -8461,7 +8464,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-095922"
+Lobby.VERSION = "20261025-101208"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8610,6 +8613,7 @@ function Lobby.Loop()
                 AutoPlaceModule.Catalog.save("live_status.txt", table.concat(Lobby.live, "\n"))
             end)
         end
+        if State.eventMode and not inLobbyNow then pcall(Lobby.SampleDepth) end
         -- (wave each unit was placed, for the shared game data: not only while Watch is on)
         if State.eventMode and not inLobbyNow then
             pcall(function()
@@ -8788,6 +8792,47 @@ function Lobby.CardGain(opt)
     return gain
 end
 
+-- How far the front enemy got along this map's recorded road (0 = their spawn, 1 = our base), the
+-- deepest point per wave. Read by the card choice as the team's margin (owner 2026-10-25: choose
+-- by how strong the team is now, not by the wave number alone).
+Lobby.depthByWave = {}
+function Lobby.SampleDepth()
+    local pts = AutoPlaceModule.PathPoints and AutoPlaceModule.PathPoints() or {}
+    if #pts < 8 then return end
+    local folder = unitsFolder()
+    local deepest = 0
+    for _, u in ipairs(folder and folder:GetChildren() or {}) do
+        if AutoPlaceModule.IsEnemy(u) then
+            local p = AutoPlaceModule.RootPos(u)
+            if p then
+                local bi, bd = 1, math.huge
+                for i = 1, #pts, 2 do
+                    local q = pts[i]
+                    local d = (q.X - p.X) ^ 2 + (q.Z - p.Z) ^ 2
+                    if d < bd then bi, bd = i, d end
+                end
+                deepest = math.max(deepest, bi / #pts)
+            end
+        end
+    end
+    local w = AutoPlaceModule.WaveNumber()
+    Lobby.depthByWave[w] = math.max(Lobby.depthByWave[w] or 0, deepest)
+end
+-- The deepest point of the last 3 waves (nil until a road is known)
+function Lobby.Margin()
+    local w, m = AutoPlaceModule.WaveNumber(), nil
+    for i = w - 2, w do
+        local d = Lobby.depthByWave[i]
+        if d then m = math.max(m or 0, d) end
+    end
+    return m
+end
+-- (depth limits, from the strategy simulator 2026-10-25, 1500 games each: Bad cards taken "because the
+-- team looks strong" cost waves AND coins at every threshold (strong 0.45: w17.2 / 232 coins vs w20.9 /
+-- 289 with none); Good-only once enemies pass 30%% of the road: w22.6 / 303 coins vs w20.7 / 287 with the
+-- wave-6 rule. So: no strong override, weak at 0.3)
+Lobby.DEPTH_STRONG, Lobby.DEPTH_WEAK = 0, 0.3
+
 -- The card to pick: "Most coins" takes the Bad card that hurts least (each adds 0.3 to the
 -- coin multiplier) unless the base is losing HP or every Bad card is heavy; "Safest" takes a
 -- Good card whenever there is one.
@@ -8815,7 +8860,15 @@ function Lobby.PickCard(options)
     -- - Good cards only reached wave 23 on average vs 18, with 22% MORE coins, since coins come
     -- mostly from the waves lived; Bad cards on every offer was the worst play tested, -35% coins)
     local late = State.eventMode and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL
+    -- (by the margin when the road is known: strong = a light Bad card even late; weak = Good only)
+    local depth = State.eventMode and Lobby.Margin()
+    Lobby.lastDepth = depth
+    if depth then
+        if depth >= Lobby.DEPTH_WEAK then late = true
+        elseif depth < Lobby.DEPTH_STRONG and not hurt then late = false end
+    end
     if good and (Lobby.cfg.cardMode == "Safest" or late or hurt or not bestBad or bestBadCost > 0.8) then return good, "help" end
+    if good and depth and AutoPlaceModule.WaveNumber() >= Lobby.BAD_CARDS_UNTIL and bestBadCost >= Lobby.AVOID then return good, "help" end
     if yen and bestBad and bestBadCost >= Lobby.AVOID then return yen, "yen over a heavy Bad card" end
     if yen and not good and (Lobby.cfg.cardMode == "Safest" or late or hurt) then return yen, "help" end
     return bestBad or 1, "coins"
@@ -8913,7 +8966,7 @@ function Lobby.OnCardResult(picked, state)
     if type(state) == "table" then Lobby.candy = tonumber(state.candy_multiplier) or Lobby.candy end
     if type(picked) == "table" then
         Lobby.cardsTaken = Lobby.cardsTaken or {}
-        table.insert(Lobby.cardsTaken, { AutoPlaceModule.WaveNumber(), tostring(picked.title) })
+        table.insert(Lobby.cardsTaken, { AutoPlaceModule.WaveNumber(), tostring(picked.title), Lobby.lastDepth and math.floor(Lobby.lastDepth * 100) or -1 })
     end
     if type(picked) == "table" then
         for _, e in ipairs(Lobby.AsList(type(picked.effects) == "table" and picked.effects or {})) do
