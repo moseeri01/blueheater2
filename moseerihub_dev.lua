@@ -8773,12 +8773,33 @@ section:Button({ Name = "Copy buff report", Callback = UnitAIModule.BuffReport }
 end
 
 
+-- The event rooms the game runs now (GameplaySettings.ACTIVE_DUNGEONS: lobby room -> level id),
+-- named for the Stage list so the owner sees where Auto join goes (2026-10-25: two event rooms,
+-- Cursed Womb needs a key, Fool's Hunt does not - joining "any" could pick the wrong one).
+Lobby.EVENT_NAMES = { april2_event = "Fool's Hunt", jjk_finger = "Cursed Womb" }
+function Lobby.EventList()
+    local out = {}
+    pcall(function()
+        local gs = require(ReplicatedStorage.src.Data.GameplaySettings)
+        for room, id in pairs(type(gs) == "table" and gs.ACTIVE_DUNGEONS or {}) do
+            local name = Lobby.EVENT_NAMES[tostring(id)] or tostring(id)
+            table.insert(out, { room = tostring(room), id = tostring(id), name = name })
+        end
+    end)
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
+
 -- Stage lists for Auto join from the game's own Worlds data: Story / Infinite (worlds with
 -- levels), Legend (legend_stage), Raid (raid_world); the Infinity Mansion has no world.
 function Lobby.Worlds(mode)
     local out, seen, rank = {}, {}, {}
     if mode == "Infinity Mansion" then return { "Infinity Mansion" } end
-    if mode == "Event" then return { "Current event" } end
+    if mode == "Event" then
+        local out = { "Any event" }
+        for _, e in ipairs(Lobby.EventList()) do table.insert(out, e.name) end
+        return out
+    end
     pcall(function()
         -- game order, first choice: the game's own WorldLevelOrder list (world ids, or
         -- tables naming one), position = rank
@@ -8890,7 +8911,11 @@ function Lobby.Join()
         -- join call alone (made from across the lobby) did not start it in the real game, so
         -- the character is moved onto the room's floor, like walking in; the call follows.
         local join = getAARemote("request_join_lobby")
-        for _, room in ipairs(Lobby.Rooms("event")) do
+        -- (only the chosen event's room when one is picked in Stage)
+        local only
+        for _, e in ipairs(Lobby.EventList()) do if e.name == c.world then only = e.room end end
+        local rooms = only and { only } or Lobby.Rooms("event")
+        for _, room in ipairs(rooms) do
             local model
             for _, d in ipairs(workspace:GetDescendants()) do
                 if d:IsA("Model") and d.Name == room then model = d break end
@@ -8964,7 +8989,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-125757"
+Lobby.VERSION = "20261025-125819"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
