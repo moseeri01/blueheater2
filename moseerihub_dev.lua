@@ -8453,6 +8453,8 @@ function DungeonRun.StartButton()
 end
 function DungeonRun.OpenWindowStep(st)
     if DungeonRun.ChoiceOpen() then DungeonRun.closedSince = nil return nil end
+    -- (You Died! first: the green Start under it only answers "error")
+    if Lobby.ButtonFor("You Died!") then return nil end
     local running = st ~= nil and st.live and #st.rooms > 0 and not st.ended
     local keys = DungeonRun.KeyCount()
     if not running and not (keys and keys > 0) then return nil end
@@ -8607,12 +8609,66 @@ end
 -- buffs and chests plus, curses minus by how bad they are for this team - ACCEPT when the total is
 -- above 0; with 1 life left any curse is DENIED unless a gold chest comes with it. The accept / deny
 -- call is not recorded yet: the button is tapped by GUI (Watch logs the call the game sends).
-DungeonRun.SHRINE_GOOD = { { "philosoph", 5 }, { "gold", 4 }, { "rare chest", 4 }, { "cost", 3 }, { "attack cooldown", 3 }, { "boots", 3 },
-    { "attack speed", 3 }, { "chest", 2.5 }, { "damage", 2.5 }, { "dmg", 2.5 }, { "attack", 2 }, { "range", 1.5 }, { "luck", 1 } }
-DungeonRun.SHRINE_BAD = { { "fly", 6 }, { "flight", 6 }, { "armor", 2.5 }, { "health", 2.5 }, { "hp", 2.5 }, { "speed", 2.5 },
-    { "faster", 2.5 }, { "frenzy", 2.5 }, { "wind", 2.5 }, { "regen", 2 }, { "vampir", 2 }, { "shield", 2 }, { "burst", 2 },
-    { "explo", 2 }, { "erupt", 2 }, { "chaos", 3 }, { "money", 0.8 }, { "hoard", 0.8 }, { "shop", 0.8 } }
 DungeonRun.SHRINE_SKIP = { "shrine", "accept", "deny", "do you accept", "you will receive" }
+-- An item's "<name> <effect>": our catalog by the game's id, else the wiki's list by name (the id read as
+-- words: philosophers_stone -> Philosopher's Stone); the game's id stays the key.
+function DungeonRun.ItemText(id)
+    id = tostring(id or "")
+    for _, kind in ipairs({ "shop", "shrine" }) do
+        for _, it in ipairs(DungeonRun.ItemList(kind)) do
+            if it.id == id and it.effect ~= "(seen in game)" then return it.name .. " " .. it.effect end
+        end
+    end
+    local norm = string.lower(id):gsub("[^a-z]", "")
+    for name, effect in pairs(DungeonRun.WIKI_EFFECTS) do
+        local n = name:gsub("[^a-z]", "")
+        if norm ~= "" and #n >= 3 and (norm:find(n, 1, true) or n:find(norm, 1, true)) then return name .. " " .. effect end
+    end
+    return id
+end
+-- What an item / curse is worth to THIS team (AA wiki effects, owner 2026-10-25): damage only by our
+-- share of that damage type (Archmage's Hat +250% magic x our magic share), cost cuts by size (more
+-- before depth 10), Philosopher's Stone highest, chest luck / range / cooldown in between; curses by
+-- danger - Frenzy / Health / Flight with no air unit worst, Wind / Armor / Shielding / Regen middle,
+-- Money / Shopping small, Chaos bad - x1.5 at 2 lives or less. Returns value, isCurse.
+DungeonRun.CURSE_DANGER = { { "frenzy", 6 }, { "health", 6 }, { "hp", 6 }, { "flight", 8 }, { "fly", 8 }, { "chaos", 4 },
+    { "wind", 3 }, { "armor", 3 }, { "shield", 3 }, { "regen", 3 }, { "vampir", 3 }, { "burst", 3 }, { "erupt", 2.5 },
+    { "explo", 2.5 }, { "speed", 4 }, { "faster", 4 }, { "money", 1 }, { "hoard", 1 }, { "shop", 1 } }
+function DungeonRun.ItemValue(text, lives)
+    local low = string.lower(tostring(text))
+    local pct = tonumber(low:match("(%d+)%%")) or 0
+    if low:find("curse", 1, true) or low:find("[*]", 1, true) then
+        local v = 2
+        for _, b in ipairs(DungeonRun.CURSE_DANGER) do
+            if low:find(b[1], 1, true) then
+                v = b[2]
+                if (b[1] == "flight" or b[1] == "fly") and DungeonRun.TeamHitsAir() then v = 2 end
+                break
+            end
+        end
+        if lives ~= nil and lives <= 2 then v = v * 1.5 end
+        return -v, true
+    end
+    local share = DungeonRun.TeamShare()
+    if low:find("philosoph", 1, true) then return 10, false end
+    if low:find("rare chest", 1, true) or (low:find("gold", 1, true) and low:find("chest", 1, true)) then return 4, false end
+    if low:find("cost", 1, true) then return pct / 10 * ((DungeonRun.lastDepth or 0) < 10 and 1.3 or 1), false end
+    for _, t in ipairs({ "magic", "physical", "true" }) do
+        if low:find(t .. " dmg", 1, true) or low:find(t .. " damage", 1, true) then return pct / 100 * 4 * (share[t] or 0), false end
+        if low:find(t .. " crit", 1, true) then return pct / 100 * 1.5 * (share[t] or 0), false end
+    end
+    if low:find("chest luck", 1, true) then return pct / 40, false end
+    if low:find("cooldown", 1, true) or low:find("attack speed", 1, true) then return pct / 8, false end
+    if low:find("range", 1, true) then return pct / 100 * 2, false end
+    if low:find("boss", 1, true) then return pct / 50, false end
+    if low:find("slower", 1, true) then return pct / 15, false end
+    if low:find("star remnant", 1, true) then return 1.5, false end
+    if low:find("chest", 1, true) then return 2.5, false end
+    if low:find("boots", 1, true) then return 2.5, false end
+    if low:find("attack", 1, true) or low:find("dmg", 1, true) or low:find("damage", 1, true) then return pct / 30, false end
+    -- (an effect we do not know: worth too little to spend coins on, a small plus in a shrine offer)
+    return 0.2, false
+end
 -- The offer's rows, each "name / effect" with its value. The page data names the offer by item id
 -- ({ _t = "7", data = { {id = "boots"}, {id = "chest_mock_item"}, {id = "_curse_super_armored"} } }, device
 -- 21:31 2026-10-25); without it the page's rows are read: every label under one row of the list joined
@@ -8628,6 +8684,7 @@ function DungeonRun.ShrineRows(page, data)
                     if item.id == id then text = id .. " / " .. item.name .. " / " .. item.effect end
                 end
             end
+            if text == id then text = DungeonRun.ItemText(id) end
             if id:find("^_curse") and not text:lower():find("curse", 1, true) then text = text .. " / curse" end
             table.insert(rows, text)
         end
@@ -8656,28 +8713,11 @@ function DungeonRun.ShrineRows(page, data)
 end
 function DungeonRun.ShrineOffer(page, lives, data)
     local rows, total, curses, gold = {}, 0, 0, false
-    local air = DungeonRun.TeamHitsAir()
     for _, text in ipairs(DungeonRun.ShrineRows(page, data)) do
+        local value, curse = DungeonRun.ItemValue(text, lives)
+        if curse then curses = curses + 1 end
         local low = string.lower(text)
-        local value = 0
-        if low:find("curse", 1, true) or text:find("[*]", 1, true) then
-            curses = curses + 1
-            value = -2
-            for _, b in ipairs(DungeonRun.SHRINE_BAD) do
-                if low:find(b[1], 1, true) then
-                    value = -b[2]
-                    if (b[1] == "fly" or b[1] == "flight") and air then value = -1.5 end
-                    break
-                end
-            end
-            if lives ~= nil and lives <= 2 then value = value * 1.5 end
-        else
-            value = 1
-            for _, g in ipairs(DungeonRun.SHRINE_GOOD) do
-                if low:find(g[1], 1, true) then value = g[2] break end
-            end
-            if low:find("gold", 1, true) or low:find("rare chest", 1, true) or low:find("philosoph", 1, true) then gold = true end
-        end
+        if not curse and (low:find("gold", 1, true) or low:find("rare chest", 1, true) or low:find("philosoph", 1, true)) then gold = true end
         total = total + value
         table.insert(rows, string.format("%s (%+.1f)", text, value))
     end
@@ -9197,7 +9237,6 @@ end
 -- Shop: dungeon_buy_shop(<slot number in the list now>) - the list shifts after each buy - then
 -- dungeon_continue_shop(). Chest page: dungeon_open_chest(true) opens a gold chest (treasure_gold
 -- - 1); false is not known yet, so silver chests are left alone. (Watch, real game 15:59 2026-10-25)
-DungeonRun.SHOP_DEFAULT = { "shroom", "branch", "bow" }   -- cost down first, then range
 DungeonRun.PRICES = { gold_branch = 300, bow2 = 300, gold_shroom = 500 }
 -- Shop items and shrine buffs seen in the real game (names / effects from the owner's screenshots,
 -- 2026-10-25). New shop ids are learned from each shop page (Lobby.cfg.dungeonItems) and item
@@ -9337,13 +9376,22 @@ function DungeonRun.ShopPick(items, money)
         if prefs[id] == "prefer" and affordable(id) then return i, id end
     end
     local wishes = auto and {} or DungeonRun.wishes()
-    if #wishes == 0 then wishes = DungeonRun.SHOP_DEFAULT end
     for _, w in ipairs(wishes) do
         for i, it in ipairs(list) do
             local id = idOf(it)
             if id:find(w, 1, true) and prefs[id] ~= "avoid" and affordable(id) then return i, id end
         end
     end
+    -- (no wish-list: the item worth most to THIS team - DungeonRun.ItemValue; worth almost nothing: kept)
+    local best, bestI, bestId
+    for i, it in ipairs(list) do
+        local id = idOf(it)
+        if prefs[id] ~= "avoid" and affordable(id) then
+            local v = DungeonRun.ItemValue(DungeonRun.ItemText(id))
+            if v > 0.3 and (not best or v > best) then best, bestI, bestId = v, i, id end
+        end
+    end
+    return bestI, bestId
 end
 function DungeonRun.PageStep(st, page)
     local kind = type(page) == "table" and tostring(page._t) or "?"
@@ -9551,6 +9599,12 @@ end
 
 -- The next run after one ended: one dungeon_start() per ended run, never retried.
 function DungeonRun.TryStart()
+    -- (You Died! still up: it closes the old run first - dungeon_start answered "error" under it, 22:56)
+    if Lobby.ButtonFor("You Died!") then
+        DungeonRun.status = "waiting for You Died! to close"
+        DungeonRun.Refresh(false)
+        return 3
+    end
     DungeonRun.pendingStart = false
     saveConfig()
     -- (the game may already have started the next run itself, after You Died! Continue)
@@ -11095,7 +11149,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-222525"
+Lobby.VERSION = "20261025-230634"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -11387,19 +11441,16 @@ function Lobby.DiedStep(inLobbyNow)
             return r:InvokeServer(arg)
         end)
         log(string.format("step %d: %s(%s) answered %s", d.step, name, arg == nil and "" or tostring(arg), clip(tostring(ok and answer or "error"), 40)))
+        -- (a call that errors gets no answer later either: the next step at once - 22:55 2026-10-25)
+        if not ok then d.at = -1e9 end
     end
     if d.step == 1 then
         local b = Lobby.ButtonFor("Continue")
         if b then Lobby.TapGui(b) log("step 1: tapped Continue") else log("step 1: no Continue button") end
-    elseif d.step == 2 then
-        call("dungeon_open_chest", true, tonumber(res.treasure_gold))
-    elseif d.step == 3 then
-        call("dungeon_open_chest", false, tonumber(res.treasure))
-    elseif d.step == 4 then
-        call("dungeon_continue_death", nil)
-    elseif inLobbyNow then
-        log("still up in the lobby - press Continue by hand")
-    else
+    elseif d.step == 2 and not inLobbyNow then
+        -- (in the room the calls below only answered "error" (22:55): back to the lobby at once, the
+        -- You Died! page shows again there and its Continue works)
+        d.step = 5
         local back, remote = Lobby.ButtonFor("Return to lobby"), getAARemote("teleport_back_to_lobby")
         local how
         if back then
@@ -11411,7 +11462,15 @@ function Lobby.DiedStep(inLobbyNow)
             pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
             how = "teleport to the lobby"
         end
-        log("step 5: no answer - " .. how)
+        log("in the room, no answer - " .. how)
+    elseif d.step == 2 then
+        call("dungeon_open_chest", true, tonumber(res.treasure_gold))
+    elseif d.step == 3 then
+        call("dungeon_open_chest", false, tonumber(res.treasure))
+    elseif d.step == 4 then
+        call("dungeon_continue_death", nil)
+    else
+        log("still up in the lobby - press Continue by hand")
     end
 end
 
