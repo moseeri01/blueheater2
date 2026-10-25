@@ -102,7 +102,7 @@ local AutoPlace = {
     unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
     stageLosses = {},             -- [stage] = recent losses there (each win takes one off): play safer
     stopTimes = {},               -- [control skill id] = { dur = s a stop lasts, gap = s enemies stay immune } (measured)
-    preset = "Custom",            -- last preset picked ("Fast farm" / "Safe"); Custom = set by hand
+    preset = "Custom",            -- last preset picked ("Safe" / "Balanced" / "Fast"; old saves "Fast farm"); Custom = set by hand
     showDetails = false,          -- full Auto Place status (team, ranking, 6 actions) instead of the short one
     placeMode = "Balanced",       -- damage units: "Safe" near our base, "Fast clear" near the enemy spawn
     lastTeam = {},                -- [slot] = { uuid, name } last read from game data (used when it is not readable)
@@ -2987,6 +2987,10 @@ PV.MIN_NORMAL = 0.85                   -- a spot's ground must be flatter than t
 PV.REFUSED_GONE = 3                    -- a refused spot and this far around it: never tried again this game
 PV.PLACE_REACH = 30                    -- hill-placement spots at most this far from the road
 PV.SUMMON_COVER = 0.5                  -- a summoner's summons work along this share of the road (margin)
+-- Fool's Hunt on the v2 spot rules (AutoPlace.v2Event = true; off by default - owner 2026-10-26, on hold): the road, cov / best, the carry /
+-- damage / slow / summoner / buff spots; Merge keeps its rule (a copy next to its own kind first). What to buy
+-- stays the event brain's (EventChoose).
+function PV.EventOn() return AutoPlace.v2Event == true end
 -- The map's hill-placement parts (Hill4_Placement ...): parts under _terrain / _map with "placement" in
 -- their own or a parent's name (4 levels); read again every 10 s.
 function PV.PlacementParts()
@@ -3862,8 +3866,9 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         if trust == "name" or #PV.PlacementParts() > 0 or (trust ~= "height" and #nf + #nr > 0 and comparable) then free, nearRefused = nf, nr end
     end
     if #free == 0 then free = nearRefused end
-    -- v2 (normal stages): damage / slow by PV.Rank, buff / support by PV.BuffRank; farms below
-    if not State.eventMode and role ~= "farm" then
+    -- v2 (normal stages, and Fool's Hunt with AutoPlace.v2Event): damage / slow by PV.Rank, buff / support by
+    -- PV.BuffRank; farms below
+    if (not State.eventMode or PV.EventOn()) and role ~= "farm" then
         local list
         if (role == "buff" or role == "support") and (#helpers > 0 or #farms > 0) then
             list = PV.BuffRank(free, (range and range > 0 and range ~= DEFAULT_RANGE) and range or BUFF_REACH)
@@ -3884,6 +3889,28 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 best = math.floor(PV.Best(reach, PV.Shape(AutoPlaceModule.placingName or ""), candidates) * 10) / 10,
                 wave = AutoPlaceModule.WaveNumber(), top = log })
             while #AutoPlaceModule.scoredLog > 4 do table.remove(AutoPlaceModule.scoredLog, 1) end
+            -- (Fool's Hunt Merge: a copy next to its own kind first - inside 0.6 of its reach - so Merge can fold them)
+            if State.eventMode and AutoPlaceModule.placingName then
+                local kin = {}
+                for _, u in ipairs(ownedUnits()) do
+                    if unitType(u) == AutoPlaceModule.placingName then
+                        local p = rootPos(u)
+                        if p then kin[#kin + 1] = p end
+                    end
+                end
+                if #kin > 0 then
+                    local near, rest = {}, {}
+                    for _, e in ipairs(list) do
+                        local ok = false
+                        for _, p in ipairs(kin) do
+                            if (p.X - e.c.x) ^ 2 + (p.Z - e.c.z) ^ 2 <= (reach * 0.6) ^ 2 then ok = true break end
+                        end
+                        table.insert(ok and near or rest, e)
+                    end
+                    for _, e in ipairs(rest) do near[#near + 1] = e end
+                    list = near
+                end
+            end
         end
         if list then return list[skip + 1] and list[skip + 1].c end
     end
@@ -5080,6 +5107,21 @@ PV.ORDER = {
 }
 PV.FARM_PHASE_WAVE = 6 -- from this wave the farm steps wait while the carry has an upgrade left below CARRY_LEVEL
 PV.DPS_BY_WAVE = 5     -- a damage unit that is not a summoner is on the map by this wave
+PV.HARD_ROOM = 2       -- level _lobby_difficulty_scale at least this: a hard room
+PV.HARD_DPS = 3        -- hard room: the carry stays at HARD_LEVEL until this many damage units are down
+PV.HARD_LEVEL = 2
+function PV.HardRoom()
+    local ok, d = pcall(Stage.levelData)
+    return ok and type(d) == "table" and (tonumber(d._lobby_difficulty_scale) or 0) >= PV.HARD_ROOM
+end
+-- (b) a hard room: no carry upgrade past HARD_LEVEL while fewer than HARD_DPS damage units are down and one
+-- can still be placed
+function PV.CarryHold(u, level)
+    if State.eventMode or level < PV.HARD_LEVEL or not PV.HardRoom() or unitType(u) ~= (PV.Carry() or {}).name then return false end
+    if PV.DpsDown() >= PV.HARD_DPS then return false end
+    for _, x in ipairs(AutoPlaceModule.placeable or {}) do if x.role == "dps" then return true end end
+    return false
+end
 -- our damage units on the map (all, and the ones that are not summoners)
 function PV.DpsDown()
     local n, real = 0, 0
@@ -5377,7 +5419,7 @@ end
 -- once a tick: a new wave closes the last one's row (money left unspent at its end, the worst lag)
 function PV.WaveStep(money)
     local w = AutoPlaceModule.WaveNumber()
-    if w < (PV.logWave or 0) then PV.waveLog = {} PV.FastWave(true) end
+    if w < (PV.logWave or 0) then PV.waveLog = {} PV.FastWave(true) PV.u4, PV.carryRow, PV.peak = nil, 0, {} end
     if PV.logWave and w > PV.logWave then
         PV.FastWave(false)
         table.insert(PV.waveLog, { wave = PV.logWave, unspent = PV.lastMoney and math.floor(PV.lastMoney) or -1,
@@ -5386,6 +5428,7 @@ function PV.WaveStep(money)
         PV.waveLag = 0
     end
     PV.logWave, PV.lastMoney = w, money
+    if w >= 4 and not PV.u4 then PV.u4 = #ownedUnits() end
 end
 
 -- Summoners (owner 2026-10-26, work/placement_method.md "Summoners"): their summons run along the road and
@@ -6275,6 +6318,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
             -- a farm upgrade must pay back in time (friend's Infinity Mansion loss: ~60k in farms
             -- by wave 9, Bulma at 6, the damage units barely upgraded)
             if can and role == "farm" and not AutoPlaceModule.FarmPays(u, level, cost) then can = false end
+            -- (hard room: the carry waits at HARD_LEVEL for the first damage units - PV.CarryHold)
+            if can and PV.CarryHold(u, level) then can = false end
             -- (spare money only: an upgrade it cannot pay must not block one it can - a farm's
             -- 6500 upgrade held 30k unused in a real game)
             if can and noWait and cost and money and cost > money then can = false end
@@ -6353,6 +6398,8 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
     end
     if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
         PV.Acted()
+        -- (any copy of the carry's unit counts: cid had three copies upgraded in turn)
+        if not State.eventMode then PV.carryRow = unitType(pick) == (PV.Carry() or {}).name and (PV.carryRow or 0) + 1 or 0 end
         AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
             pickAir and ", hits flying enemies" or fuse[pick] and ", for the fusion" or BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
     elseif not pickCost and State.eventMode and money then
@@ -7091,6 +7138,19 @@ end
 --   damageUps: damage upgrades | rest: the normal choice below (chooseNext, value per ¥)
 -- Returns a wait, or a team entry to place (t, role, slot), or nothing (go on with the rest).
 local function v2Plan(money, danger)
+    -- (a) starvation guard: never two carry upgrades in a row while a team unit - damage / slow, or a farm on a
+    -- long road - is unplaced and affordable now (owner's rooms 2026-10-26: one carry upgraded 1->4, lost)
+    if (PV.carryRow or 0) >= 1 then
+        local long = PV.Kind(PV.Road().len) == "long"
+        local best, bv
+        for _, x in ipairs(AutoPlaceModule.placeable or {}) do
+            if x.cost <= (money or 0) and (x.role == "dps" or (x.role == "farm" and long)) then
+                local v = (x.role == "dps" and 1e6 or 0) + AutoPlaceModule.Value(x.t, x.cost ~= math.huge and x.cost or nil)
+                if not bv or v > bv then best, bv = x, v end
+            end
+        end
+        if best then AutoPlaceModule.v2Why = "guard: a unit before another carry upgrade" return nil, best.t, best.role, best.slot end
+    end
     -- (timing, owner 2026-10-25) flyers on the map: an air-capable unit's upgrade (not a trap's) the moment it is affordable
     -- (airNeed held on for the call: upgradeStep counts a unit as air only while the air quota is short)
     if AutoPlace.upgrade and AutoPlaceModule.flying then
@@ -7161,7 +7221,7 @@ local function v2Plan(money, danger)
                 for _, u in ipairs(ownedUnits()) do
                     local r = unitRole(u)
                     if (r == "buff" or r == "support") and PV.BuffKind(unitType(u) or "") == "aura" then
-                        local wait = upgradeStep(money, nil, nil, nil, nil, u)
+                        local wait = upgradeStep(money, nil, nil, why == "low", nil, u)
                         if wait then return wait end
                     end
                 end
@@ -7208,7 +7268,7 @@ local function v2Plan(money, danger)
 end
 
 local function tick()
-    AutoPlaceModule.idleMoney, AutoPlaceModule.nextCost = nil, nil
+    AutoPlaceModule.idleMoney, AutoPlaceModule.nextCost, AutoPlaceModule.v2Picked = nil, nil, nil
     -- (where the last tick got to, for the live status: a step that never returns shows here)
     AutoPlaceModule.tickAt, AutoPlaceModule.tickStep = os.clock(), "start"
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
@@ -7362,6 +7422,7 @@ local function tick()
         local wait, vt, vrole, vslot = v2Plan(money, danger)
         if wait then return wait end
         if vt then t, role, slot = vt, vrole, vslot end
+        AutoPlaceModule.v2Picked = vt ~= nil
     end
     if not ev then
     -- Fool's Hunt: 20 units at most on the map (seen in the real game); then the money goes into
@@ -7462,7 +7523,7 @@ local function tick()
         local wait = upgradeStep(money - cost, danger and "dps" or nil, nil, true)
         if wait then return wait end
     end
-    if not danger and AutoPlace.upgrade and role == "dps" and (dpsPlaced or 0) > 0 then
+    if not danger and AutoPlace.upgrade and role == "dps" and (dpsPlaced or 0) > 0 and not (AutoPlaceModule.v2Picked and not State.eventMode) then
         -- stay ahead instead of waiting for the base to get hit: when upgrading the strongest
         -- unit (trait / rolls included) adds more damage per ¥ than another copy, upgrade it
         if AutoPlaceModule.BestUpgradeScore() > AutoPlaceModule.Value(t, cost) then
@@ -7513,6 +7574,7 @@ local function tick()
     local placeStart = os.clock()
     if tryPlace(t, spot) then
         PV.Acted()
+        PV.carryRow = 0
         -- (event: the copy is used up - the placed unit may carry another uuid, so it is not
         -- counted from the map; the bar is read again on the next tick)
         if t.temp then
@@ -12653,8 +12715,18 @@ local home = UIRef.play
 local KEEP = { { AutoPlace, "enabled" }, { AutoPlace, "upgrade" }, { AutoPlace, "smartFreeze" }, { AutoPlace, "autoTarget" },
     { AutoPlace, "sellFarmsLast" }, { AutoFarm, "autoStart" }, { AutoFarm, "autoSkip" }, { AutoFarm, "autoReplay" },
     { AutoFarm, "autoNextStage" }, { AutoFarm, "autoLeave" }, { UnitAI, "autoBuff" }, { UnitAI, "autoAbilities" } }
+-- the Home Mode shown for the saved preset ("Fast farm" from old saves = Fast; Custom: by placeMode)
+AutoPlaceModule.MODE_HINT = { Safe = "Safe - stays near the base",
+    Balanced = "Balanced - moves forward when the team is clearly stronger (recommended)",
+    Fast = "Fast - forward from the start, skips waves" }
+function AutoPlaceModule.ModeName()
+    local p = AutoPlace.preset
+    if p == "Safe" or p == "Balanced" or p == "Fast" then return p end
+    if p == "Fast farm" then return "Fast" end
+    return AutoPlace.placeMode == "Safe" and "Safe" or AutoPlace.placeMode == "Fast clear" and "Fast" or "Balanced"
+end
 function AutoPlaceModule.HomeAuto(on)
-    local mode = AutoPlace.preset == "Safe" and "Safe" or "Fast farm"
+    local mode = AutoPlaceModule.ModeName()
     local p = AutoPlaceModule.PRESETS[mode] or {}
     if on then
         if not AutoPlace.homeKeep then
@@ -12701,13 +12773,23 @@ Controls.homeMode = home:Dropdown({
     Name = "Mode",
     Multi = false,
     Required = true,
-    Options = { "Fast farm", "Safe" },
-    Default = AutoPlace.preset == "Safe" and "Safe" or "Fast farm",
+    Options = { "Safe", "Balanced", "Fast" },
+    Default = AutoPlaceModule.ModeName(),
     Callback = function(v)
         if syncing or not configReady or type(v) ~= "string" or v == AutoPlace.preset then return end
         AutoPlaceModule.ApplyPreset(v)
     end,
 }, "HomeMode")
+UIRef.modeHint = home:Paragraph({ Header = "Hint", Body = AutoPlaceModule.MODE_HINT[AutoPlaceModule.ModeName()] })
+-- the Mode dropdown and its hint show the saved preset (no preset is applied)
+function AutoPlaceModule.ShowMode()
+    local name = AutoPlaceModule.ModeName()
+    local was = syncing
+    syncing = true
+    pcall(function() Controls.homeMode:UpdateSelection(name) end)
+    syncing = was
+    pcall(function() UIRef.modeHint:UpdateBody(AutoPlaceModule.MODE_HINT[name]) end)
+end
 -- the player places the units; AUTO still upgrades them, buffs, uses skills, freezes, targets
 Controls.placeMyself = home:Toggle({
     Name = "Place units myself",
@@ -12828,7 +12910,7 @@ function AutoPlaceModule.StageLine()
     return stage .. (wave and wave > 0 and (" · Wave " .. wave) or "")
 end
 function AutoPlaceModule.HomeLine(text)
-    local parts = { AutoPlace.enabled and (AutoPlace.preset == "Safe" and "Safe" or "Fast farm") or "AUTO off" }
+    local parts = { AutoPlace.enabled and AutoPlaceModule.ModeName() or "AUTO off" }
     local where = AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage or "Lobby")
     table.insert(parts, where)
     if where == "Lobby" then
@@ -12867,11 +12949,14 @@ function AutoPlaceModule.SetPlacing(on)
 end
 -- One click sets every Auto Place / wave option for a way of playing.
 local PRESETS = {
-    ["Fast farm"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
+    ["Fast"] = { placeMode = "Fast clear", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
+    ["Balanced"] = { placeMode = "Balanced", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = true },
     ["Safe"] = { placeMode = "Safe", upgrade = true, sellFarmsLast = true, smartFreeze = true, autoStart = true, autoSkip = false },
 }
+PRESETS["Fast farm"] = PRESETS.Fast -- (old saves and old calls)
 AutoPlaceModule.PRESETS = PRESETS
 function AutoPlaceModule.ApplyPreset(name)
+    if name == "Fast farm" then name = "Fast" end
     local p = PRESETS[name]
     AutoPlace.preset = name
     if p then
@@ -12881,7 +12966,7 @@ function AutoPlaceModule.ApplyPreset(name)
         for _, cv in ipairs({ { Controls.autoStart, p.autoStart }, { Controls.autoSkip, p.autoSkip } }) do
             if cv[1] then pcall(function() setToggle(cv[1], cv[2]) end) end
         end
-        pcall(function() if Controls.homeMode then Controls.homeMode:UpdateSelection(name) end end)
+        pcall(AutoPlaceModule.ShowMode)
         pcall(refreshAutoStatus)
         notify("Mode " .. name .. ": " .. p.placeMode .. " placement, skip waves " .. (p.autoSkip and "on" or "off"))
     end
@@ -13223,7 +13308,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-020206"
+Lobby.VERSION = "20261026-022708"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -13323,11 +13408,14 @@ function Lobby.ShareGame(win, wave)
         candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units,
         -- (normal stages: BAD_SPOT count and whether the learned road reached our base)
         bad = not State.eventMode and (AutoPlaceModule.badCount or 0) or nil,
+        -- (Fool's Hunt rows: 1 = placed by the v2 spot rules, to compare win / wave old vs new)
+        v2e = State.eventMode and (AutoPlaceModule.V2.EventOn() and 1 or 0) or nil,
         -- (last-wave boss chase used / the boss reached our base on the last wave)
         chase = (AutoPlaceModule.chase or {}).used and 1 or 0,
         bossBase = (AutoPlaceModule.chase or {}).lastProg ~= nil and ((AutoPlaceModule.chase or {}).reached and 1 or 0) or nil,
         -- (v2: road length, buff coverage % of the team's damage)
         rl = not State.eventMode and AutoPlaceModule.V2.lastLen or nil,
+        u4 = not State.eventMode and AutoPlaceModule.V2.u4 or nil,
         bs = (function()
             if State.eventMode then return nil end
             local ok, v = pcall(AutoPlaceModule.V2.BuffShare)
@@ -15213,7 +15301,7 @@ applyRuntimeFeatures = function()
         setControl(Controls.dungeonAuto, true)
         DungeonRun.Start()
     end
-    pcall(function() Controls.homeMode:UpdateSelection(AutoPlace.preset == "Safe" and "Safe" or "Fast farm") end)
+    pcall(AutoPlaceModule.ShowMode)
 
     refreshUnitStatus()
     refreshAutoStatus()
