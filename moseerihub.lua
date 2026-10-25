@@ -8464,7 +8464,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-101208"
+Lobby.VERSION = "20261025-101933"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8542,6 +8542,66 @@ function Lobby.ShareGame(win, wave)
     Lobby.ShareLog("sent " .. tostring(sent) .. " " .. tostring(why) .. " (" .. #body .. " chars)")
 end
 
+-- Full skill / passive texts of the roster from the game's own data (owner 2026-10-25), written once a
+-- version to AAMacro/unit_skills_full.txt: every text field of the unit and of the attacks it names
+-- (primary / active), rich-text tags removed, nothing cut.
+function Lobby.SaveSkills()
+    if not hasFileApi() then return end
+    local path = "AAMacro/unit_skills_full.txt"
+    local stamp = "# version " .. tostring(Lobby.VERSION)
+    if isfile(path) and readfile(path):sub(1, #stamp) == stamp then return end
+    local attacks = {}
+    pcall(function()
+        local data = ReplicatedStorage.src.Data
+        local ok, mod = pcall(require, data:FindFirstChild("Attacks"))
+        if ok and type(mod) == "table" then attacks = mod end
+    end)
+    local names, seen = {}, {}
+    for _, list in ipairs({ AutoPlaceModule.ROSTER or {}, Lobby.cfg.eventAlways or {}, Lobby.cfg.eventNever or {} }) do
+        for _, n in ipairs(list) do if not seen[n] then seen[n] = true table.insert(names, n) end end
+    end
+    table.sort(names)
+    local out = { stamp }
+    local WANT = { "desc", "name", "passive", "abilit", "active", "text", "effect", "skill", "stun", "slow", "burn", "bleed", "summon", "buff", "aoe", "shield", "crit", "execute", "percent" }
+    local function clean(v) return (tostring(v):gsub("<[^>]->", ""):gsub("%s+", " ")) end
+    local function walk(t, prefix, depth, seenT)
+        if depth > 5 or seenT[t] then return end
+        seenT[t] = true
+        local keys = {}
+        for k in pairs(t) do table.insert(keys, k) end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        for _, k in ipairs(keys) do
+            local v, p = t[k], prefix .. "." .. tostring(k)
+            local lk = p:lower()
+            if type(v) == "table" then walk(v, p, depth + 1, seenT)
+            elseif type(v) == "string" or type(v) == "number" or type(v) == "boolean" then
+                for _, w in ipairs(WANT) do
+                    if lk:find(w, 1, true) and not lk:find("anim", 1, true) and not lk:find("sfx", 1, true) then
+                        table.insert(out, "  " .. p:sub(2) .. " = " .. clean(v))
+                        break
+                    end
+                end
+            end
+        end
+    end
+    for _, n in ipairs(names) do
+        local def = AutoPlaceModule.UnitDef(n)
+        table.insert(out, "")
+        table.insert(out, "== " .. n .. (def and (" | " .. clean(def.name or "")) or " | (no data)"))
+        if def then
+            pcall(walk, def, "", 1, {})
+            for _, key in ipairs({ "primary_attack", "primary_attack_no_upgrades", "active_attack" }) do
+                local a = def[key]
+                if type(a) == "string" and type(attacks[a]) == "table" then
+                    table.insert(out, "  [" .. key .. " " .. a .. "]")
+                    pcall(walk, attacks[a], "", 1, {})
+                end
+            end
+        end
+    end
+    writefile(path, table.concat(out, "\n"))
+end
+
 function Lobby.RecordWaves()
     Lobby.placedAt = Lobby.placedAt or setmetatable({}, { __mode = "k" })
     for _, u in ipairs(ownedUnits()) do Lobby.placedAt[u] = Lobby.placedAt[u] or AutoPlaceModule.WaveNumber() end
@@ -8614,6 +8674,7 @@ function Lobby.Loop()
             end)
         end
         if State.eventMode and not inLobbyNow then pcall(Lobby.SampleDepth) end
+        if State.eventMode and not inLobbyNow and not Lobby.skillsSaved then Lobby.skillsSaved = true task.spawn(pcall, Lobby.SaveSkills) end
         -- (wave each unit was placed, for the shared game data: not only while Watch is on)
         if State.eventMode and not inLobbyNow then
             pcall(function()
