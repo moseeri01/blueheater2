@@ -144,7 +144,7 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false,
+        openEggs = false, eggs = {}, claim = false, survey = false, surveyDone = {}, towerRoom = 0, challenges = {}, watch = false,
         watchNoPause = false, eventCards = false, cardMode = "Most coins", voteWay = "", eventSpells = false, spellWay = "",
         -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
@@ -10490,6 +10490,46 @@ end
 -- Infinity Mansion: the game starts the player's current room (watched:
 -- request_start_infinite_tower(141, "Hard")). The room comes from the stage name of the
 -- last tower game ("Infinity Mansion Room 141"): won = the next room, lost = the same.
+-- Map survey (owner 2026-10-25): every Story and Raid world once, act 1 - join, leave 6 s after
+-- wave 1 (the placement dump with the map lanes is written at wave 1), then the next world.
+-- Worlds done are kept in surveyDone; it turns itself off when none is left.
+function Lobby.SurveyStep(inLobbyNow)
+    local c = Lobby.cfg
+    if not c.survey then return end
+    if inLobbyNow then
+        Lobby.surveyAt = nil
+        if os.clock() - (Lobby.surveyTry or -1e9) < 30 then return end
+        for _, mode in ipairs({ "Story", "Raid" }) do
+            for _, w in ipairs(Lobby.Worlds(mode)) do
+                local key = mode .. ":" .. w
+                if not c.surveyDone[key] then
+                    c.surveyDone[key] = true
+                    c.mode, c.world, c.act = mode, w, "1"
+                    saveConfig()
+                    Lobby.surveyTry = os.clock()
+                    Lobby.Status("Map survey: " .. key)
+                    pcall(Lobby.Join)
+                    return
+                end
+            end
+        end
+        c.survey = false
+        saveConfig()
+        Lobby.Status("Map survey: every world done")
+        return
+    end
+    if AutoPlaceModule.WaveNumber() < 1 then return end
+    Lobby.surveyAt = Lobby.surveyAt or os.clock()
+    if os.clock() - Lobby.surveyAt < 6 then return end
+    Lobby.surveyAt = os.clock() + 30 -- then one try every 36 s
+    local remote = getAARemote("teleport_back_to_lobby")
+    if remote then
+        pcall(function() if remote:IsA("RemoteFunction") then remote:InvokeServer() else remote:FireServer() end end)
+    else
+        pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
+    end
+end
+
 function Lobby.TowerResult(win)
     local n = tonumber(tostring(State.stage or ""):match("[Ii]nfinity [Mm]ansion[^%d]*(%d+)"))
     if not n then return end
@@ -10521,7 +10561,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-194910"
+Lobby.VERSION = "20261025-195831"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -10830,6 +10870,7 @@ function Lobby.Loop()
         -- (Dungeon Run "You Died!" - all lives lost, the run is over: its Continue collects the rewards
         -- and leaves. Left alone it sat there until the idle kick - 2026-10-25. It shows in the lobby too)
         pcall(Lobby.DiedStep, inLobbyNow)
+        pcall(Lobby.SurveyStep, inLobbyNow)
         if not inLobbyNow then
             -- (Dungeon Room result, win or defeat: "Next" goes back to the room choice / You Died!
             -- page. Left alone it sat on DEFEAT Depth 6 for 5+ minutes - 2026-10-25)
@@ -11905,6 +11946,12 @@ local function picked(list) local m = {} for _, n in ipairs(list) do m[n] = true
 local join = UIRef.tabs.lobby:Section({ Side = "Left" })
 join:Header({ Text = "Auto join" })
 join:Toggle({ Name = "Auto join", Default = Lobby.cfg.autoJoin, Callback = set("autoJoin") }, "LobbyAutoJoin")
+join:Toggle({ Name = "Map survey (every map to wave 1)", Default = Lobby.cfg.survey, Callback = function(v)
+    if syncing then return end
+    Lobby.cfg.survey = v
+    if v then Lobby.cfg.surveyDone = {} end
+    saveConfig()
+end }, "LobbySurvey")
 -- (owner 2026-10-25: hard to see what is picked) one line says what Auto join starts; Event
 -- uses only the event picker, Infinity Mansion only Difficulty - the unused fields are hidden
 -- when this MacLib has SetVisibility, and the line leaves them out either way
