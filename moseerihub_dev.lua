@@ -101,6 +101,7 @@ local AutoPlace = {
     roles = {},                   -- [unit name] = "farm" | "buff" | "dps", learned from placed units
     unitInfo = {},                -- [unit uuid] = { name, traits = "golden,...", rolls } read from game data
     stageLosses = {},             -- [stage] = recent losses there (each win takes one off): play safer
+    stopTimes = {},               -- [control skill id] = { dur = s a stop lasts, gap = s enemies stay immune } (measured)
     preset = "Custom",            -- last preset picked ("Fast farm" / "Safe"); Custom = set by hand
     showDetails = false,          -- full Auto Place status (team, ranking, 6 actions) instead of the short one
     placeMode = "Balanced",       -- damage units: "Safe" near our base, "Fast clear" near the enemy spawn
@@ -273,6 +274,7 @@ local function buildConfigData()
             roles = next(AutoPlace.roles) and AutoPlace.roles or nil,
             unitInfo = next(AutoPlace.unitInfo or {}) and AutoPlace.unitInfo or nil,
             stageLosses = next(AutoPlace.stageLosses or {}) and AutoPlace.stageLosses or nil,
+            stopTimes = next(AutoPlace.stopTimes or {}) and AutoPlace.stopTimes or nil,
             preset = AutoPlace.preset, showDetails = AutoPlace.showDetails,
             placeMode = AutoPlace.placeMode,
             lastTeam = next(AutoPlace.lastTeam or {}) and AutoPlace.lastTeam or nil,
@@ -376,6 +378,14 @@ local function applyConfigData(data)
         AutoPlace.stageLosses = {}
         for k, v in pairs(ap.stageLosses) do
             if type(k) == "string" and tonumber(v) then AutoPlace.stageLosses[k] = math.max(0, math.floor(tonumber(v))) end
+        end
+    end
+    if type(ap.stopTimes) == "table" then
+        AutoPlace.stopTimes = {}
+        for k, v in pairs(ap.stopTimes) do
+            if type(k) == "string" and type(v) == "table" then
+                AutoPlace.stopTimes[k] = { dur = tonumber(v.dur), gap = tonumber(v.gap) }
+            end
         end
     end
     AutoPlace.placeMode = pick(ap.placeMode, "string", AutoPlace.placeMode)
@@ -3752,13 +3762,15 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             list = PV.BuffRank(free, (range and range > 0 and range ~= DEFAULT_RANGE) and range or BUFF_REACH)
         elseif attacks then
             local top, sub
-            list, top, sub = PV.Rank(free, AutoPlaceModule.placingT, role, reach, back)
+            -- (a summoner: beside the road where its summons enter it - PV.SummonRank)
+            if PV.IsSummoner(AutoPlaceModule.placingName or "") then list, top, sub = PV.SummonRank(free), 0, "summon"
+            else list, top, sub = PV.Rank(free, AutoPlaceModule.placingT, role, reach, back) end
             -- (placement_dump.json: the top spots of the last few damage placements)
             local log = {}
             for i = 1, math.min(30, #list) do
                 local e = list[i]
                 log[i] = { x = math.floor(e.c.x * 10) / 10, z = math.floor(e.c.z * 10) / 10, n = math.floor(e.cov * 10) / 10,
-                    p = math.floor(e.p * 100) / 100, kind = e.c.kind }
+                    p = math.floor(e.p * 100) / 100, d = e.d and math.floor(e.d * 10) / 10 or nil, kind = e.c.kind }
             end
             table.insert(AutoPlaceModule.scoredLog, { unit = AutoPlaceModule.placingName, range = reach, as = sub, buff = AutoPlaceModule.RangeBuff(),
                 defRange = AutoPlaceModule.DefRangeAt(AutoPlaceModule.placingName or "", 0),
@@ -4275,6 +4287,8 @@ AutoPlaceModule.AirFromLevel = {}
 function AutoPlaceModule.AirCapable(name, level)
     local def = AutoPlaceModule.UnitDef(name)
     if def and (def.hill_unit == true or def.hybrid_placement == true) then return true end
+    -- (a summoner whose summons hit flyers - PV.SummonAir)
+    if PV.SummonAir and PV.SummonAir(name) then return true end
     local from = AutoPlaceModule.AirFromLevel[name]
     return from ~= nil and (level or 0) >= from
 end
@@ -4671,6 +4685,10 @@ function PV.Rank(free, t, role, r, back)
         -- (decided above)
     elseif sub == "carry" then
         want = function(e) return e.p >= 0.5 end
+    elseif sub == "damage" and PV.FinishFast() then
+        -- (finish fast: the best spot in the front half of the road - PV.FinishFast)
+        want = function(e) return e.p < 0.5 end
+        sub = "damage+fast"
     elseif sub == "damage" or sub == "slow" then
         local cu = PV.CarryUnit()
         local cp = cu and rootPos(cu)
@@ -4885,6 +4903,7 @@ end
 function PV.Spend(danger)
     local margin, depth = PV.Margin()
     PV.lastMargin, PV.lastDepth = margin, depth
+    PV.FastNote(margin, danger)
     if danger or (depth and depth > 0.5) or (margin and margin < PV.MARGIN_LOW) then return "low" end
     if margin and margin >= PV.MARGIN_HIGH and depth and depth < 0.5 then return "high" end
     return "normal"
@@ -5150,14 +5169,110 @@ end
 -- once a tick: a new wave closes the last one's row (money left unspent at its end, the worst lag)
 function PV.WaveStep(money)
     local w = AutoPlaceModule.WaveNumber()
-    if w < (PV.logWave or 0) then PV.waveLog = {} end
+    if w < (PV.logWave or 0) then PV.waveLog = {} PV.FastWave(true) end
     if PV.logWave and w > PV.logWave then
+        PV.FastWave(false)
         table.insert(PV.waveLog, { wave = PV.logWave, unspent = PV.lastMoney and math.floor(PV.lastMoney) or -1,
             lag = math.floor((PV.waveLag or 0) * 100 + 0.5) / 100 })
         while #PV.waveLog > 40 do table.remove(PV.waveLog, 1) end
         PV.waveLag = 0
     end
     PV.logWave, PV.lastMoney = w, money
+end
+
+-- Summoners (owner 2026-10-26, work/placement_method.md "Summoners"): their summons run along the road and
+-- do the damage (Elyssia's jellyfish), so a summoner is not judged by its own range: it stands right beside
+-- the road where its summons enter it and meet the enemies early.
+PV.SUMMON_SIDE = 4.5   -- at most this far from the road
+PV.SUMMON_AT = 0.4     -- road position aimed for (0 enemy end, 1 our base): early enough to meet them, a guess
+PV.SUMMON_AIR = { elyssia = true, elyssia_evolved = true } -- owner 2026-10-26: the jellyfish hit flyers too (not in the data)
+-- its summons' definitions: units named "<its id>_..." with no price (elyssia_jellyfish, elyssia_eel)
+function PV.Summons(name)
+    local base = AutoPlaceModule.BaseId(name)
+    AutoPlaceModule.UnitDef("")
+    PV.summonsOf = PV.summonsOf or {}
+    if PV.summonsOf[base] then return PV.summonsOf[base] end
+    local out = {}
+    for id, def in pairs(unitDefsCache or {}) do
+        if id ~= base and id:sub(1, #base + 1) == base .. "_" and not id:find("evolved", 1, true)
+            and (tonumber(def.cost) or 0) <= 1 then out[#out + 1] = def end
+    end
+    PV.summonsOf[base] = out
+    return out
+end
+function PV.IsSummoner(name)
+    local def = AutoPlaceModule.UnitDef(name) or {}
+    return def.spawn_unit == true or def.spawn_script ~= nil or #PV.Summons(name) > 0
+end
+-- its summons hit flyers: one of them is a hill / hybrid unit, or the owner's list
+function PV.SummonAir(name)
+    if PV.SUMMON_AIR[name] or PV.SUMMON_AIR[AutoPlaceModule.BaseId(name)] then return true end
+    if not PV.IsSummoner(name) then return false end
+    for _, def in ipairs(PV.Summons(name)) do
+        if def.hybrid_placement == true or def.hill_unit == true then return true end
+    end
+    return false
+end
+-- distance to the nearest road point and that point's road position
+function PV.RoadSpot(x, z, road)
+    local bd, bp = math.huge, 0
+    for _, q in ipairs((road or PV.Road()).pts) do
+        local d = (q[1] - x) ^ 2 + (q[3] - z) ^ 2
+        if d < bd then bd, bp = d, q.p end
+    end
+    return math.sqrt(bd), bp
+end
+-- a summoner's spots: within SUMMON_SIDE of the road, nearest SUMMON_AT along it first; the rest after
+function PV.SummonRank(free)
+    local road = PV.Road()
+    local near, far = {}, {}
+    for _, c in ipairs(free) do
+        local d, p = PV.RoadSpot(c.x, c.z, road)
+        local e = { c = c, cov = 0, p = p, d = d }
+        if d <= PV.SUMMON_SIDE then near[#near + 1] = e else far[#far + 1] = e end
+    end
+    table.sort(near, function(a, b)
+        local ka, kb = math.abs(a.p - PV.SUMMON_AT), math.abs(b.p - PV.SUMMON_AT)
+        if math.abs(ka - kb) > 1e-6 then return ka < kb end
+        return a.d < b.d
+    end)
+    table.sort(far, function(a, b) return a.d < b.d end)
+    for _, e in ipairs(far) do near[#near + 1] = e end
+    return near
+end
+-- a summoner on the map, for the logs: its road distance (studs) and road position (0-100); nil otherwise
+function PV.RoadRow(u)
+    if State.eventMode or not PV.IsSummoner(unitType(u) or "") then return nil, nil end
+    local p = rootPos(u)
+    if not p then return nil, nil end
+    local d, rp = PV.RoadSpot(p.X, p.Z)
+    return math.floor(d * 10 + 0.5) / 10, math.floor(rp * 100 + 0.5)
+end
+
+-- Finish fast (owner 2026-10-26, work/placement_method.md "Finish fast"): a team that is clearly strong
+-- (margin >= MARGIN_HIGH 2 waves in a row, base never hit this game) puts its later damage units (not
+-- the carry) in the front half of the road, so waves die sooner and auto-skip ends them early. A base
+-- hit or a margin under MARGIN_LOW goes back to the base half. Mode: Safe = never, Balanced = this rule,
+-- Fast clear = from the first wave the margin is high.
+PV.highStreak, PV.waveHigh, PV.baseHit = 0, false, false
+-- from PV.Spend: what the margin said this tick
+function PV.FastNote(margin, danger)
+    if danger then PV.baseHit = true end
+    if margin and margin >= PV.MARGIN_HIGH then PV.waveHigh = true end
+    if margin and margin < PV.MARGIN_LOW then PV.highStreak, PV.waveHigh = 0, false end
+end
+-- from PV.WaveStep: a wave ended (new = a new game)
+function PV.FastWave(new)
+    if new then PV.highStreak, PV.waveHigh, PV.baseHit = 0, false, false return end
+    PV.highStreak = PV.waveHigh and PV.highStreak + 1 or 0
+    PV.waveHigh = false
+end
+function PV.FinishFast()
+    -- (the setting itself, not Mode(): that turns Balanced into Safe on every Hard stage)
+    local mode = AutoPlace.placeMode
+    if State.eventMode or mode == "Safe" or PV.baseHit then return false end
+    local need = mode == "Fast clear" and 1 or 2
+    return PV.highStreak >= need or (mode == "Fast clear" and PV.waveHigh)
 end
 
 -- Air focus is a quota, not a lock: while flyers are about, the air-capable share of the
@@ -5307,6 +5422,146 @@ local ControlUp = {
     BONUS = 0.5,
     BASE_CD = 45, -- skill cooldown when neither the definition nor the unit says (Shadowgirl ~44 s)
 }
+
+-- Control skills (time stop / freeze / stun) one at a time (owner 2026-10-26): two homura time
+-- stops fired together waste one - the enemies are already stopped, and after a stop they stay
+-- immune a moment. The next copy casts only once the running stop has ENDED plus the immunity gap.
+-- The end is seen, not guessed: enemy spots are taken at the cast and 0.5 s later; the stop has
+-- ended when most of them move again. Enemies that never stopped = a wasted cast. Stop length and
+-- gap: skill data when it has them, else measured and remembered (AutoPlace.stopTimes), else 3 s gap.
+ControlUp.STOP_GAP = 3
+ControlUp.stats = setmetatable({}, { __mode = "k" }) -- [control unit] = { casts, wasted }
+function ControlUp.skillId(u)
+    local st = u:FindFirstChild("_stats")
+    local a = st and st:FindFirstChild("active_attack")
+    return a and tostring(a.Value) or "?"
+end
+-- A number in the skill's Attacks entry (one level deep) whose key holds one of the words.
+function ControlUp.dataNum(u, words)
+    local id = ControlUp.skillId(u)
+    local ok, entry = pcall(function()
+        local m = ReplicatedStorage.src.Data:FindFirstChild("Attacks")
+        local mod = m and require(m)
+        return type(mod) == "table" and mod[id] or nil
+    end)
+    if not (ok and type(entry) == "table") then return nil end
+    local function look(t)
+        for k, v in pairs(t) do
+            local key = string.lower(tostring(k))
+            for _, w in ipairs(words) do
+                if key:find(w, 1, true) and tonumber(v) then return tonumber(v) end
+            end
+        end
+    end
+    local n = look(entry)
+    if n then return n end
+    for _, v in pairs(entry) do if type(v) == "table" then n = look(v) if n then return n end end end
+    return nil
+end
+function ControlUp.gap(u)
+    local t = (AutoPlace.stopTimes or {})[ControlUp.skillId(u)] or {}
+    return ControlUp.dataNum(u, { "immun" }) or t.gap or ControlUp.STOP_GAP
+end
+function ControlUp.reach(u)
+    local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
+    return (AutoPlaceModule.StatNum(u, "range") or tonumber(def.range) or DEFAULT_RANGE) * (AutoPlaceModule.StatNum(u, "range_multiplier") or 1)
+end
+function ControlUp.enemySpots()
+    local out = {}
+    local folder = unitsFolder()
+    for _, e in ipairs(folder and folder:GetChildren() or {}) do
+        if isEnemy(e) then
+            local p = rootPos(e)
+            if p then out[e] = p end
+        end
+    end
+    return out
+end
+-- Enemies inside this copy's reach right now.
+function ControlUp.inReach(u, spots)
+    local p = rootPos(u)
+    if not p then return 0 end
+    local r = ControlUp.reach(u)
+    local n = 0
+    for _, q in pairs(spots or ControlUp.enemySpots()) do
+        if (q.X - p.X) ^ 2 + (q.Z - p.Z) ^ 2 <= r * r then n = n + 1 end
+    end
+    return n
+end
+-- Share of the enemies seen in both snapshots that moved more than 0.3 studs.
+local function movedShare(a, b)
+    local both, moved = 0, 0
+    for e, p in pairs(a) do
+        local q = b[e]
+        if q then
+            both = both + 1
+            if (q.X - p.X) ^ 2 + (q.Z - p.Z) ^ 2 > 0.09 then moved = moved + 1 end
+        end
+    end
+    return both, moved
+end
+function ControlUp.Cast(u, now)
+    ControlUp.stop = { unit = u, id = ControlUp.skillId(u), at = now, start = ControlUp.enemySpots() }
+    local s = ControlUp.stats[u] or { casts = 0, wasted = 0 }
+    ControlUp.stats[u] = s
+    s.casts = s.casts + 1
+end
+-- Follows the running stop: wasted / still holding / ended (and remembers how long it lasted).
+function ControlUp.Watch(now)
+    local st = ControlUp.stop
+    if not st or st.endedAt then return end
+    AutoPlace.stopTimes = AutoPlace.stopTimes or {}
+    local times = AutoPlace.stopTimes[st.id] or {}
+    if not st.snap then
+        if now - st.at < 0.5 then return end
+        st.snap = ControlUp.enemySpots()
+        local both, moved = movedShare(st.start, st.snap)
+        if both > 0 and moved * 2 > both then
+            -- they kept walking: nothing stopped (still immune, or the skill missed them)
+            st.endedAt, st.wasted = st.at, true
+            local s = ControlUp.stats[st.unit]
+            if s then s.wasted = s.wasted + 1 end
+            local prev = ControlUp.prevEnd
+            if prev and st.at - prev < 15 then
+                times.gap = math.max(times.gap or ControlUp.STOP_GAP, st.at - prev + 1)
+                AutoPlace.stopTimes[st.id] = times
+            end
+            AutoPlaceModule.Note(string.format("%s's stop did nothing (enemies kept moving)", unitType(st.unit) or "?"))
+        end
+        return
+    end
+    local both, moved = movedShare(st.snap, ControlUp.enemySpots())
+    local guess = ControlUp.dataNum(st.unit, { "duration", "stop_time", "freeze_time", "stun_time" }) or times.dur or 6
+    if (both > 0 and moved * 2 > both) or (both == 0 and now - st.at > guess + 1) or now - st.at > 30 then
+        st.endedAt = now
+        ControlUp.prevEnd = now
+        if both > 0 then
+            times.dur = math.floor((now - st.at) * 10 + 0.5) / 10
+            AutoPlace.stopTimes[st.id] = times
+        end
+    end
+end
+-- No stop running, and the last one ended at least its gap ago.
+function ControlUp.Clear(now)
+    local st = ControlUp.stop
+    if not st then return true end
+    if not st.endedAt then return false end
+    return st.wasted or now - st.endedAt >= ControlUp.gap(st.unit)
+end
+-- For the dump: each control unit's level, cooldown, reach, casts and wasted casts.
+AutoPlaceModule.ControlReport = function() return ControlUp.Report() end
+function ControlUp.Report()
+    local out = {}
+    for _, u in ipairs(ownedUnits()) do
+        if BuffRot.isControlSkill(u) then
+            local s = ControlUp.stats[u] or { casts = 0, wasted = 0 }
+            out[#out + 1] = { id = unitType(u), level = AutoPlaceModule.StatNum(u, "upgrade") or 0,
+                cd = AutoPlaceModule.StatNum(u, "active_attack_cooldown"), reach = ControlUp.reach(u),
+                casts = s.casts, wasted = s.wasted, skill = ControlUp.skillId(u) }
+        end
+    end
+    return out
+end
 
 -- Skill fields of one upgrade level: new skill cooldown, seconds cut off it, new skill
 -- reach (range / aoe / radius of the active), and whether any skill field was there.
@@ -5699,7 +5954,7 @@ end
 AutoPlaceModule.badLog, AutoPlaceModule.badCount = {}, 0
 AutoPlaceModule.BAD_COVER = 0.7
 function AutoPlaceModule.CheckSpot(name, spot, range)
-    if State.eventMode or not range or range <= 0 then return end
+    if State.eventMode or not range or range <= 0 or PV.IsSummoner(name) then return end
     local road = PV.Road()
     if #road.pts < 8 then return end
     local w = AutoPlaceModule.WaveNumber()
@@ -7012,20 +7267,30 @@ local function freezeLoop(gen)
     while AutoPlace.enabled and gen == apGen and not State.unloaded do
         if AutoPlace.smartFreeze and isGameRunning() and not isResultsShowing() then
             pcall(function()
+                local now = os.clock()
+                ControlUp.Watch(now)
+                -- (one stop at a time: the next only after the running one ended + the gap - ControlUp)
+                if not ControlUp.Clear(now) then return end
+                local spots = ControlUp.enemySpots()
+                local best, bestN, bestWait
                 for _, u in ipairs(ownedUnits()) do
-                    if BuffRot.isControlSkill(u) and os.clock() - lastAny >= 4 then
+                    if BuffRot.isControlSkill(u) then
                         local cd = AutoPlaceModule.StatNum(u, "active_attack_cooldown") or 30
-                        if os.clock() - (last[u] or -1e9) >= cd + 0.5 then
+                        if now - (last[u] or -1e9) >= cd + 0.5 then
                             -- first time seen ready (not the cooldown end: a fresh unit has no last cast)
-                            readyAt[u] = readyAt[u] or os.clock()
-                            local why = AutoPlaceModule.FreezeMoment(os.clock() - readyAt[u])
-                            if why and fireActiveAttack(u) then
-                                last[u], lastAny, readyAt[u] = os.clock(), os.clock(), nil
-                                AutoPlaceModule.Note(string.format("%s stopped time: %s", unitType(u), why))
-                                break
-                            end
+                            readyAt[u] = readyAt[u] or now
+                            -- (the ready copy with the most enemies in ITS reach goes; none in reach = wait)
+                            local n = ControlUp.inReach(u, spots)
+                            if n > 0 and (not bestN or n > bestN) then best, bestN, bestWait = u, n, now - readyAt[u] end
                         end
                     end
+                end
+                if not best then return end
+                local why = AutoPlaceModule.FreezeMoment(bestWait)
+                if why and fireActiveAttack(best) then
+                    last[best], lastAny, readyAt[best] = os.clock(), os.clock(), nil
+                    ControlUp.Cast(best, os.clock())
+                    AutoPlaceModule.Note(string.format("%s stopped time: %s (%d in its reach)", unitType(best), why, bestN))
                 end
             end)
         end
@@ -7242,7 +7507,8 @@ function AutoPlaceModule.DumpStep()
             end
             table.insert(units, { id = unitType(u) or "?", role = unitRole(u), range = range, x = math.floor(p.X * 10) / 10,
                 y = math.floor(p.Y * 10) / 10, z = math.floor(p.Z * 10) / 10, level = AutoPlaceModule.StatNum(u, "upgrade") or 0,
-                cov = #pts > 0 and math.floor(100 * inside / #pts + 0.5) or -1, covBest = PV.CovBest(u) })
+                cov = #pts > 0 and math.floor(100 * inside / #pts + 0.5) or -1, covBest = PV.CovBest(u),
+                road = (function() local d, p = PV.RoadRow(u) return d and { d = d, p = p } or nil end)() })
         end
     end
     local function base(side)
@@ -7257,8 +7523,9 @@ function AutoPlaceModule.DumpStep()
         pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog,
         short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
         road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath(), hills = PV.HillSpots(),
+        control = AutoPlaceModule.ControlReport(),
         v2 = { rl = PV.Road().len, kind = PV.Kind(PV.Road().len), from = PV.Road().from, lanes = PV.Road().lanes, order = AutoPlaceModule.v2Why,
-            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog } }
+            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog, fast = PV.FinishFast(), highStreak = PV.highStreak } }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
@@ -9446,9 +9713,11 @@ function DungeonRun.ItemValue(text, lives)
     if low:find("philosoph", 1, true) then return 10, false end
     if low:find("rare chest", 1, true) or (low:find("gold", 1, true) and low:find("chest", 1, true)) then return 4, false end
     if low:find("cost", 1, true) then return pct / 10 * ((DungeonRun.lastDepth or 0) < 10 and 1.3 or 1), false end
-    for _, t in ipairs({ "magic", "physical", "true" }) do
-        if low:find(t .. " dmg", 1, true) or low:find(t .. " damage", 1, true) then return pct / 100 * 4 * (share[t] or 0), false end
-        if low:find(t .. " crit", 1, true) then return pct / 100 * 1.5 * (share[t] or 0), false end
+    -- (the shop writes "Phys Crit Chance": "phys" counts as physical)
+    for _, t in ipairs({ { "magic", "magic" }, { "physical", "physical" }, { "physical", "phys" }, { "true", "true" } }) do
+        local word = t[2]
+        if low:find(word .. " dmg", 1, true) or low:find(word .. " damage", 1, true) then return pct / 100 * 4 * (share[t[1]] or 0), false end
+        if low:find(word .. " crit", 1, true) then return pct / 100 * 1.5 * (share[t[1]] or 0), false end
     end
     if low:find("chest luck", 1, true) then return pct / 40, false end
     if low:find("cooldown", 1, true) or low:find("attack speed", 1, true) then return pct / 8, false end
@@ -10065,6 +10334,8 @@ DungeonRun.WIKI_EFFECTS = {
     ["scimitar"] = "+75% attack", ["sword"] = "+30% damage", ["ninja belt"] = "-12% attack speed",
     ["glacial axe"] = "Enemies 30% slower", ["philosophers stone"] = "All chests become rare chests",
     ["shimmering moon fragment"] = "+1 star Star Remnant per chest",
+    -- (not on the wiki: seen in a shop marked [*], 1100 coins - owner screenshot 2026-10-26)
+    ["stormbringer"] = "-50% Attack cooldown",
     ["curse of wind"] = "Enemies +25% faster", ["curse of frenzy"] = "Enemies +50% faster", ["curse of burst"] = "+100% Burst trait",
     ["curse of shielding"] = "Enemies +3 shield", ["curse of armor"] = "+100% Armor trait", ["curse of chaos"] = "All curses random",
     ["curse of eruption"] = "+24 explosive death range", ["curse of explosion"] = "+12 explosive death range",
@@ -10172,7 +10443,9 @@ function DungeonRun.ShopPick(items, money)
     local function idOf(it) return string.lower(tostring(type(it) == "table" and it.id or it)) end
     -- (the price on the page's row first: Bow 221 with 194 coins was tried and refused, 23:44 2026-10-25)
     local function affordable(id)
-        if (DungeonRun.refused or {})[id] then return false end
+        -- (a refused item: only again with more coins than at the refusal)
+        local refusedAt = (DungeonRun.refused or {})[id]
+        if refusedAt and (not money or money <= refusedAt) then return false end
         local price = (DungeonRun.pagePrices or {})[id] or DungeonRun.PRICES[id]
         return not price or not money or money >= price
     end
@@ -10226,7 +10499,7 @@ function DungeonRun.PageStep(st, page)
             if ok then return 1 end
             -- (refused: never tried again this run, and the shop is left at once)
             DungeonRun.refused = DungeonRun.refused or {}
-            DungeonRun.refused[id] = true
+            DungeonRun.refused[id] = tonumber(money) or math.huge
             DungeonRun.buyStop = DungeonRun.liveSeq or 0
         end
     elseif kind == "6" then
@@ -10274,7 +10547,8 @@ end
 -- Prices from the game's shop page: each row (in the order of the page data's ids) shows its price as a
 -- plain number (Bow 221, Dagger 221 - 23:44 2026-10-25). Kept for this page: prices change with depth.
 function DungeonRun.ReadRowPrices(pageName, data)
-    DungeonRun.pagePrices = {}
+    -- (a read that does not line up keeps the prices read before: the list shrinks after a buy)
+    DungeonRun.pagePrices = DungeonRun.pagePrices or {}
     if type(data) ~= "table" or #data == 0 then return end
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local ui = gui and gui:FindFirstChild("DungeonUI")
@@ -10451,7 +10725,7 @@ function DungeonRun.OnChanged(p)
     local over = next(p) == nil or (not running and #rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
     if over then
         note("run over at depth " .. tostring(DungeonRun.lastDepth))
-        DungeonRun.lostRooms, DungeonRun.refused = {}, nil
+        DungeonRun.lostRooms, DungeonRun.refused, DungeonRun.pagePrices = {}, nil, nil
         if DungeonRun.enabled then DungeonRun.pendingStart = true saveConfig() end
     elseif #rooms > 0 then DungeonRun.startNote = nil end
     if not over and (running or #rooms > 0) and DungeonRun.pendingStart then
@@ -10903,6 +11177,9 @@ function DungeonRun.LearnRowTexts(pageName, data, kind)
         if id ~= "" and name then
             local v = Lobby.cfg.dungeonItems[id] or { kind = kind }
             if v.name ~= name or v.effect ~= effect then
+                -- ([*] marks a special item - Stormbringer: scored by its effect like the rest; a downside in
+                -- its effect text (a curse word) counts against it)
+                v.special = name:find("^%[%*%]") ~= nil or nil
                 v.name, v.effect = name:gsub("^%[%*%]%s*", ""), effect
                 Lobby.cfg.dungeonItems[id] = v
                 table.insert(found, id .. "=" .. v.name .. " / " .. tostring(effect))
@@ -12211,7 +12488,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-001743"
+Lobby.VERSION = "20261026-002455"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -12283,8 +12560,11 @@ function Lobby.UnitRows()
         end
         -- (7th: cov / best for its range on this map, 0-100 - Auto Place v2)
         local okB, covBest = pcall(AutoPlaceModule.V2.CovBest, u)
+        -- (summoners: 8th / 9th = road distance and road position 0-100 instead of cov / best)
+        local okS, sd, sp = pcall(AutoPlaceModule.V2.RoadRow, u)
+        if okS and sd then covBest = -1 else sd, sp = nil, nil end
         table.insert(rows, { unitType(u) or "?", AutoPlaceModule.StatNum(u, "upgrade") or 0, trait,
-            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1, cov, (not State.eventMode and okB) and covBest or -1 })
+            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1, cov, (not State.eventMode and okB) and covBest or -1, sd, sp })
     end
     return rows
 end
