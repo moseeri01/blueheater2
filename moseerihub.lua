@@ -8496,7 +8496,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-105409"
+Lobby.VERSION = "20261025-114614"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -9706,6 +9706,13 @@ function Lobby.SetWatch(on)
                         local args = table.pack(...)
                         local parts = {}
                         for i = 1, args.n do parts[i] = describeValue(args[i], 0, FULL) end
+                        -- (dungeon state is nested deep - rooms of the next depths: kept whole as JSON)
+                        if n:find("dungeon", 1, true) then
+                            for i = 1, args.n do
+                                local ok, j = pcall(function() return HttpService:JSONEncode(args[i]) end)
+                                if ok and type(j) == "string" then parts[i] = j end
+                            end
+                        end
                         table.insert(Lobby.watchLog, string.format("%s <- %s(%s)", os.date("%H:%M:%S"), r.Name, table.concat(parts, ", ")))
                         Lobby.watchDirty = true
                     end))
