@@ -6244,7 +6244,7 @@ function AutoPlaceModule.ResetSpots() candidates, candidatesFor = nil, -1 end
 -- units (role, range, spot, road cover %), the bases and the scored spots of the last damage
 -- placements - read on the PC (work/dump_map.js draws it) to judge the placer against the real map.
 AutoPlaceModule.scoredLog = {}
-AutoPlaceModule.DUMP_WAVES = { 5, 10, 20 }
+AutoPlaceModule.DUMP_WAVES = { 1, 5, 10, 20 } -- wave 1: the map scan (lanes) without playing on
 -- For the dump: workspace's top folders, and anything named like a path / waypoint / node / lane /
 -- route (the game has "Show Paths Info" for multi-path modes, so its own path data may be readable).
 function AutoPlaceModule.MapScan()
@@ -10521,7 +10521,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-193050"
+Lobby.VERSION = "20261025-194910"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
