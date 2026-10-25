@@ -7636,7 +7636,7 @@ end
 -- The run as the game holds it: the getgc table with a depth and room choices (or a shop).
 function DungeonRun.Read()
     local live = DungeonRun.live
-    if not live and DungeonRun.InLobby() then live = DungeonRun.FindLive() end
+    if not live and (DungeonRun.InLobby() or DungeonRun.ChoiceOpen()) then live = DungeonRun.FindLive() end
     if live then return DungeonRun.FromLive(live) end
     local best, bestScore
     -- the table found last time is read again while it still looks like the run
@@ -8014,6 +8014,15 @@ function DungeonRun.ReadScreen()
     return out
 end
 
+-- The room choice is open on screen: the Dungeon Run window shows room tiles (read every 2 s at most).
+function DungeonRun.ChoiceOpen()
+    if os.clock() - (DungeonRun.choiceAt or -1e9) < 2 then return DungeonRun.choiceOpen end
+    DungeonRun.choiceAt = os.clock()
+    local scr = DungeonRun.ReadScreen()
+    DungeonRun.choiceOpen = scr.tiles ~= nil and #scr.tiles > 0
+    return DungeonRun.choiceOpen
+end
+
 -- Every dungeon_changed / dungeon_selected_changed payload and screen read, for checking the
 -- _t map after a run (lobby_watch keeps only 20 KB): AAMacro/dungeon_log.txt, last ~200 KB.
 function DungeonRun.Log(text)
@@ -8185,9 +8194,11 @@ function DungeonRun.LiveStep(st)
         DungeonRun.Refresh(st)
         return 2
     end
-    -- (the copy found in memory in the lobby is the last room choice, not an open one: rooms sent
-    -- from there were never taken - 2026-10-25. The game sends dungeon_changed when the choice opens)
-    if st.table ~= DungeonRun.live then
+    -- (the copy found in memory is the last room choice: rooms sent from it with the Dungeon Run window
+    -- closed were never taken (12:49), but after a lost room no dungeon_changed comes - the owner's
+    -- "Open Dungeon" only opens the window and the same choice is taken from there (15:22, 2026-10-25).
+    -- So: a fresh dungeon_changed, or the window open with its room tiles on screen)
+    if st.table ~= DungeonRun.live and not DungeonRun.ChoiceOpen() then
         DungeonRun.status = "waiting for the game to open the room choice"
         DungeonRun.Refresh(st)
         return 3
@@ -9473,7 +9484,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-152158"
+Lobby.VERSION = "20261025-152959"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -9726,15 +9737,20 @@ function Lobby.Loop()
             -- page. Left alone it sat on DEFEAT Depth 6 for 5+ minutes - 2026-10-25)
             pcall(function()
                 if os.clock() - (Lobby.roomNextAt or -1e9) < 4 then return end
-                if not DungeonRun.InRoom() or not AutoFarmModule.ResultsShowing() then return end
-                local b = Lobby.ButtonFor("Next")
+                if not DungeonRun.InRoom() then return end
+                -- (the page after it shows "Return to lobby" / "Open Dungeon": Open Dungeon reopens the
+                -- Dungeon Run window for the next room or the retry; never Return to lobby mid-run - 2026-10-25.
+                -- Its text alone is enough: that page may not count as the result screen)
+                local word, b = "Next", nil
+                if AutoFarmModule.ResultsShowing() then b = Lobby.ButtonFor(word) end
+                if not b then word = "Open Dungeon" b = Lobby.ButtonFor(word) end
                 if b then
                     -- (after a lost room the game itself selects the same room again:
                     -- dungeon_selected_changed with lives - 1 at the defeat, 2026-10-25)
                     local won = AutoFarmModule.ResultIsVictory()
                     Lobby.roomNextAt = os.clock()
                     Lobby.TapGui(b)
-                    pcall(Lobby.ShareLog, "dungeon: room result (" .. (won and "won" or "lost") .. ") - tapped Next")
+                    pcall(Lobby.ShareLog, "dungeon: room result (" .. (won and "won" or "lost") .. ") - tapped " .. word)
                 end
             end)
         end
