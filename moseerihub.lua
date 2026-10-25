@@ -2849,6 +2849,7 @@ local BAD_REACH = 4        -- spots this close to a refused one are tried last (
 local DEFAULT_RANGE = 15
 local apGen = 0
 local badSpots = {}
+AutoPlaceModule.badParts = setmetatable({}, { __mode = "k" }) -- parts a raised spot was refused on (bestSpot: tried last)
 local candidates, candidatesFor = nil, -1
 local recentBad = {}
 local unknownTries = 0
@@ -3410,7 +3411,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 if dx * dx + dz * dz < MIN_SPACING * MIN_SPACING then ok = false break end
             end
             if ok then
-                local near = false
+                local near = c.part ~= nil and AutoPlaceModule.badParts[c.part] == true
                 for _, b in ipairs(refused) do
                     local dx, dz = b[1] - c.x, b[2] - c.z
                     if dx * dx + dz * dz < BAD_REACH * BAD_REACH then near = true break end
@@ -5494,6 +5495,9 @@ local function tick()
     if why == "spot" or (why == nil and cost and money and money >= cost) then AutoPlaceModule.SpotRefused(t, spot, kind) end
     if why == "spot" then
         badSpots[spotKey(spot, kind)] = true
+        -- (a raised spot with no hill name is a roof / wall: the rest of that part is refused too -
+        -- a buff unit tried 7 spots on one roof, each refusal ~0.5 s)
+        if spot.part and spot.hillBy == "height" then AutoPlaceModule.badParts[spot.part] = true end
         return 0.1
     end
     -- (Fool's Hunt: "max placement" for a copy under its own unit limit = the map's unit limit;
@@ -8551,7 +8555,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-115833"
+Lobby.VERSION = "20261025-121106"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
