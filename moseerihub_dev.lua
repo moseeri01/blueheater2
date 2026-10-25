@@ -115,7 +115,7 @@ local AutoPlace = {
 -- Dungeon Run state (settings saved in config.json "dungeon"; Auto dungeon is never restored on)
 local DungeonRun = {
     enabled = false,
-    roomPriority = "HOARD > CHEST > SHOP > BATTLE > SHRINE",
+    roomPriority = "HOARD>CHEST>SHOP>BATTLE>SHRINE",
     wishList = "",            -- shop items to buy, by name; empty = buy nothing
     acceptShrines = false,
     openRareAtEnd = true,
@@ -307,6 +307,7 @@ local function applyConfigData(data)
     local d = data.dungeon or {}
     -- (old dungeon bot keys remoteMap / autoBuyBuffs are ignored: that bot clicked any buy button)
     DungeonRun.roomPriority = pick(d.roomPriority, "string", DungeonRun.roomPriority)
+    if DungeonRun.roomPriority == "HOARD > CHEST > SHOP > BATTLE > SHRINE" then DungeonRun.roomPriority = "HOARD>CHEST>SHOP>BATTLE>SHRINE" end
     DungeonRun.wishList = pick(d.wishList, "string", DungeonRun.wishList)
     DungeonRun.acceptShrines = pick(d.shrineEnabled, "boolean", DungeonRun.acceptShrines)
     DungeonRun.openRareAtEnd = pick(d.openRareAtEnd, "boolean", DungeonRun.openRareAtEnd)
@@ -2929,6 +2930,20 @@ function AutoPlaceModule.Hard()
         or where:find("daily", 1, true) ~= nil or AutoPlaceModule.Losses() > 0
 end
 
+-- The learned path does not reach our base yet (a stage played for the first time): no road point
+-- within a fifth of the spawn-to-base distance (12 studs at least) of our base.
+AutoPlaceModule.HOLD_PATH = 45 -- seconds the 2nd damage unit waits for that at most (tick)
+AutoPlaceModule.holdAt = {}    -- [stageKey] = when that wait began
+function AutoPlaceModule.PathShort()
+    local spawn, goal = AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos("player")
+    if not (spawn and goal) then return false end
+    local reach = math.max(12, 0.2 * math.sqrt((spawn.X - goal.X) ^ 2 + (spawn.Z - goal.Z) ^ 2))
+    for _, q in ipairs(AutoPlaceModule.PathPoints()) do
+        if (q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2 <= reach * reach then return false end
+    end
+    return true
+end
+
 -- Placement mode in use: the chosen one, but Balanced turns Safe on a hard stage.
 function AutoPlaceModule.Mode()
     if AutoPlace.placeMode == "Balanced" and AutoPlaceModule.Hard() then return "Safe" end
@@ -5326,6 +5341,21 @@ local function tick()
     local slot, t, role, dpsPlaced, strongestDown = chooseNext(hudPrices, danger)
     -- Place units myself (Home): the player places, the script only upgrades / sells
     if AutoPlace.manual then t = nil end
+    -- (owner 2026-10-25: on a stage played for the first time only the road near the enemy spawn
+    -- is known when the first unit goes down, so every unit stood forward) the 2nd+ damage unit
+    -- waits until the learned path reaches our base - HOLD_PATH s at most, never in danger
+    if t and role == "dps" and (dpsPlaced or 0) > 0 and not danger and not State.eventMode and AutoPlaceModule.PathShort() then
+        local key = stageKey()
+        AutoPlaceModule.holdAt[key] = AutoPlaceModule.holdAt[key] or os.clock()
+        if os.clock() - AutoPlaceModule.holdAt[key] < AutoPlaceModule.HOLD_PATH then
+            if AutoPlaceModule.holdNoted ~= key then
+                AutoPlaceModule.holdNoted = key
+                AutoPlaceModule.Note("new stage: more damage units once the enemy path reaches our base")
+            end
+            AutoPlaceModule.status = string.format("Learning the road to our base (%d points) before more damage units", #pathPoints())
+            return 0.5
+        end
+    end
     -- Fool's Hunt: its own brain decides (EventChoose); the normal-stage rules below are skipped
     local ev = State.eventMode and not AutoPlace.manual and Lobby.cfg.eventBrain ~= false
     if ev then
@@ -7434,7 +7464,7 @@ local Catalog = AutoPlaceModule.Catalog
 DungeonRun.WORDS = { "depth", "floor", "room", "heart", "lives", "death", "shop", "curse", "blessing", "hoard",
     "chest", "coin", "dungeon", "shrine", "key" }
 DungeonRun.TYPES = { "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE", "BOSS" }
-DungeonRun.WAITING = "waiting for dungeon data - press Copy dungeon report in a run and send it"
+DungeonRun.WAITING = "waiting for the room choice"
 
 function DungeonRun.priority()
     local list = {}
@@ -7593,39 +7623,17 @@ function DungeonRun.ScreenText()
     return out
 end
 
+-- Two short lines (owner 2026-10-25: the old block was a wall of text): state, then what it does.
 function DungeonRun.StatusText(st)
-    local lines = { "Auto: " .. (DungeonRun.enabled and "ON" or "off") .. " | " .. tostring(DungeonRun.status) }
+    local head = (DungeonRun.enabled and "ON" or "Off") .. " | " .. tostring(DungeonRun.mode)
     if st then
-        table.insert(lines, string.format("Depth %s%s | hearts %s%s | coins %s | keys silver %s gold %s",
-            tostring(st.depth or "?"), st.maxDepth and ("/" .. st.maxDepth) or "/20", tostring(st.hearts or "?"),
-            st.maxHearts and ("/" .. st.maxHearts) or "", tostring(st.coins or "?"), tostring(st.silverKeys or "?"), tostring(st.goldKeys or "?")))
-        local rooms = {}
-        for _, r in ipairs(st.rooms or {}) do
-            table.insert(rooms, string.format("%s%s%s", tostring(r.type or r.label or "?"), r.id ~= nil and ("[" .. tostring(r.id) .. "]") or ("#" .. tostring(r.index)),
-                r.score and string.format(" %.2f", r.score) or ""))
+        head = head .. string.format(" | depth %s/20 | lives %s", tostring(st.depth or "?"), tostring(st.hearts or "?"))
+        if st.live and #st.rooms > 0 and not st.ended and DungeonRun.enteredTable ~= st.table then
+            local r = DungeonRun.mode == "Auto" and DungeonRun.AutoPick(st.rooms, st.hearts) or DungeonRun.PickRoom(st.rooms) or st.rooms[1]
+            if r then head = head .. " | next " .. tostring(r.id or r.index) .. " " .. tostring(r.label or r.type or "") end
         end
-        table.insert(lines, "Rooms offered: " .. (#rooms > 0 and table.concat(rooms, ", ") or "none"))
-        if st.shop and #st.shop > 0 then
-            local items = {}
-            for _, it in ipairs(st.shop) do table.insert(items, tostring(it.label or it.id or "?") .. (it.price and (" " .. it.price) or "")) end
-            table.insert(lines, "Shop: " .. table.concat(items, ", "))
-        end
-    else
-        table.insert(lines, st == false and "Run data: not read yet (press Refresh dungeon data)"
-            or "Run data: not found (not in a dungeon, or its table is unknown)")
     end
-    local screen = DungeonRun.ScreenText()
-    if #screen > 0 then table.insert(lines, "On screen: " .. table.concat(screen, ", ")) end
-    if DungeonRun.mode == "Auto" then
-        local share = DungeonRun.TeamShare()
-        local parts = {}
-        for k, v in pairs(share) do table.insert(parts, string.format("%s %d%%", k, math.floor(v * 100 + 0.5))) end
-        table.sort(parts)
-        table.insert(lines, "Team damage: " .. (#parts > 0 and table.concat(parts, ", ") or "unknown"))
-    end
-    table.insert(lines, "Mode " .. tostring(DungeonRun.mode) .. " | Rooms: " .. table.concat(DungeonRun.priority(), " > ") .. " | shrines " .. (DungeonRun.acceptShrines and "on" or "off")
-        .. " | wish-list: " .. (#DungeonRun.wishes() > 0 and table.concat(DungeonRun.wishes(), ", ") or "empty (buys nothing)"))
-    return table.concat(lines, "\n")
+    return head .. "\n" .. tostring(DungeonRun.enabled and DungeonRun.status or "Auto dungeon is off")
 end
 
 function DungeonRun.Refresh(st)
@@ -7781,7 +7789,7 @@ function DungeonRun.Step()
     DungeonRun.deathTried = nil
     local room = DungeonRun.PickRoom(st.rooms)
     if not room then
-        DungeonRun.status = "no room fits the settings (shrines off?) - pick one yourself"
+        DungeonRun.status = "no room fits - pick one yourself"
         DungeonRun.Refresh(st)
         return 2
     end
@@ -7998,15 +8006,18 @@ function DungeonRun.LiveStep(st)
         if not room and not typed then room, why = st.rooms[1], "first room (types not in the data)" end
     end
     if not room then
-        DungeonRun.status = "no room fits the settings (shrines off?) - pick one yourself"
+        DungeonRun.status = "no room fits - pick one yourself"
         DungeonRun.Refresh(st)
         return 2
     end
     local arg = tostring(room.id)
     DungeonRun.status = string.format("entering %s %s (%s)", arg, tostring(room.label or "?"), tostring(why))
     DungeonRun.Refresh(st)
-    pcall(Lobby.ShareLog, string.format("dungeon: depth %s %s -> room %s %s (%s) lives %s", tostring(st.depth), DungeonRun.mode, arg,
-        tostring(room.label), tostring(why), tostring(st.hearts)))
+    local team = {}
+    for k, v in pairs(DungeonRun.TeamShare()) do table.insert(team, string.format("%s %d%%", k, math.floor(v * 100 + 0.5))) end
+    table.sort(team)
+    pcall(Lobby.ShareLog, string.format("dungeon: depth %s %s -> room %s %s (%s) lives %s team %s", tostring(st.depth), DungeonRun.mode, arg,
+        tostring(room.label), tostring(why), tostring(st.hearts), table.concat(team, ", ")))
     local changed = DungeonRun.Call("dungeon_enter_room", arg, st)
     if changed then
         DungeonRun.enteredTable, DungeonRun.enteredId = st.table, arg
@@ -8897,7 +8908,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-122427"
+Lobby.VERSION = "20261025-123240"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -10282,10 +10293,8 @@ local dungeonTab = UIRef.tabs.dungeon
 local dataSection = dungeonTab:Section({ Side = "Left" })
 local setSection = dungeonTab:Section({ Side = "Right" })
 
-dataSection:Header({ Text = "Dungeon data" })
-UIRef.dungeonStatus = dataSection:Paragraph({ Header = "Run", Body = DungeonRun.WAITING })
-dataSection:Button({ Name = "Copy dungeon report", Callback = function() pcall(DungeonRun.Report) end })
-dataSection:Paragraph({ Header = "", Body = "In a run, on the room choice (and in a shop):\npress Copy dungeon report and send it.\nThe bot acts only on room / item ids it finds\nin the game's data; it never quits a run." })
+dataSection:Header({ Text = "Dungeon" })
+UIRef.dungeonStatus = dataSection:Paragraph({ Header = "Run", Body = "Off | " .. DungeonRun.mode .. "\nAuto dungeon is off" })
 Controls.dungeonAuto = dataSection:Toggle({
     Name = "Auto dungeon",
     Default = false,
@@ -10294,6 +10303,7 @@ Controls.dungeonAuto = dataSection:Toggle({
         saveConfig()
     end,
 }, "DungeonBot")
+dataSection:Button({ Name = "Copy dungeon report", Callback = function() pcall(DungeonRun.Report) end })
 
 setSection:Header({ Text = "Choices" })
 Controls.dungeonMode = setSection:Dropdown({ Name = "Room choice", Multi = false, Required = true, Options = { "Fixed", "Auto" },
@@ -10302,34 +10312,24 @@ Controls.dungeonMode = setSection:Dropdown({ Name = "Room choice", Multi = false
 }, "DungeonMode")
 Controls.dungeonPriority = setSection:Input({
     Name = "Room priority",
-    Placeholder = "HOARD > CHEST > SHOP > BATTLE > SHRINE",
+    Placeholder = "HOARD>CHEST>SHOP",
     Default = DungeonRun.roomPriority,
     AcceptedCharacters = "All",
     Callback = function(text) DungeonRun.roomPriority = text or ""; DungeonRun.Refresh(false); saveConfig() end,
 }, "DungeonPriority")
 Controls.dungeonWish = setSection:Input({
-    Name = "Shop wish-list (names, comma separated)",
-    Placeholder = "empty = buy nothing",
+    Name = "Shop wish-list",
+    Placeholder = "item, item",
     Default = DungeonRun.wishList,
     AcceptedCharacters = "All",
     Callback = function(text) DungeonRun.wishList = text or ""; DungeonRun.Refresh(false); saveConfig() end,
 }, "DungeonWishList")
 Controls.shrineEnabled = setSection:Toggle({
-    Name = "Accept shrines (curse for more reward)",
+    Name = "Accept shrines",
     Default = DungeonRun.acceptShrines,
     Callback = function(on) DungeonRun.acceptShrines = on; DungeonRun.Refresh(false); saveConfig() end,
 }, "Shrine")
-Controls.dungeonRareEnd = setSection:Toggle({
-    Name = "Open rare chests at the end",
-    Default = DungeonRun.openRareAtEnd,
-    Callback = function(on) DungeonRun.openRareAtEnd = on; saveConfig() end,
-}, "DungeonRareAtEnd")
-Controls.dungeonContinueDeath = setSection:Toggle({
-    Name = "Auto continue after a lost room",
-    Default = DungeonRun.autoContinueDeath,
-    Callback = function(on) DungeonRun.autoContinueDeath = on; saveConfig() end,
-}, "DungeonContinueDeath")
-setSection:Paragraph({ Header = "", Body = "Battles are normal games: Auto Place plays\nthem with your team. Chests are not opened\nautomatically yet (their data is unknown)." })
+setSection:Paragraph({ Header = "", Body = "Auto: picks rooms our damage types hit hard.\nFixed: Room priority order." })
 end
 
 -- TAB 5: Settings
