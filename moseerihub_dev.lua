@@ -2996,10 +2996,42 @@ function AutoPlaceModule.AdoptOldPath(key)
     return old
 end
 
+-- Another stage on the same map (same fingerprint) learned its path already: Strange Town Raid,
+-- Infinity Mansion and the Daily Challenge share one road, but each stage name started from 4
+-- points and the first units went down on that (owner 2026-10-25). The longest such path that runs
+-- from this map's enemy base is copied; learning goes on from it.
+function AutoPlaceModule.SameMapPath(key)
+    local fp = tostring(key):match("#(%w+)$")
+    local spawn = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve")
+    if not fp or not spawn then return nil end
+    local best
+    for k, p in pairs(AutoPlace.paths) do
+        if k ~= key and type(p) == "table" and #p >= 30 and (not best or #p > #best)
+            and string.sub(k, -(#fp + 1)) == "#" .. fp then
+            for _, q in ipairs(p) do
+                if type(q) == "table" and tonumber(q[1]) and tonumber(q[3])
+                    and (q[1] - spawn.X) ^ 2 + (q[3] - spawn.Z) ^ 2 < 225 then best = p break end
+            end
+        end
+    end
+    if not best then return nil end
+    local copy = {}
+    for i, q in ipairs(best) do copy[i] = { q[1], q[2], q[3] } end
+    AutoPlaceModule.Note(string.format("same map played before: its enemy path (%d points) is used here", #copy))
+    return copy
+end
+AutoPlaceModule.sameMapAt = {}
+
 local function pathPoints()
     local key = stageKey()
     if not AutoPlace.paths[key] then
         AutoPlace.paths[key] = AutoPlaceModule.AdoptOldPath(key) or {}
+    end
+    -- (still empty: the same map's path, tried once a second - the bases may load late)
+    if #AutoPlace.paths[key] == 0 and os.clock() - (AutoPlaceModule.sameMapAt[key] or -1e9) >= 1 then
+        AutoPlaceModule.sameMapAt[key] = os.clock()
+        local same = AutoPlaceModule.SameMapPath(key)
+        if same then AutoPlace.paths[key] = same end
     end
     return AutoPlace.paths[key]
 end
@@ -7385,7 +7417,7 @@ task.spawn(function()
             -- (per-game card memory starts empty: a Replay keeps the script running)
             Lobby.cardsTaken, Lobby.badTaken, Lobby.resTaken, Lobby.regenTaken, Lobby.shieldTaken = nil, nil, nil, nil, nil
             Lobby.candy, Lobby.pendingVote, Lobby.spells, Lobby.buffMain = nil, nil, nil, nil
-            Lobby.depthByWave, Lobby.lastDepth = {}, nil
+            Lobby.depthByWave, Lobby.lastDepth, Lobby.lastUnitRows = {}, nil, nil
             -- (mainSeen is kept across games, as before: resetting it let weak copies fill the early map)
             AutoPlaceModule.capSeen, AutoPlaceModule.capFails = nil, 0
             startSnap, gameWave = playerSnapshot(), 0
@@ -9225,7 +9257,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-131459"
+Lobby.VERSION = "20261025-132301"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -9273,6 +9305,34 @@ function Lobby.ShareLog(text)
     local old = isfile(path) and readfile(path) or ""
     writefile(path, old:sub(-4000) .. os.date("%H:%M:%S ") .. text .. "\n")
 end
+-- One row per unit on the map: id, upgrade, trait, golden, wave placed, and cov = how much of the
+-- recorded enemy road lies inside its range (0-100) - to judge placement from the shared data.
+function Lobby.UnitRows()
+    local pts = AutoPlaceModule.PathPoints and AutoPlaceModule.PathPoints() or {}
+    local rows = {}
+    for _, u in ipairs(ownedUnits()) do
+        local st = u:FindFirstChild("_stats")
+        local trait = ""
+        for _, c in ipairs(st and st:GetChildren() or {}) do
+            local n = c.Name:lower()
+            if c:IsA("StringValue") and n:find("trait", 1, true) and not n:find("stat", 1, true) and c.Value ~= "" then trait = c.Value break end
+        end
+        local cov = -1
+        local range = AutoPlaceModule.StatNum(u, "range")
+        local p = AutoPlaceModule.RootPos(u)
+        if range and p and #pts >= 8 then
+            local inside = 0
+            for _, q in ipairs(pts) do
+                if (q.X - p.X) ^ 2 + (q.Z - p.Z) ^ 2 <= range * range then inside = inside + 1 end
+            end
+            cov = math.floor(100 * inside / #pts + 0.5)
+        end
+        table.insert(rows, { unitType(u) or "?", AutoPlaceModule.StatNum(u, "upgrade") or 0, trait,
+            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1, cov })
+    end
+    return rows
+end
+
 function Lobby.ShareGame(win, wave)
     Lobby.ShareLog(string.format("game end: share %s, event %s, wave %s", tostring(Lobby.cfg.shareData), tostring(State.eventMode), tostring(wave)))
     -- (every mode since 2026-10-25, owner: story, raids, dungeon too - "mode" tells them apart)
@@ -9283,17 +9343,10 @@ function Lobby.ShareGame(win, wave)
         Lobby.shareUrl = ok and type(url) == "string" and url:match("https://[%w%./_%-]+") or nil
     end
     if not Lobby.shareUrl then Lobby.ShareLog("no share_url.txt address") return end
-    local units = {}
-    for _, u in ipairs(ownedUnits()) do
-        local st = u:FindFirstChild("_stats")
-        local trait = ""
-        for _, c in ipairs(st and st:GetChildren() or {}) do
-            local n = c.Name:lower()
-            if c:IsA("StringValue") and n:find("trait", 1, true) and not n:find("stat", 1, true) and c.Value ~= "" then trait = c.Value break end
-        end
-        table.insert(units, { unitType(u) or "?", AutoPlaceModule.StatNum(u, "upgrade") or 0, trait,
-            AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1 })
-    end
+    -- (the map may already be cleared at the result screen in normal stages: the rows kept during
+    -- the game stand in - Dungeon / story shares came with no units, 2026-10-25)
+    local units = Lobby.UnitRows()
+    if #units == 0 then units = Lobby.lastUnitRows or {} end
     -- (pl = players in the room: a duo game is much easier than solo, so stats compare like with like)
     local data = { v = 1, mode = State.eventMode and "event" or "other", ver = Lobby.VERSION, ch = Lobby.CHANNEL, pl = #game:GetService("Players"):GetPlayers(), id = Lobby.ShareId(), t = os.time(), map = tostring(State.stage), w = wave, win = win and 1 or 0,
         candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units }
@@ -9470,11 +9523,13 @@ function Lobby.Loop()
             end)
         end
         if State.eventMode and not inLobbyNow and not Lobby.skillsSaved then Lobby.skillsSaved = true task.spawn(pcall, Lobby.SaveSkills) end
-        -- (wave each unit was placed, for the shared game data: not only while Watch is on)
-        if State.eventMode and not inLobbyNow then
+        -- (wave each unit was placed, and the unit rows kept for the shared game data - every mode)
+        if not inLobbyNow then
             pcall(function()
                 Lobby.placedAt = Lobby.placedAt or setmetatable({}, { __mode = "k" })
                 for _, u in ipairs(ownedUnits()) do Lobby.placedAt[u] = Lobby.placedAt[u] or AutoPlaceModule.WaveNumber() end
+                local rows = Lobby.UnitRows()
+                if #rows > 0 then Lobby.lastUnitRows = rows end
             end)
         end
         if State.watching and State.eventMode and not inLobbyNow then
