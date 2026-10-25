@@ -2909,9 +2909,21 @@ function AutoPlaceModule.Losses()
     return (AutoPlace.stageLosses or {})[AutoPlaceModule.StageName()] or 0
 end
 
--- Placement mode in use: the chosen one, but Balanced turns Safe on a stage lost before.
+-- A hard stage (normal modes only): Hard / Nightmare difficulty, a challenge (Daily Challenge was
+-- lost at wave 3 with 4 farms and one damage unit down), or a stage lost here lately.
+AutoPlaceModule.LONG_RANGE = 1.3      -- range this many times a team unit's = "long range" (bestSpot)
+AutoPlaceModule.HARD_CARRY_LEVEL = 4  -- hard stage: farm upgrades wait until a damage unit is this level
+function AutoPlaceModule.Hard()
+    if State.eventMode then return false end
+    local d = string.lower(tostring(Stage.difficulty or ""))
+    local where = string.lower(tostring(Stage.mode or "") .. " " .. tostring(State.stage or ""))
+    return (d ~= "" and d ~= "normal") or where:find("challenge", 1, true) ~= nil
+        or where:find("daily", 1, true) ~= nil or AutoPlaceModule.Losses() > 0
+end
+
+-- Placement mode in use: the chosen one, but Balanced turns Safe on a hard stage.
 function AutoPlaceModule.Mode()
-    if AutoPlace.placeMode == "Balanced" and AutoPlaceModule.Losses() > 0 then return "Safe" end
+    if AutoPlace.placeMode == "Balanced" and AutoPlaceModule.Hard() then return "Safe" end
     return AutoPlace.placeMode
 end
 
@@ -3479,20 +3491,44 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 end
             end
         end
+        -- (normal stages, owner 2026-10-25: units went down near the enemy spawn) each road point
+        -- weighs by how far along it is (1 = at our base): single-target units hold the last
+        -- stretch, area units lean the same way but less; a long-range unit leaves the spots a
+        -- shorter-range team unit covers best (half of that short cover is taken off its score)
+        local weight, shortR = {}, nil
+        if not State.eventMode then
+            for i, q in ipairs(pts) do
+                local prog = (i - 1) / math.max(1, #pts - 1)
+                if spawn and goal then
+                    local ds = math.sqrt((q[1] - spawn.X) ^ 2 + (q[3] - spawn.Z) ^ 2)
+                    local dg = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
+                    prog = ds / math.max(1, ds + dg)
+                end
+                weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog)
+            end
+            for _, tm in pairs(AutoPlaceModule.team) do
+                local tr = (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" and tm.name ~= AutoPlaceModule.placingName and AutoPlaceModule.Range(tm)
+                if tr and tr > 0 and tr * AutoPlaceModule.LONG_RANGE <= r and (not shortR or tr < shortR) then shortR = tr end
+            end
+        end
         local scored = {}
         for _, c in ipairs(free) do
             local n, passes, inside = 0, 0, false
             local r2 = r * r - (c.rise or 0) ^ 2
-            for _, q in ipairs(pts) do
+            local s2 = shortR and (shortR * shortR - (c.rise or 0) ^ 2)
+            local shortN = 0
+            for i, q in ipairs(pts) do
                 local dx, dz = q[1] - c.x, q[3] - c.z
                 local hit = dx * dx + dz * dz <= r2
-                if hit then n = n + 1 end
+                if hit then n = n + (weight[i] or 1) end
+                if s2 and dx * dx + dz * dz <= s2 then shortN = shortN + (weight[i] or 1) end
                 if hit and not inside then passes = passes + 1 end
                 inside = hit
             end
             -- area attacks hit the whole crowd: a spot where the road passes by two or three
             -- times (a bend, a U-turn) is worth more than one long straight
             if aoe and passes > 1 then n = n * (1 + 0.5 * (passes - 1)) end
+            n = n - 0.5 * shortN
             -- back: a trap unit that also hits flyers (Usopp) guards the last stretch before
             -- our base in every mode (owner): whatever slips past the front line meets its traps
             if spawn and goal and (back or mode == "Fast clear" or mode == "Safe") then
@@ -4470,6 +4506,15 @@ end
 -- onlyRole limits it to one role, airOnly to units that hit flyers. Returns seconds to wait,
 -- or nil when nothing is left.
 AutoPlaceModule.upNeed = setmetatable({}, { __mode = "k" })
+-- Hard stage with no damage unit at HARD_CARRY_LEVEL yet: damage upgrades before farm ones.
+function AutoPlaceModule.HardLow(units)
+    if not AutoPlaceModule.Hard() then return false end
+    local top = 0
+    for _, o in ipairs(units or ownedUnits()) do
+        if unitRole(o) == "dps" then top = math.max(top, AutoPlaceModule.StatNum(o, "upgrade") or 0) end
+    end
+    return top < AutoPlaceModule.HARD_CARRY_LEVEL
+end
 local function upgradeStep(money, onlyRole, airOnly, noWait)
     local remote = getAARemote("upgrade_unit_ingame")
     if not remote then return nil end
@@ -4523,6 +4568,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
         and AutoPlaceModule.WaveNumber() < (AutoPlaceModule.shortRoad and 5 or 10)
         and AutoPlaceModule.UnitDef("judar_evolved") ~= nil -- (only with the owner's roster in the game data)
         and not (AutoPlaceModule.EARLY_CARRY[carryKind] or (AutoPlaceModule.InList(AutoPlaceModule.RANK, carryKind) and not AutoPlaceModule.UP_CAP[carryKind]))
+    local hardLow = AutoPlaceModule.HardLow(units)
     local topOf = {}
     for _, o in ipairs(units) do
         local k = unitType(o) or ""
@@ -4552,6 +4598,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
             if can and noWait and cost and money and cost > money then can = false end
             if can then
                 local rank = AutoPlaceModule.UP_FIRST[unitType(u) or ""] and 1 or RANK[role] or 2
+                if hardLow and role == "farm" then rank = 3 end
                 -- (an upgrade price not in the data: about the unit's price times the next level)
                 local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
                 local guess = (tonumber(def.cost) or 1000) * (level + 1)
@@ -4877,7 +4924,7 @@ end
 -- In danger, the best-value damage unit first and nothing else (returns "upgrade" when none
 -- is left). 5th result: the team's strongest damage unit (best damage per ¥) is on the map.
 local function chooseNext(prices, danger)
-    local list, dpsPlaced = {}, 0
+    local list, dpsPlaced, farmsPlaced = {}, 0, 0
     local strongest, strongestDown
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
@@ -4887,6 +4934,7 @@ local function chooseNext(prices, danger)
             t.placedSample = copies[1]
             local role = AutoPlaceModule.RoleOf(t) or "dps"
             if role == "dps" then dpsPlaced = dpsPlaced + placed end
+            if role == "farm" then farmsPlaced = farmsPlaced + placed end
             local target = math.min(AutoPlaceModule.SlotTarget(s, t), tonumber(AutoPlace.caps[t.name]) or AutoPlaceModule.gameCaps[t.name] or 99,
                 AutoPlaceModule.TraitMods(t.traits).cap or 99)
             -- an event copy is one unit: placed once, then its slot frees for the next random one
@@ -4941,7 +4989,10 @@ local function chooseNext(prices, danger)
         return best
     end
     -- the best-value damage unit, then the farms, then support (cheaper upgrades before upgrading)
-    local pick = (dpsPlaced == 0 and bestDps()) or cheapest("farm") or cheapest("support")
+    -- (hard stage: a farm only while fewer farms than damage units are down - Daily Challenge lost
+    -- at wave 3 with 4 farms and one damage unit)
+    local pick = ((dpsPlaced == 0 or (AutoPlaceModule.Hard() and farmsPlaced >= dpsPlaced)) and bestDps())
+        or cheapest("farm") or cheapest("support")
     -- air share below its quota: the next damage unit is an air-capable one (if one is left)
     if not pick and AutoPlaceModule.airNeed then
         local best = bestDps()
@@ -5305,7 +5356,7 @@ local function tick()
     end
     -- (lost twice here: no farm upgrades until every damage unit is down)
     if not danger and AutoPlace.upgrade and (dpsPlaced or 0) > 0 and strongestDown
-        and (AutoPlaceModule.Losses() < 2 or (t == nil or role ~= "dps"))
+        and (AutoPlaceModule.Losses() < 2 or (t == nil or role ~= "dps")) and not AutoPlaceModule.HardLow()
         and (not t or (role ~= "farm" and role ~= "support")) then
         -- once the strongest damage unit and every farm are down, farm upgrades pay for
         -- themselves quickly (speedwagon 200 -> 500 per wave), so they come before spreading
@@ -7705,7 +7756,9 @@ function DungeonRun.Step()
         DungeonRun.Refresh(st)
         return 2
     end
+    -- (the game sends the room as a string: dungeon_enter_room("2") - Watch, real game 2026-10-25)
     local arg = room.id ~= nil and room.id or room.index
+    if arg ~= nil then arg = tostring(arg) end
     if arg == nil then
         DungeonRun.status = DungeonRun.WAITING
         DungeonRun.Refresh(st)
@@ -8498,7 +8551,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-115541"
+Lobby.VERSION = "20261025-115833"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
