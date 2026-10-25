@@ -233,7 +233,8 @@ local function buildConfigData()
         dungeon = { roomPriority = DungeonRun.roomPriority, wishList = DungeonRun.wishList, shrineEnabled = DungeonRun.acceptShrines,
             openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath,
             mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true,
-            prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule },
+            prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule, autoShop = DungeonRun.autoShop ~= false,
+            goldChests = DungeonRun.goldChests or "now" },
         unitAI = {
             autoAbilities = UnitAI.autoAbilities,
             abilityCooldown = UnitAI.abilityCooldown,
@@ -319,6 +320,8 @@ local function applyConfigData(data)
     DungeonRun.prefs = type(d.prefs) == "table" and d.prefs or nil
     if DungeonRun.prefs and DungeonRun.ApplyPrefs then DungeonRun.ApplyPrefs() end
     DungeonRun.shrineRule = (d.shrineRule == "never" or d.shrineRule == "lives3" or d.shrineRule == "always") and d.shrineRule or nil
+    DungeonRun.autoShop = d.autoShop ~= false
+    DungeonRun.goldChests = d.goldChests == "end" and "end" or "now"
     -- (every room is a teleport and the script reloads there: Auto dungeon has to come back on)
     pendingToggles.dungeon = d.enabled == true
     local u = data.unitAI or {}
@@ -7940,10 +7943,12 @@ function DungeonRun.TagText(tags)
     table.sort(parts)
     return table.concat(parts, ",")
 end
--- _t codes seen in the real game (2026-10-25): "6" = shrine (current_shops held {_t = "6"} while
--- the owner stood at the shrine), "7" = shop, "3" = chest (rooms tagged "3,_curse_..." showed
--- "CURSE + CHEST" on screen), key "0" = { id = "_curse_..." } = a curse. The rest are not known.
-DungeonRun.TAG_TYPES = { ["3"] = "CHEST", ["6"] = "SHRINE", ["7"] = "SHOP" }
+-- _t codes seen in the real game (2026-10-25): a room's tags are the pages that follow it, the same
+-- codes as current_shops: "1" = shop ({_t = "1", data = {items}}), "6" = chest page ({_t = "6",
+-- data = true}: dungeon_open_chest(true) used a gold chest) - the depth-10 room tagged 1,6 was
+-- followed by a shop and a chest page. "3" = chest (rooms tagged "3,_curse_..." showed
+-- "CURSE + CHEST"), "7" = shop (one sample), key "0" = { id = "_curse_..." } = a curse.
+DungeonRun.TAG_TYPES = { ["1"] = "SHOP", ["3"] = "CHEST", ["6"] = "CHEST", ["7"] = "SHOP" }
 -- A room's types as a set ({ CHEST = true, CURSE = true }), from its _t tags.
 function DungeonRun.TagTypes(tags)
     local set = {}
@@ -8178,6 +8183,67 @@ function DungeonRun.AutoPick(rooms, lives)
 end
 
 -- One step on the live run (from dungeon_changed or the game's copy of it).
+-- Shop: dungeon_buy_shop(<slot number in the list now>) - the list shifts after each buy - then
+-- dungeon_continue_shop(). Chest page: dungeon_open_chest(true) opens a gold chest (treasure_gold
+-- - 1); false is not known yet, so silver chests are left alone. (Watch, real game 15:59 2026-10-25)
+DungeonRun.SHOP_DEFAULT = { "shroom", "branch", "bow" }   -- cost down first, then range
+DungeonRun.PRICES = { gold_branch = 300, bow2 = 300, gold_shroom = 500 }
+function DungeonRun.ShopPick(items, money)
+    local wishes = DungeonRun.wishes()
+    if #wishes == 0 then wishes = DungeonRun.SHOP_DEFAULT end
+    for _, w in ipairs(wishes) do
+        for i, it in ipairs(type(items) == "table" and items or {}) do
+            local id = string.lower(tostring(type(it) == "table" and it.id or it))
+            local price = DungeonRun.PRICES[id]
+            if id:find(w, 1, true) and (not price or not money or money >= price) then return i, id end
+        end
+    end
+end
+function DungeonRun.PageStep(st, page)
+    local kind = type(page) == "table" and tostring(page._t) or "?"
+    local seq = DungeonRun.liveSeq or 0
+    local money = st.coins
+    if kind == "1" and DungeonRun.autoShop ~= false and DungeonRun.buyStop ~= seq then
+        local slot, id = DungeonRun.ShopPick(page.data, money)
+        if slot then
+            DungeonRun.status = "shop: buying " .. id
+            DungeonRun.Refresh(st)
+            local ok, answer = DungeonRun.Call("dungeon_buy_shop", slot, st)
+            pcall(DungeonRun.Log, string.format("dungeon_buy_shop(%d) %s -> %s, answered %s", slot, id, ok and "bought" or "nothing", clip(tostring(answer), 40)))
+            pcall(Lobby.ShareLog, "dungeon: shop bought " .. id .. (ok and "" or " - refused"))
+            if not ok then DungeonRun.buyStop = DungeonRun.liveSeq or 0 end
+            return 1
+        end
+    elseif kind == "6" then
+        local gold = tonumber(st.goldKeys) or 0
+        local now = DungeonRun.goldChests ~= "end" or (DungeonRun.lastDepth or 0) >= 19
+        if gold > 0 and now and DungeonRun.chestTried ~= seq then
+            DungeonRun.chestTried = seq
+            DungeonRun.status = "opening a gold chest"
+            DungeonRun.Refresh(st)
+            local ok, answer = DungeonRun.Call("dungeon_open_chest", true, st)
+            pcall(DungeonRun.Log, "dungeon_open_chest(true) -> " .. (ok and "opened" or "nothing") .. ", answered " .. clip(tostring(answer), 40))
+            pcall(Lobby.ShareLog, "dungeon: gold chest " .. (ok and "opened" or "not opened"))
+            return 1
+        end
+    elseif kind ~= "1" then
+        -- (a page not known yet - a shrine?: left to the player, logged for the next build)
+        local ok, j = pcall(function() return HttpService:JSONEncode(page) end)
+        DungeonRun.status = "page _t " .. kind .. " not known yet - choose by hand"
+        if DungeonRun.pageNoted ~= seq then
+            DungeonRun.pageNoted = seq
+            pcall(DungeonRun.Log, "unknown page " .. clip(ok and j or "?", 300))
+        end
+        DungeonRun.Refresh(st)
+        return 3
+    end
+    DungeonRun.status = kind == "1" and "leaving the shop" or "leaving the chest page"
+    DungeonRun.Refresh(st)
+    local ok = DungeonRun.Call("dungeon_continue_shop", nil, st)
+    if not ok then DungeonRun.blocked = "dungeon_continue_shop changed nothing - continue by hand" end
+    return 1
+end
+
 function DungeonRun.LiveStep(st)
     if st.ended then
         DungeonRun.status = DungeonRun.startNote or "run over" .. (DungeonRun.InLobby() and " - no next run to start" or " - back to the lobby next")
@@ -8188,6 +8254,10 @@ function DungeonRun.LiveStep(st)
         DungeonRun.status = DungeonRun.blocked
         DungeonRun.Refresh(st)
         return 2
+    end
+    -- shop / chest pages come first (current_shops; continue_shop closes the first one)
+    if st.table == DungeonRun.live and type(st.table.current_shops) == "table" and st.table.current_shops[1] ~= nil then
+        return DungeonRun.PageStep(st, st.table.current_shops[1])
     end
     if #st.rooms == 0 then
         DungeonRun.status = "no rooms offered right now"
@@ -8483,11 +8553,11 @@ function DungeonRun.OpenSetup()
     local prefs = {}
     for k, v in pairs(DungeonRun.prefs or {}) do prefs[k] = v end
     local draft = { mode = DungeonRun.mode, prefs = prefs, shrineRule = DungeonRun.shrineRule or (DungeonRun.acceptShrines and "always" or "never"),
-        openRare = DungeonRun.openRareAtEnd ~= false }
+        openRare = DungeonRun.openRareAtEnd ~= false, autoShop = DungeonRun.autoShop ~= false, goldChests = DungeonRun.goldChests or "now" }
     local g = Instance.new("ScreenGui")
     g.Name, g.ResetOnSpawn, g.DisplayOrder = "MoseeriDungeonSetup", false, 60
     local win = Instance.new("Frame")
-    win.Name, win.Size, win.Position = "Window", UDim2.new(0, 380, 0, 412), UDim2.new(0.5, -190, 0.5, -206)
+    win.Name, win.Size, win.Position = "Window", UDim2.new(0, 380, 0, 488), UDim2.new(0.5, -190, 0.5, -244)
     win.BackgroundColor3, win.BorderSizePixel, win.Active = C.bg, 0, true
     win.Parent = g
     pcall(function() Instance.new("UICorner").Parent = win end)
@@ -8588,8 +8658,20 @@ function DungeonRun.OpenSetup()
             if stroke then pcall(function() stroke.Color = p == "prefer" and C.preferEdge or (p == "avoid" and C.avoidEdge or C.panel) end) end
         end)
     end
+    -- shop and gold chests (their calls are known since 15:59 2026-10-25)
+    label("Buy in shops (cost down, then range)", 12, 272, 280, 26, 14)
+    local shopBtn = button("", 300, 270, 68, 28, function() draft.autoShop = not draft.autoShop repaint() end)
+    table.insert(paint, function()
+        shopBtn.Text = draft.autoShop and "ON" or "OFF"
+        shopBtn.BackgroundColor3 = draft.autoShop and C.prefer or C.panel
+    end)
+    label("Gold chests", 12, 306, 120, 28, 14)
+    for i, c in ipairs({ { "Open now", "now" }, { "Keep for the end", "end" } }) do
+        local b = button(c[1], 112 + (i - 1) * 130, 304, 124, 30, function() draft.goldChests = c[2] repaint() end)
+        table.insert(paint, function() b.BackgroundColor3 = draft.goldChests == c[2] and C.on or C.panel end)
+    end
     -- the next rooms with the score reason (Auto)
-    local nextLabel = label("", 12, 270, 356, 84, 12)
+    local nextLabel = label("", 12, 346, 356, 84, 12)
     table.insert(paint, function()
         local st = DungeonRun.Read()
         local lines = {}
@@ -8606,9 +8688,10 @@ function DungeonRun.OpenSetup()
         end
         nextLabel.Text = #lines > 0 and ("Next rooms:\n" .. table.concat(lines, "\n")) or "Next rooms: shown when the game opens the room choice"
     end)
-    button("Copy report", 12, 368, 120, 32, function() pcall(DungeonRun.Report) end)
-    button("Save & Close", 218, 368, 150, 32, function()
+    button("Copy report", 12, 444, 120, 32, function() pcall(DungeonRun.Report) end)
+    button("Save & Close", 218, 444, 150, 32, function()
         DungeonRun.mode, DungeonRun.prefs, DungeonRun.shrineRule, DungeonRun.openRareAtEnd = draft.mode, draft.prefs, draft.shrineRule, draft.openRare
+        DungeonRun.autoShop, DungeonRun.goldChests = draft.autoShop, draft.goldChests
         DungeonRun.acceptShrines = draft.shrineRule ~= "never"
         DungeonRun.ApplyPrefs()
         DungeonRun.blocked = nil
@@ -9484,7 +9567,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-152959"
+Lobby.VERSION = "20261025-160757"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
