@@ -302,7 +302,7 @@ local function applyConfigData(data)
         if Lobby.cfg[k] ~= nil and type(v) == type(Lobby.cfg[k]) then Lobby.cfg[k] = v end
         -- (learned dungeon items and pictures have no default: they were saved but never read back, so
         -- every reload - each room is a teleport - showed the generic picture again; 2026-10-26)
-        if (k == "dungeonItems" or k == "dungeonItemIcons" or k == "dungeonIcons4") and type(v) == "table" then Lobby.cfg[k] = v end
+        if (k == "dungeonItems" or k == "dungeonItemIcons" or k == "dungeonIcons4" or k == "dungeonNameIcons") and type(v) == "table" then Lobby.cfg[k] = v end
     end
     local w = data.webhook or {}
     Webhook.url = pick(w.url, "string", Webhook.url)
@@ -10688,22 +10688,28 @@ function DungeonRun.LearnItemIcons()
     Lobby.cfg.dungeonItemIcons = Lobby.cfg.dungeonItemIcons or {}
     local icons, byName, found = Lobby.cfg.dungeonItemIcons, {}, {}
     for _, kind in ipairs({ "shop", "shrine" }) do
-        for _, it in ipairs(DungeonRun.ItemList(kind)) do byName[string.upper(it.name)] = it.id end
+        for _, it in ipairs(DungeonRun.ItemList(kind)) do byName[DungeonRun.NameKey(it.name)] = it.id end
     end
+    -- (a picture of the card frame - inset / border / glow - is no item picture: learned again)
+    local function learned(id) return icons[id] and not DungeonRun.FRAME_IMAGES[icons[id].image or ""] end
     for _, d in ipairs(ui:GetDescendants()) do
-        local id = (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and byName[string.upper(tostring(d.Text):gsub("<[^>]->", ""))]
-        if id and not icons[id] then
+        local id = (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and byName[DungeonRun.NameKey(tostring(d.Text):gsub("<[^>]->", ""))]
+        if id and not learned(id) then
             local node = d.Parent
-            for level = 1, 2 do
-                if not node or icons[id] then break end
-                for _, x in ipairs(level == 1 and node:GetChildren() or node:GetDescendants()) do
-                    if (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) ~= "" then
+            for level = 1, 3 do
+                if not node or learned(id) then break end
+                local direct = node:FindFirstChild("ItemImage", level > 1)
+                for _, x in ipairs(direct and { direct } or (level == 1 and node:GetChildren() or node:GetDescendants())) do
+                    local img = (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) or ""
+                    if img ~= "" and not DungeonRun.FRAME_IMAGES[img] and img ~= DungeonRun.SHOP_ICON then
                         local icon = { image = tostring(x.Image) }
                         pcall(function()
                             local o, z = x.ImageRectOffset, x.ImageRectSize
                             if z and z.X > 0 and z.Y > 0 then icon.offset, icon.size = { o.X, o.Y }, { z.X, z.Y } end
                         end)
                         icons[id] = icon
+                        Lobby.cfg.dungeonNameIcons = Lobby.cfg.dungeonNameIcons or {}
+                        Lobby.cfg.dungeonNameIcons[DungeonRun.NameKey(d.Text)] = icon
                         table.insert(found, id .. "=" .. icon.image .. (icon.size and string.format(" rect %d,%d %dx%d", icon.offset[1], icon.offset[2], icon.size[1], icon.size[2]) or ""))
                         break
                     end
@@ -10818,6 +10824,7 @@ function DungeonRun.PageStep(st, page)
             local ok, answer = DungeonRun.Call("dungeon_buy_shop", slot, st)
             pcall(DungeonRun.Log, string.format("dungeon_buy_shop(%d) %s -> %s, answered %s", slot, id, ok and "bought" or "nothing", clip(tostring(answer), 40)))
             pcall(Lobby.ShareLog, "dungeon: shop bought " .. id .. (ok and "" or " - refused"))
+            if ok then DungeonRun.lastBought = id end
             -- (refused: not tried again unless there is more money; the next pick runs at once and the shop
             -- is left as soon as nothing affordable and wanted is left - a cheaper Dagger after a refused Lamp)
             if not ok then
@@ -11397,6 +11404,40 @@ function DungeonRun.ScanData()
             end
         end
     end)
+    -- ReplicatedStorage Instances named by an item id or name: an Image / Texture, a picture child,
+    -- a StringValue or an attribute holding an asset id
+    local names = {}
+    for _, kind in ipairs({ "shop", "shrine" }) do
+        for _, it in ipairs(DungeonRun.ItemList(kind)) do names[DungeonRun.NameKey(it.name)] = it.id end
+    end
+    local inst = {}
+    pcall(function()
+        for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+            local low = string.lower(d.Name)
+            local id = ids[low] and low or names[DungeonRun.NameKey(d.Name)]
+            if id and #inst < 300 then
+                local img
+                pcall(function()
+                    if d:IsA("ImageLabel") or d:IsA("ImageButton") then img = tostring(d.Image)
+                    elseif d:IsA("Decal") then img = tostring(d.Texture)
+                    elseif d:IsA("StringValue") and tostring(d.Value):find("%d%d%d%d") then img = tostring(d.Value) end
+                end)
+                if not img or img == "" then
+                    local c = d:FindFirstChildWhichIsA("ImageLabel", true) or d:FindFirstChildWhichIsA("Decal", true)
+                    pcall(function() img = c and tostring(c:IsA("Decal") and c.Texture or c.Image) or nil end)
+                end
+                pcall(function()
+                    for k, v in pairs(d:GetAttributes()) do
+                        if not img and imageOf(k, v) then img = imageOf(k, v) end
+                    end
+                end)
+                if img and img ~= "" and not DungeonRun.FRAME_IMAGES[img] then
+                    table.insert(inst, d:GetFullName() .. " [" .. id .. "] " .. d.ClassName .. " image=" .. img)
+                    if not icons[id] then icons[id] = { image = img } table.insert(found, id .. "=" .. img .. " (instance)") end
+                end
+            end
+        end
+    end)
     -- the game's own windows: objects named by an item id (its templates)
     local ui = {}
     pcall(function()
@@ -11417,6 +11458,7 @@ function DungeonRun.ScanData()
         writefile("AAMacro/dungeon_items_dump.txt", table.concat({ "# dungeon items " .. os.date("%Y-%m-%d %H:%M:%S") ..
             " - " .. modules .. " modules read", "## entries for known ids", table.concat(lines, "\n"),
             "## other entries with an image in dungeon / relic / blessing / curse modules", table.concat(maybe, "\n"),
+            "## ReplicatedStorage objects named by an item", table.concat(inst, "\n"),
             "## GUI objects named by an item id", table.concat(ui, "\n") }, "\n"))
     end
     if #found > 0 then
@@ -11473,8 +11515,29 @@ end
 -- An item's picture on a picker row: learned from the shop window, else an emoji.
 -- The game's shop / shrine page lists its rows in the order of the page data's ids: the picture in
 -- row i is item i's (sprite rect kept). Saved like the room icons, logged once per item.
+-- (the game's cards: SellFrame / OfferFrameItem, each with ItemImage + ItemName. The page's own
+-- frame pictures - inset, border, EvolvedGlow, the coin - are not items; the Configuration template
+-- is no row: it made 4 rows for 3 items, so nothing was ever learned - device dump 2026-10-26)
+DungeonRun.FRAME_IMAGES = { ["rbxassetid://126788194153452"] = true, ["rbxassetid://93100413948929"] = true,
+    ["rbxassetid://104758976705209"] = true, ["rbxassetid://95202532327953"] = true }
+-- Pictures read from the game's shop / shrine pages (device dump 2026-10-25/26), by item name.
+DungeonRun.NAME_ICONS = { ["speedy boots"] = "rbxassetid://110168360769036", ["treasure chest"] = "rbxassetid://103690538373746",
+    ["curse of armor"] = "rbxassetid://131564693808604", bow = "rbxassetid://83257385637914", dagger = "rbxassetid://99767692490865",
+    ["ninja belt"] = "rbxassetid://129383649740464", stormbringer = "rbxassetid://82443821880546", axe = "rbxassetid://126820581831157",
+    ["nimble cloak"] = "rbxassetid://112490194054135" }
+function DungeonRun.NameKey(name)
+    return (string.lower(tostring(name or "")):gsub("^%[[^%]]*%]%s*", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+-- An item's picture: learned by id, else by its name, else the built-in one by name.
+function DungeonRun.ItemIcon(it)
+    local icon = (Lobby.cfg.dungeonItemIcons or {})[it.id]
+    if type(icon) == "table" and icon.image and not DungeonRun.FRAME_IMAGES[icon.image] and icon.image ~= DungeonRun.SHOP_ICON then return icon end
+    local key = DungeonRun.NameKey(it.name)
+    icon = (Lobby.cfg.dungeonNameIcons or {})[key]
+    if type(icon) == "table" and icon.image then return icon end
+    return DungeonRun.NAME_ICONS[key] and { image = DungeonRun.NAME_ICONS[key] } or nil
+end
 function DungeonRun.LearnRowIcons(pageName, data)
-    if type(data) ~= "table" or #data == 0 then return end
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local ui = gui and gui:FindFirstChild("DungeonUI")
     local page = ui and ui:FindFirstChild(pageName, true)
@@ -11482,31 +11545,42 @@ function DungeonRun.LearnRowIcons(pageName, data)
     local list = page:FindFirstChildWhichIsA("ScrollingFrame", true) or page
     local rows = {}
     for _, c in ipairs(list:GetChildren()) do
-        if c:IsA("GuiObject") and c:FindFirstChildWhichIsA("ImageLabel", true) then table.insert(rows, c) end
+        if c:IsA("GuiObject") and c.Visible ~= false and c:FindFirstChildWhichIsA("ImageLabel", true) then table.insert(rows, c) end
     end
-    if #rows ~= #data then return end
     local function order(x) local ok, v = pcall(function() return x.LayoutOrder end) return ok and tonumber(v) or 0 end
     table.sort(rows, function(a, b)
         if order(a) ~= order(b) then return order(a) < order(b) end
         return a.AbsolutePosition.Y < b.AbsolutePosition.Y
     end)
     Lobby.cfg.dungeonItemIcons = Lobby.cfg.dungeonItemIcons or {}
-    local icons, found = Lobby.cfg.dungeonItemIcons, {}
+    Lobby.cfg.dungeonNameIcons = Lobby.cfg.dungeonNameIcons or {}
+    local icons, byName, found = Lobby.cfg.dungeonItemIcons, Lobby.cfg.dungeonNameIcons, {}
+    local byOrder = type(data) == "table" and #data == #rows
     for i, row in ipairs(rows) do
-        local id = type(data[i]) == "table" and tostring(data[i].id or "") or tostring(data[i])
-        if id ~= "" and not icons[id] then
+        -- the card's ItemImage first, else its first picture that is not part of the frame
+        local pic = row:FindFirstChild("ItemImage", true)
+        if not (pic and (pic:IsA("ImageLabel") or pic:IsA("ImageButton"))) then
+            pic = nil
             for _, x in ipairs(row:GetDescendants()) do
-                -- (the shop stall picture on a row is the page's, not the item's)
-                if (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) ~= "" and tostring(x.Image) ~= DungeonRun.SHOP_ICON then
-                    local icon = { image = tostring(x.Image) }
-                    pcall(function()
-                        local o, z = x.ImageRectOffset, x.ImageRectSize
-                        if z and z.X > 0 and z.Y > 0 then icon.offset, icon.size = { o.X, o.Y }, { z.X, z.Y } end
-                    end)
-                    icons[id] = icon
-                    table.insert(found, id .. "=" .. icon.image)
-                    break
-                end
+                local img = (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) or ""
+                if img ~= "" and img ~= DungeonRun.SHOP_ICON and not DungeonRun.FRAME_IMAGES[img] then pic = x break end
+            end
+        end
+        local img = pic and tostring(pic.Image) or ""
+        if img ~= "" and img ~= DungeonRun.SHOP_ICON and not DungeonRun.FRAME_IMAGES[img] then
+            local icon = { image = img }
+            pcall(function()
+                local o, z = pic.ImageRectOffset, pic.ImageRectSize
+                if z and z.X > 0 and z.Y > 0 then icon.offset, icon.size = { o.X, o.Y }, { z.X, z.Y } end
+            end)
+            local nameLabel = row:FindFirstChild("ItemName", true)
+            local key = nameLabel and nameLabel:IsA("TextLabel") and DungeonRun.NameKey(nameLabel.Text) or ""
+            if key ~= "" and not (byName[key] and byName[key].image == img) then byName[key] = icon table.insert(found, key .. "=" .. img) end
+            local id = byOrder and (type(data[i]) == "table" and tostring(data[i].id or "") or tostring(data[i])) or ""
+            local old = icons[id]
+            if id ~= "" and (type(old) ~= "table" or DungeonRun.FRAME_IMAGES[old.image or ""] or old.image ~= img) then
+                icons[id] = icon
+                table.insert(found, id .. "=" .. img)
             end
         end
     end
@@ -11585,7 +11659,7 @@ function DungeonRun.ItemInfo(id)
     return { id = id, kind = kind, name = pretty, effect = "(effect not known yet)" }
 end
 function DungeonRun.ItemIconOn(parent, it, x, y, size)
-    local icon = (Lobby.cfg.dungeonItemIcons or {})[it.id]
+    local icon = DungeonRun.ItemIcon(it)
     if type(icon) == "table" and icon.image then
         local img = Instance.new("ImageLabel")
         img.BackgroundTransparency, img.Image = 1, icon.image
@@ -11735,7 +11809,7 @@ function DungeonRun.OpenSetup()
             sub.TextColor3 = draft.mode == m[2] and C.text or C.dim
         end)
     end
-    -- Select by tap (owner 2026-10-26): a selected row / room tile glows (border + brighter), tap again =
+    -- Select by tap (owner 2026-10-26): a selected card / room glows (border + brighter), tap again =
     -- not selected. My picks: tap to change; Auto: read-only, the glow shows what the script picks.
     local function glow(b, isOn)
         local stroke
@@ -11750,10 +11824,10 @@ function DungeonRun.OpenSetup()
             if stroke then pcall(function() stroke.Transparency = on and 0 or 1 end) end
         end)
     end
+    local function roomOn(t) return draft.mode == "Auto" or draft.prefs[t] ~= "avoid" end
     local pageFrame
     local function closePage() pcall(function() pageFrame:Destroy() end) pageFrame = nil repaint() end
-    -- (owner 2026-10-25: like the game's shop - icon, yellow name, effect under it; rows in groups: shop
-    -- by what they do, shrine blessings first then curses by danger)
+    -- groups: shop by what the item does, shrine blessings first then curses by danger
     local function itemGroup(it)
         local text = string.lower(it.name .. " " .. it.effect)
         if it.kind == "shrine" then
@@ -11767,12 +11841,13 @@ function DungeonRun.OpenSetup()
         if text:find("luck", 1, true) or text:find("chest", 1, true) then return 4, "Chest luck" end
         return 5, "Special"
     end
-    -- (owner 2026-10-26: "Recommended for your team" on top, open; the other groups folded - tap the
-    -- header; open groups are remembered for this session only)
+    -- (owner 2026-10-26: like the game's shop page - a grid of item cards, the game's picture on top,
+    -- name, value stars, effect; "Recommended for your team" open on top, the other groups folded -
+    -- tap the header (+ / -); open groups are remembered for this session only)
     DungeonRun.openGroups = DungeonRun.openGroups or {}
     local function itemList(kind, top, parent)
         local list = Instance.new("ScrollingFrame")
-        list.Name, list.Position, list.Size = "List", UDim2.new(0, 8, 0, top), UDim2.new(1, -16, 0, 300 - top)
+        list.Name, list.Position, list.Size = "List", UDim2.new(0, 8, 0, top), UDim2.new(1, -16, 0, 306 - top)
         list.BackgroundColor3, list.BorderSizePixel = C.frame, 0
         list.Parent = parent
         pcall(function() Instance.new("UICorner").Parent = list end)
@@ -11787,50 +11862,57 @@ function DungeonRun.OpenSetup()
         table.sort(sorted, function(a, b) if a.g ~= b.g then return a.g < b.g end return a.i < b.i end)
         local counts = {}
         for _, e in ipairs(sorted) do counts[e.g] = (counts[e.g] or 0) + 1 end
-        local layout
-        local function row(it, y)
-            local b = button("", 4, y, 336, 58, function()
+        local CW, CH, GAP = 112, 132, 6
+        local function card(it, x, y)
+            local b = button("", x, y, CW, CH, function()
                 if draft.mode == "Auto" then return end
                 draft.itemPrefs[it.id] = DungeonRun.ItemSelected(it.id, draft.itemPrefs) and "avoid" or "prefer"
                 repaint()
             end, list)
             b.Name, b.AutoButtonColor = "Pick_" .. it.id, false
-            DungeonRun.ItemIconOn(b, it, 6, 7, 44)
-            label(it.name, 58, 6, 196, 20, 14, b).TextColor3 = C.gold
+            DungeonRun.ItemIconOn(b, it, math.floor((CW - 56) / 2), 6, 56)
+            local name = label(it.name, 4, 64, CW - 8, 28, 12, b)
+            name.TextColor3, name.TextXAlignment = C.gold, Enum.TextXAlignment.Center
             local st = stars[it.id] or { n = 1 }
-            local mark = label(string.rep(st.curse and "☠" or "★", st.n), 256, 6, 74, 20, 13, b)
-            mark.Name, mark.TextXAlignment, mark.TextColor3 = "Stars_" .. it.id, Enum.TextXAlignment.Right, st.curse and C.avoidEdge or C.gold
-            label(it.effect, 58, 28, 270, 24, 11, b).TextColor3 = C.dim
+            local mark = label(string.rep(st.curse and "☠" or "★", st.n), 4, 92, CW - 8, 12, 11, b)
+            mark.Name, mark.TextXAlignment, mark.TextColor3 = "Stars_" .. it.id, Enum.TextXAlignment.Center, st.curse and C.avoidEdge or C.gold
+            local eff = label(it.effect, 4, 104, CW - 8, 26, 10, b)
+            eff.TextColor3, eff.TextXAlignment = C.dim, Enum.TextXAlignment.Center
             glow(b, function()
                 if draft.mode == "Auto" then return DungeonRun.ItemRecommended(it.id) end
                 return DungeonRun.ItemSelected(it.id, draft.itemPrefs)
             end)
         end
+        local layout
         layout = function()
             list:ClearAllChildren()
-            local y, lastGroup, open = 4, nil, true
+            local y, col, lastGroup, open = 4, 0, nil, true
             for _, e in ipairs(sorted) do
                 if e.g ~= lastGroup then
+                    if col > 0 then y, col = y + CH + GAP, 0 end
                     lastGroup = e.g
                     local key = kind .. "/" .. e.title
                     open = e.g == 0 or DungeonRun.openGroups[key] == true
-                    local head = button("", 4, y, 336, 24, function()
+                    local head = button("", 4, y, 346, 24, function()
                         DungeonRun.openGroups[key] = not DungeonRun.openGroups[key] or nil
                         layout()
                     end, list)
                     head.Name, head.BackgroundTransparency = "Head_" .. e.title, 1
-                    label(e.g == 0 and "" or (open and "▾" or "▸"), 4, 2, 14, 20, 12, head).TextColor3 = C.dim
+                    -- (+ / - as text: the arrow glyphs showed as empty boxes - owner 2026-10-26)
+                    label(e.g == 0 and "" or (open and "-" or "+"), 4, 2, 14, 20, 14, head).TextColor3 = C.dim
                     local t = label(e.title, 20, 2, 240, 20, 12, head)
                     t.Name, t.TextColor3 = "Group_" .. e.title, e.g == 0 and C.gold or C.dim
-                    local n = label("(" .. counts[e.g] .. ")", 262, 2, 68, 20, 12, head)
+                    local n = label("(" .. counts[e.g] .. ")", 262, 2, 80, 20, 12, head)
                     n.TextXAlignment, n.TextColor3 = Enum.TextXAlignment.Right, C.dim
                     y = y + 26
                 end
                 if open then
-                    row(e.it, y)
-                    y = y + 62
+                    card(e.it, 4 + col * (CW + GAP), y)
+                    col = col + 1
+                    if col == 3 then y, col = y + CH + GAP, 0 end
                 end
             end
+            if col > 0 then y = y + CH + GAP end
             pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, y + 4) end)
             repaint()
         end
@@ -11844,9 +11926,17 @@ function DungeonRun.OpenSetup()
         pageFrame.Parent = win
         local page = pageFrame
         DungeonRun.IconOn(page, t, 0, 0, 30).Position = UDim2.new(0, 12, 0, 0)
-        label(t .. " room", 50, 2, 200, 26, 16, page)
+        label(t .. " room", 50, 2, 160, 26, 16, page)
+        -- the room itself: one glowing toggle in the header (glowing = go to this room)
+        local roomBtn = button("Go to this room", 232, 0, 136, 30, function()
+            if draft.mode == "Auto" then return end
+            draft.prefs[t] = draft.prefs[t] ~= "avoid" and "avoid" or nil
+            repaint()
+        end, page)
+        roomBtn.Name, roomBtn.TextSize, roomBtn.AutoButtonColor = "Room_" .. t, 12, false
+        glow(roomBtn, function() return roomOn(t) end)
         label(draft.mode == "Auto" and "Auto picks these - glowing = yes (switch to My picks to change)" or "Tap to select - glowing = yes",
-            12, 32, 356, 20, 11, page).TextColor3 = C.dim
+            12, 34, 356, 20, 11, page).TextColor3 = C.dim
         if t == "SHOP" then
             label("Buy in shops", 12, 58, 280, 26, 13, page)
             local shopBtn = button("", 300, 56, 68, 28, function() draft.autoShop = not draft.autoShop repaint() end, page)
@@ -11865,6 +11955,8 @@ function DungeonRun.OpenSetup()
                 local b = button(c[1], 112 + (i - 1) * 130, 60, 124, 30, function() draft.goldChests = c[2] repaint() end, page)
                 table.insert(paint, function() if b.Parent then b.BackgroundColor3 = draft.goldChests == c[2] and C.on or C.panel end end)
             end
+        else
+            label("Coins room - nothing else to set up", 12, 62, 356, 24, 13, page).TextColor3 = C.dim
         end
         button("Back", 130, 312, 120, 34, closePage, page)
         repaint()
@@ -11902,41 +11994,41 @@ function DungeonRun.OpenSetup()
         end
         button("Back", 130, 312, 120, 34, closePage, pageFrame)
     end
-    button("Items", 138, 366, 74, 32, openRunItems)
-    -- the room tiles: icon and name; a tap selects / unselects the room (not selected = only when
-    -- nothing else is offered)
-    local tapHelp = label("Tap to select - glowing = yes", 12, 140, 356, 22, 12)
-    -- Auto: nothing to choose, only what it will do (owner 2026-10-25)
-    local summary = label("", 12, 140, 356, 116, 13)
-    summary.Text = "What Auto does:\n- Rooms: the one your team's damage hits hardest; a room lost before counts harder\n"
-        .. "- Shops: buys what is worth most to your team\n- Gold (rare) chests: kept for the end - Secret Unit chance\n- Shrines: scored, accepted when worth it"
+    -- (My picks only: the run's blessings and curses)
+    local itemsBtn = button("Items", 138, 366, 74, 32, openRunItems)
+    table.insert(paint, function() itemsBtn.Visible = draft.mode ~= "Auto" end)
+    -- My picks: the room tiles (icon and name, glowing = go to this room; a tap opens the room's page).
+    -- Auto: a summary only - nothing to choose (owner 2026-10-26)
+    local tapHelp = label("Tap a room to set it up - glowing = go there", 12, 140, 356, 22, 12)
+    local summary = label("", 12, 140, 356, 118, 12)
     table.insert(paint, function()
         tapHelp.Visible = draft.mode ~= "Auto"
         summary.Visible = draft.mode == "Auto"
+        if draft.mode ~= "Auto" then return end
+        local top, names = DungeonRun.TopItems(DungeonRun.ItemList("shop")), {}
+        for _, it in ipairs(DungeonRun.ItemList("shop")) do if top[it.id] then names[top[it.id]] = it.name end end
+        local bought = DungeonRun.lastBought and DungeonRun.ItemInfo(DungeonRun.lastBought)
+        summary.Text = "What Auto does:\n- Rooms: the one your team's damage hits hardest; a room lost before counts harder\n"
+            .. "- Shops: buys what is worth most to your team" .. (#names > 0 and (" (now: " .. table.concat(names, ", ") .. ")") or "") .. "\n"
+            .. "- Gold (rare) chests: kept for the end - Secret Unit chance\n- Shrines: scored, accepted when worth it"
+            .. (bought and ("\nLast bought: " .. bought.name) or "")
     end)
     for i, t in ipairs(DungeonRun.ROOM_TYPES) do
         -- (the tiles share the row's width: 4 since BATTLE has none - owner 2026-10-25)
         local n = #DungeonRun.ROOM_TYPES
         local w = math.floor((356 - (n - 1) * 8) / n)
-        local tile = button("", 12 + (i - 1) * (w + 8), 166, w, 86, function()
-            draft.prefs[t] = draft.prefs[t] ~= "avoid" and "avoid" or nil
-            repaint()
-        end)
+        local tile = button("", 12 + (i - 1) * (w + 8), 166, w, 86, function() openPage(t) end)
         tile.Name, tile.AutoButtonColor = "Tile_" .. t, false
         DungeonRun.IconOn(tile, t, 0, 10, 40)
         local name = Instance.new("TextLabel")
         name.BackgroundTransparency, name.TextColor3, name.Font, name.TextSize = 1, C.text, Enum.Font.GothamBold, 12
         name.Position, name.Size = UDim2.new(0, 0, 0, 58), UDim2.new(1, 0, 0, 18)
         name.Text, name.Parent = t, tile
-        glow(tile, function() return draft.prefs[t] ~= "avoid" end)
+        glow(tile, function() return roomOn(t) end)
         table.insert(paint, function() tile.Visible = draft.mode ~= "Auto" end)
     end
-    -- the pages with settings and items (both modes: read-only in Auto)
-    for i, p in ipairs({ { "Shop items", "SHOP" }, { "Shrine", "SHRINE" }, { "Chests", "CHEST" } }) do
-        button(p[1], 12 + (i - 1) * 120, 258, 114, 26, function() openPage(p[2]) end).TextSize = 12
-    end
     -- the next rooms with the score reason (Auto)
-    local nextLabel = label("", 12, 290, 356, 72, 12)
+    local nextLabel = label("", 12, 262, 356, 96, 12)
     table.insert(paint, function()
         local st = DungeonRun.Read()
         local lines = {}
@@ -12893,7 +12985,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-011217"
+Lobby.VERSION = "20261026-014005"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
