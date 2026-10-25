@@ -8464,7 +8464,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-101933"
+Lobby.VERSION = "20261025-102751"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -9653,7 +9653,8 @@ function Lobby.SetWatch(on)
             for _, r in ipairs(ReplicatedStorage.endpoints.server_to_client:GetChildren()) do
                 local n = string.lower(r.Name)
                 if r:IsA("RemoteEvent") and (n:find("temporary", 1, true) or n:find("roguelike", 1, true)
-                    or n:find("spell", 1, true) or n:find("vote", 1, true) or n:find("unit_spawned", 1, true)) then
+                    or n:find("spell", 1, true) or n:find("vote", 1, true) or n:find("unit_spawned", 1, true)
+                    or n:find("dungeon", 1, true)) then
                     table.insert(Lobby.watchConns, r.OnClientEvent:Connect(function(...)
                         local args = table.pack(...)
                         local parts = {}
