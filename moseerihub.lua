@@ -5074,7 +5074,10 @@ function AutoPlaceModule.EventChoose(money)
                 if buffs >= EV.buffUnits then why = "enough buff units" end
             -- (owner: only the units on the Always list - the rest just while fewer than 4 damage units
             -- are down, so the early waves are held)
-            elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 8 then why = "not on the Always list"
+            -- (from wave 20 a free map place is worth more than the yen: losses at waves 28-30 had only
+            -- 10-16 of 20 units while copies were cleared - owner 2026-10-25)
+            elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 8
+                and not (AutoPlaceModule.WaveNumber() >= 20 and #units < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2) then why = "not on the Always list"
             elseif not always and not thin and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
@@ -8449,7 +8452,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-052853"
+Lobby.VERSION = "20261025-085954"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
