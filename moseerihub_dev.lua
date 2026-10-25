@@ -2933,6 +2933,7 @@ end
 -- A hard stage (normal modes only): Hard / Nightmare difficulty, a challenge (Daily Challenge was
 -- lost at wave 3 with 4 farms and one damage unit down), or a stage lost here lately.
 AutoPlaceModule.LONG_RANGE = 1.3      -- range this many times a team unit's = "long range" (bestSpot)
+AutoPlaceModule.COVER_DECAY = 0.7     -- normal stages: road already covered by k damage units counts 0.7^k (bestSpot)
 AutoPlaceModule.HARD_CARRY_LEVEL = 4  -- hard stage: farm upgrades wait until a damage unit is this level
 function AutoPlaceModule.Hard()
     if State.eventMode then return false end
@@ -3607,7 +3608,30 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             for i, q in ipairs(pts) do
                 local prog = (i - 1) / math.max(1, #pts - 1)
                 if far > near then prog = (far - math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)) / (far - near) end
-                weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog)
+                -- (Safe leans through these weights alone, steeper - the old (1 - nearSpawn)^2 spot factor
+                -- on top of them put all 6 damage units on the last 25 studs of known road)
+                if mode == "Safe" then weight[i] = aoe and (0.6 + 0.8 * prog) or (0.25 + 1.5 * prog)
+                else weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog) end
+            end
+            -- road already in reach of k of our damage units is worth COVER_DECAY^k to the next one:
+            -- Ant Kingdom (2026-10-25 dump) had six damage units on one spot, together covering 22% of
+            -- the known road; with this about 75% in the replay (work/ sim on the dump)
+            local reach = {}
+            for _, u in ipairs(ownedUnits()) do
+                if unitRole(u) == "dps" then
+                    local p = rootPos(u)
+                    local ur = AutoPlaceModule.StatNum(u, "range") or AutoPlaceModule.Range({ name = unitType(u) or "" })
+                    if p and ur and ur > 0 then reach[#reach + 1] = { p.X, p.Z, ur * ur } end
+                end
+            end
+            if #reach > 0 then
+                for i, q in ipairs(pts) do
+                    local k = 0
+                    for _, e in ipairs(reach) do
+                        if (q[1] - e[1]) ^ 2 + (q[3] - e[2]) ^ 2 <= e[3] then k = k + 1 end
+                    end
+                    if k > 0 then weight[i] = weight[i] * AutoPlaceModule.COVER_DECAY ^ k end
+                end
             end
             for _, tm in pairs(AutoPlaceModule.team) do
                 local tr = (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" and tm.name ~= AutoPlaceModule.placingName and AutoPlaceModule.Range(tm)
@@ -3651,7 +3675,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             n = n - 0.5 * shortN
             -- back: a trap unit that also hits flyers (Usopp) guards the last stretch before
             -- our base in every mode (owner): whatever slips past the front line meets its traps
-            if spawn and goal and (back or mode == "Fast clear" or mode == "Safe") then
+            if spawn and goal and (back or mode == "Fast clear" or (mode == "Safe" and State.eventMode)) then
                 local ds = math.sqrt((c.x - spawn.X) ^ 2 + (c.z - spawn.Z) ^ 2)
                 local dg = math.sqrt((c.x - goal.X) ^ 2 + (c.z - goal.Z) ^ 2)
                 local nearSpawn = dg / math.max(1, ds + dg) -- 1 at the spawn, 0 at our base
@@ -6006,6 +6030,13 @@ function AutoPlaceModule.DumpStep()
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
+        -- (a copy per map and wave in AAMacro/dumps/, so the next game does not overwrite a bad case)
+        pcall(function()
+            local dir = Config.Folder .. "/dumps"
+            if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(dir) then makefolder(dir) end
+            local name = string.sub(string.gsub(tostring(stageKey()), "[^%w]+", "_"), 1, 80)
+            writefile(dir .. "/" .. name .. "_w" .. tostring(mark) .. ".json", text)
+        end)
         AutoPlaceModule.Note(string.format("placement dump written (wave %d)", w))
     end
 end
@@ -7934,7 +7965,8 @@ function DungeonRun.Step()
     pcall(DungeonRun.LearnIcons)
     pcall(DungeonRun.LearnItemIcons)
     local st = DungeonRun.Read()
-    if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and #st.rooms > 0 and not st.ended) then
+    -- (only a fresh dungeon_changed shows a run still going: an old copy in memory still has rooms)
+    if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and st.table == DungeonRun.live and #st.rooms > 0 and not st.ended) then
         return DungeonRun.TryStart()
     end
     if st and st.live then return DungeonRun.LiveStep(st) end
@@ -8482,6 +8514,12 @@ function DungeonRun.LiveStep(st)
         DungeonRun.status = DungeonRun.blocked
         DungeonRun.Refresh(st)
         return 2
+    end
+    -- (no lives left: the run is over, a room call only answers "error" - 18:05 2026-10-25)
+    if st.hearts ~= nil and st.hearts <= 0 then
+        DungeonRun.status = "no lives left - the run is over"
+        DungeonRun.Refresh(st)
+        return 3
     end
     -- shop / chest pages come first (current_shops; continue_shop closes the first one)
     if st.table == DungeonRun.live and type(st.table.current_shops) == "table" and st.table.current_shops[1] ~= nil then
@@ -9961,7 +9999,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-180446"
+Lobby.VERSION = "20261025-181418"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -10201,15 +10239,39 @@ function Lobby.Loop()
         -- (Dungeon Run "You Died!" - all lives lost, the run is over: its Continue collects the rewards
         -- and leaves. Left alone it sat there until the idle kick - 2026-10-25)
         if not inLobbyNow then
+            -- (at most 2 Continue taps: in the depth-18 room it was tapped every 5 s for a minute, each
+            -- sending dungeon_continue_death() with no answer - the run was already over. Still up 10 s
+            -- after the 2nd tap: back to the lobby the normal way, where Auto starts the next run - 18:05 2026-10-25)
             pcall(function()
-                if os.clock() - (Lobby.diedTapAt or -1e9) < 4 then return end
-                if not Lobby.ButtonFor("You Died!") then return end
-                local b = Lobby.ButtonFor("Continue")
-                if b then
-                    Lobby.diedTapAt = os.clock()
-                    Lobby.TapGui(b)
-                    pcall(Lobby.ShareLog, "dungeon: You Died! - tapped Continue")
+                if not Lobby.ButtonFor("You Died!") then Lobby.diedTaps, Lobby.diedLeft = nil, nil return end
+                if DungeonRun.enabled and not DungeonRun.pendingStart then
+                    DungeonRun.pendingStart = true
+                    saveConfig()
                 end
+                if (Lobby.diedTaps or 0) < 2 then
+                    if os.clock() - (Lobby.diedTapAt or -1e9) < 4 then return end
+                    local b = Lobby.ButtonFor("Continue")
+                    if b then
+                        Lobby.diedTaps, Lobby.diedTapAt = (Lobby.diedTaps or 0) + 1, os.clock()
+                        Lobby.TapGui(b)
+                        pcall(Lobby.ShareLog, "dungeon: You Died! - tapped Continue (" .. Lobby.diedTaps .. ")")
+                    end
+                    return
+                end
+                if Lobby.diedLeft or os.clock() - (Lobby.diedTapAt or 0) < 10 then return end
+                Lobby.diedLeft = true
+                local back, remote = Lobby.ButtonFor("Return to lobby"), getAARemote("teleport_back_to_lobby")
+                local how
+                if back then
+                    Lobby.TapGui(back) how = "tapped Return to lobby"
+                elseif remote then
+                    pcall(function() if remote:IsA("RemoteFunction") then remote:InvokeServer() else remote:FireServer() end end)
+                    how = "teleport_back_to_lobby()"
+                else
+                    pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
+                    how = "teleport to the lobby"
+                end
+                pcall(Lobby.ShareLog, "dungeon: You Died! still up after 2 Continue taps - " .. how)
             end)
             -- (Dungeon Room result, win or defeat: "Next" goes back to the room choice / You Died!
             -- page. Left alone it sat on DEFEAT Depth 6 for 5+ minutes - 2026-10-25)
