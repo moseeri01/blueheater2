@@ -5549,7 +5549,6 @@ function ControlUp.Clear(now)
     return st.wasted or now - st.endedAt >= ControlUp.gap(st.unit)
 end
 -- For the dump: each control unit's level, cooldown, reach, casts and wasted casts.
-AutoPlaceModule.ControlReport = function() return ControlUp.Report() end
 function ControlUp.Report()
     local out = {}
     for _, u in ipairs(ownedUnits()) do
@@ -7523,7 +7522,6 @@ function AutoPlaceModule.DumpStep()
         pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog,
         short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
         road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath(), hills = PV.HillSpots(),
-        control = AutoPlaceModule.ControlReport(),
         v2 = { rl = PV.Road().len, kind = PV.Kind(PV.Road().len), from = PV.Road().from, lanes = PV.Road().lanes, order = AutoPlaceModule.v2Why,
             margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog, fast = PV.FinishFast(), highStreak = PV.highStreak } }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
@@ -12488,7 +12486,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-002455"
+Lobby.VERSION = "20261026-003159"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
