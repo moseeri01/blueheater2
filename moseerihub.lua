@@ -144,7 +144,7 @@ local Lobby = {
     cfg = { autoJoin = false, mode = "Story", world = "", act = "1", difficulty = "Normal", joinFriends = false,
         usePortals = false, portal = "", portalTier = "1", portalFriends = false,
         clean = false, deletePortals = {}, deleteItems = {}, cleanAt = 90, cleanInStage = false,
-        openEggs = false, eggs = {}, claim = false, survey = false, surveyDone = {}, towerRoom = 0, challenges = {}, watch = false,
+        openEggs = false, eggs = {}, claim = false, towerRoom = 0, challenges = {}, watch = false,
         watchNoPause = false, eventCards = false, cardMode = "Most coins", voteWay = "", eventSpells = false, spellWay = "",
         -- Fool's Hunt: its own Auto Place brain, the units always placed / never placed (the rest
         -- go by the quality bar), and how many spells may wait in hand. Default lists: the strategy
@@ -234,8 +234,7 @@ local function buildConfigData()
             openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath,
             mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true,
             prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule, autoShop = DungeonRun.autoShop ~= false,
-            goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, lostRooms = DungeonRun.lostRooms, flyMaps = DungeonRun.flyMaps,
-            lives = DungeonRun.lives },
+            goldChests = DungeonRun.goldChests or "now" },
         unitAI = {
             autoAbilities = UnitAI.autoAbilities,
             abilityCooldown = UnitAI.abilityCooldown,
@@ -317,16 +316,12 @@ local function applyConfigData(data)
     DungeonRun.autoContinueDeath = pick(d.autoContinueDeath, "boolean", DungeonRun.autoContinueDeath)
     DungeonRun.mode = d.mode == "Auto" and "Auto" or "Fixed"
     DungeonRun.pendingStart = d.pendingStart == true
-    DungeonRun.lives = tonumber(d.lives)
     -- (Setup window: room prefs and the shrine rule; an old config keeps its typed priority)
     DungeonRun.prefs = type(d.prefs) == "table" and d.prefs or nil
     if DungeonRun.prefs and DungeonRun.ApplyPrefs then DungeonRun.ApplyPrefs() end
     DungeonRun.shrineRule = (d.shrineRule == "never" or d.shrineRule == "lives3" or d.shrineRule == "always") and d.shrineRule or nil
     DungeonRun.autoShop = d.autoShop ~= false
-    DungeonRun.goldChests = d.goldChests == "now" and "now" or "end"
-    DungeonRun.itemPrefs = type(d.itemPrefs) == "table" and d.itemPrefs or {}
-    DungeonRun.lostRooms = type(d.lostRooms) == "table" and d.lostRooms or {}
-    DungeonRun.flyMaps = type(d.flyMaps) == "table" and d.flyMaps or {}
+    DungeonRun.goldChests = d.goldChests == "end" and "end" or "now"
     -- (every room is a teleport and the script reloads there: Auto dungeon has to come back on)
     pendingToggles.dungeon = d.enabled == true
     local u = data.unitAI or {}
@@ -2937,7 +2932,6 @@ end
 -- A hard stage (normal modes only): Hard / Nightmare difficulty, a challenge (Daily Challenge was
 -- lost at wave 3 with 4 farms and one damage unit down), or a stage lost here lately.
 AutoPlaceModule.LONG_RANGE = 1.3      -- range this many times a team unit's = "long range" (bestSpot)
-AutoPlaceModule.COVER_DECAY = 0.7     -- normal stages: road already covered by k damage units counts 0.7^k (bestSpot)
 AutoPlaceModule.HARD_CARRY_LEVEL = 4  -- hard stage: farm upgrades wait until a damage unit is this level
 function AutoPlaceModule.Hard()
     if State.eventMode then return false end
@@ -2947,10 +2941,9 @@ function AutoPlaceModule.Hard()
         or where:find("daily", 1, true) ~= nil or AutoPlaceModule.Losses() > 0
 end
 
--- The learned path does not reach our base yet (a stage played for the first time, or enemies held /
--- killed near the spawn): no road point within a quarter of the spawn-to-base distance (12 studs at
--- least) of our base.
-AutoPlaceModule.HOLD_PATH = 12 -- seconds the 2nd damage unit waits for that at most (tick; 45 left 12.5k unspent at wave 5 - candy map 2026-10-25)
+-- The learned path does not reach our base yet (a stage played for the first time): no road point
+-- within a fifth of the spawn-to-base distance (12 studs at least) of our base.
+AutoPlaceModule.HOLD_PATH = 45 -- seconds the 2nd damage unit waits for that at most (tick)
 AutoPlaceModule.holdAt = {}    -- [stageKey] = when that wait began
 
 -- Enemy spawn and our base, checked against the road (normal stages): _BASES.pve / _BASES.player
@@ -2980,41 +2973,10 @@ function AutoPlaceModule.Ends()
     return spawn, goal, false
 end
 
--- Road points to SCORE spots with (normal stages): the learned path, plus - while it does not reach
--- our base (PathShort) - points every 2.5 studs on a straight line from its point nearest our base to
--- the base. Spots still come from the learned road and must reach it; this only makes the end of a
--- stub that leads on toward the base worth more than its middle by the spawn.
-AutoPlaceModule.STUB_LEAD = 30
-AutoPlaceModule.STUB_STALL = 10
-function AutoPlaceModule.ScorePath(pts)
-    -- (not in Fast clear: forward on purpose; only a stub that stopped growing STUB_STALL s ago - the
-    -- enemies held / killed by the spawn, Future City; a road still being learned is the hold's job,
-    -- and scoring it toward the base early moved flyer and long-range spots - flying_focus)
-    if State.eventMode or #pts < 8 or AutoPlaceModule.Mode() == "Fast clear" or not AutoPlaceModule.PathShort()
-        or os.clock() - (AutoPlaceModule.pathGrewAt or 0) < AutoPlaceModule.STUB_STALL then return pts end
-    local _, goal = AutoPlaceModule.Ends()
-    if not goal then return pts end
-    local best, bd
-    for _, q in ipairs(pts) do
-        local d = (q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2
-        if not bd or d < bd then best, bd = q, d end
-    end
-    local out = {}
-    for i, q in ipairs(pts) do out[i] = q end
-    -- (30 studs on at most: enough to pull units to the stub end that leads on; the whole line to the
-    -- base outweighed the real road - a long-range unit stood on the road edge, flyers waited)
-    local len = math.sqrt(bd)
-    for s = 2.5, math.min(len, AutoPlaceModule.STUB_LEAD), 2.5 do
-        local t = s / len
-        out[#out + 1] = { best[1] + (goal.X - best[1]) * t, best[2], best[3] + (goal.Z - best[3]) * t }
-    end
-    return out
-end
-
 function AutoPlaceModule.PathShort()
     local spawn, goal = AutoPlaceModule.Ends()
     if not (spawn and goal) then return false end
-    local reach = math.max(12, 0.25 * math.sqrt((spawn.X - goal.X) ^ 2 + (spawn.Z - goal.Z) ^ 2))
+    local reach = math.max(12, 0.2 * math.sqrt((spawn.X - goal.X) ^ 2 + (spawn.Z - goal.Z) ^ 2))
     for _, q in ipairs(AutoPlaceModule.PathPoints()) do
         if (q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2 <= reach * reach then return false end
     end
@@ -3029,8 +2991,6 @@ end
 
 -- Called once per finished game.
 function AutoPlaceModule.OnResult(win)
-    -- (a played stage is not new any more: no new-stage hold in the next game on it)
-    AutoPlaceModule.freshStage = {}
     AutoPlace.stageLosses = AutoPlace.stageLosses or {}
     local key, n = AutoPlaceModule.StageName(), AutoPlaceModule.Losses()
     if win then
@@ -3073,194 +3033,36 @@ end
 -- from this map's enemy base is copied; learning goes on from it.
 function AutoPlaceModule.SameMapPath(key)
     local fp = tostring(key):match("#(%w+)$")
-    if not fp then return nil end
     local spawn = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve")
-    -- a complete one (reaching our base) first, then the longest; with no _BASES.pve (Dungeon rooms)
-    -- only a complete one - nothing else shows it is this map's road
-    local best, bestDone
+    if not fp or not spawn then return nil end
+    local best
     for k, p in pairs(AutoPlace.paths) do
-        if k ~= key and type(p) == "table" and #p >= 30 and string.sub(k, -(#fp + 1)) == "#" .. fp then
-            local fits = spawn == nil
-            if spawn then
-                for _, q in ipairs(p) do
-                    if type(q) == "table" and tonumber(q[1]) and tonumber(q[3])
-                        and (q[1] - spawn.X) ^ 2 + (q[3] - spawn.Z) ^ 2 < 225 then fits = true break end
-                end
-            end
-            local done = AutoPlaceModule.Reaches(p)
-            if fits and (done or spawn) and (not best or (done and not bestDone) or (done == bestDone and #p > #best)) then
-                best, bestDone = p, done
+        if k ~= key and type(p) == "table" and #p >= 30 and (not best or #p > #best)
+            and string.sub(k, -(#fp + 1)) == "#" .. fp then
+            for _, q in ipairs(p) do
+                if type(q) == "table" and tonumber(q[1]) and tonumber(q[3])
+                    and (q[1] - spawn.X) ^ 2 + (q[3] - spawn.Z) ^ 2 < 225 then best = p break end
             end
         end
     end
     if not best then return nil end
     local copy = {}
     for i, q in ipairs(best) do copy[i] = { q[1], q[2], q[3] } end
-    AutoPlaceModule.Note(string.format("same map played before: its enemy path (%d points%s) is used here", #copy, bestDone and ", complete" or ""))
-    return copy, bestDone
+    AutoPlaceModule.Note(string.format("same map played before: its enemy path (%d points) is used here", #copy))
+    return copy
 end
 AutoPlaceModule.sameMapAt = {}
-AutoPlaceModule.sameMapDone = {}
-AutoPlaceModule.freshStage = {}
-AutoPlaceModule.laneClean = {}
-
--- The game's own road data: _BASES.pve.LANES / _BASES.player.LANES .<lane>.<bend> (MapFingerprint reads
--- player LANES on maps with no _BASES.pve). Real dump (Planet Greenie, 2026-10-25): bends "1".."10" plus
--- "final" by the enemy entrance and "spawn" by our base - "10" next to the entrance, "1" next to our base
--- (player LANES run base -> entrance: summons walk the road backwards). Raw bends go into the dump.
-function AutoPlaceModule.Lanes()
-    local bases = workspace:FindFirstChild("_BASES")
-    local out = {}
-    for _, side in ipairs({ "pve", "player" }) do
-        local sb = bases and bases:FindFirstChild(side)
-        local lanes = sb and sb:FindFirstChild("LANES")
-        for _, lane in ipairs(lanes and lanes:GetChildren() or {}) do
-            local bends = {}
-            for _, b in ipairs(lane:GetChildren()) do
-                local ok, p = pcall(function() return b:IsA("BasePart") and b.Position or b:GetPivot().Position end)
-                if ok and p then bends[#bends + 1] = { name = b.Name, x = p.X, y = p.Y, z = p.Z } end
-            end
-            if #bends > 0 then out[#out + 1] = { name = lane.Name, side = side, bends = bends } end
-        end
-    end
-    return out
-end
--- One lane's bends in walking order, entrance first: numbered bends by number, the named ones
--- ("final", "spawn") at the end they stand nearer; turned round so it starts away from our base. Only
--- when no bend name is a number: chained from the bend farthest from our base, nearest bend next.
-function AutoPlaceModule.LaneOrder(bends, g)
-    local function d2(a, b) return (a.x - b.x) ^ 2 + (a.z - b.z) ^ 2 end
-    local nums, named = {}, {}
-    for _, b in ipairs(bends) do
-        if tonumber(b.name) then nums[#nums + 1] = b else named[#named + 1] = b end
-    end
-    local chain = {}
-    if #nums >= 2 then
-        table.sort(nums, function(a, b) return tonumber(a.name) > tonumber(b.name) end)
-        for _, b in ipairs(nums) do chain[#chain + 1] = b end
-        local head, tail = {}, {}
-        for _, b in ipairs(named) do
-            if d2(b, nums[1]) <= d2(b, nums[#nums]) then head[#head + 1] = b else tail[#tail + 1] = b end
-        end
-        for _, b in ipairs(head) do table.insert(chain, 1, b) end
-        for _, b in ipairs(tail) do chain[#chain + 1] = b end
-    else
-        local start, sd = 1, -1
-        for i, p in ipairs(bends) do if d2(p, g) > sd then start, sd = i, d2(p, g) end end
-        local used = { [start] = true }
-        chain[1] = bends[start]
-        while #chain < #bends do
-            local last, bi, bd = chain[#chain], nil, nil
-            for i, p in ipairs(bends) do
-                if not used[i] and (not bd or d2(last, p) < bd) then bi, bd = i, d2(last, p) end
-            end
-            used[bi] = true
-            chain[#chain + 1] = bends[bi]
-        end
-    end
-    if #chain >= 2 and d2(chain[1], g) < d2(chain[#chain], g) then
-        local rev = {}
-        for i = #chain, 1, -1 do rev[#rev + 1] = chain[i] end
-        chain = rev
-    end
-    return chain
-end
-function AutoPlaceModule.LanePath()
-    local goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
-    if not goal then return nil end
-    local g = { x = goal.X, z = goal.Z }
-    local lanes = AutoPlaceModule.Lanes()
-    -- (the enemies' own lanes first when the map has them)
-    local useSide = "player"
-    for _, lane in ipairs(lanes) do if lane.side == "pve" and #lane.bends >= 2 then useSide = "pve" end end
-    local out = {}
-    for _, lane in ipairs(lanes) do
-        if lane.side == useSide and #lane.bends >= 2 then
-            local chain = AutoPlaceModule.LaneOrder(lane.bends, g)
-            for i = 1, #chain - 1 do
-                local a, b = chain[i], chain[i + 1]
-                local len = math.sqrt((a.x - b.x) ^ 2 + (a.z - b.z) ^ 2)
-                for s = 0, len - 0.01, 2.5 do
-                    local t = s / math.max(0.01, len)
-                    out[#out + 1] = { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t }
-                end
-            end
-            local e = chain[#chain]
-            out[#out + 1] = { e.x, e.y, e.z }
-        end
-    end
-    return #out >= 8 and out or nil
-end
-
--- Does this road reach our base: a point within a quarter of the spawn-to-base distance (12 studs at
--- least) of _BASES.player; the spawn is _BASES.pve or the first point.
-function AutoPlaceModule.Reaches(pts)
-    local goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
-    if not goal or type(pts) ~= "table" or #pts == 0 then return false end
-    local spawn = AutoPlaceModule.BasePos("pve")
-    local sx, sz = spawn and spawn.X or pts[1][1], spawn and spawn.Z or pts[1][3]
-    local reach = math.max(12, 0.25 * math.sqrt((sx - goal.X) ^ 2 + (sz - goal.Z) ^ 2))
-    for _, q in ipairs(pts) do
-        if (q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2 <= reach * reach then return true end
-    end
-    return false
-end
 
 local function pathPoints()
     local key = stageKey()
     if not AutoPlace.paths[key] then
         AutoPlace.paths[key] = AutoPlaceModule.AdoptOldPath(key) or {}
-        -- (nothing saved for this stage: a new one - the only kind the new-stage hold waits on)
-        if #AutoPlace.paths[key] == 0 then AutoPlaceModule.freshStage[key] = true end
     end
-    -- (empty, or a stub that does not reach our base: the same map's road from another stage - each
-    -- Dungeon Room depth is its own stage - tried once a second, the bases may load late; a stub
-    -- keeps its points and gets the other road's points that are not already there)
-    local cur = AutoPlace.paths[key]
-    -- (normal stages, once per stage: lane points merged by the old bend chaining - out of order on
-    -- Planet Greenie, its road cut across off-road ground - are dropped; learned samples are always on
-    -- the half-stud grid, lane points are not; the lanes are merged again in the right order below)
-    if not State.eventMode and not AutoPlaceModule.laneClean[key] then
-        AutoPlaceModule.laneClean[key] = true
-        local kept = {}
-        for _, q in ipairs(cur) do
-            if q[1] * 2 == math.floor(q[1] * 2) and q[3] * 2 == math.floor(q[3] * 2) then kept[#kept + 1] = q end
-        end
-        if #kept < #cur then
-            AutoPlace.paths[key], cur = kept, kept
-            AutoPlaceModule.sameMapDone[key] = nil
-            AutoPlaceModule.Note(string.format("old lane points dropped from the saved road (%d left)", #kept))
-        end
-    end
-    if not State.eventMode and not AutoPlaceModule.sameMapDone[key] and os.clock() - (AutoPlaceModule.sameMapAt[key] or -1e9) >= 1 then
+    -- (still empty: the same map's path, tried once a second - the bases may load late)
+    if #AutoPlace.paths[key] == 0 and os.clock() - (AutoPlaceModule.sameMapAt[key] or -1e9) >= 1 then
         AutoPlaceModule.sameMapAt[key] = os.clock()
-        if #cur == 0 or not AutoPlaceModule.Reaches(cur) then
-            local same, done = AutoPlaceModule.SameMapPath(key)
-            -- (no complete road seen on this map: the game's lane bends)
-            if not done then
-                local lanes = AutoPlaceModule.LanePath()
-                if lanes and AutoPlaceModule.Reaches(lanes) then
-                    same, done = lanes, true
-                    AutoPlaceModule.Note(string.format("enemy road taken from the map's lanes (%d points)", #lanes))
-                end
-            end
-            if same and #cur == 0 then
-                AutoPlace.paths[key] = same
-                AutoPlaceModule.sameMapDone[key] = true
-            elseif same and done then
-                for _, q in ipairs(same) do
-                    if #cur >= 400 then break end
-                    local near = false
-                    for _, c in ipairs(cur) do
-                        if (c[1] - q[1]) ^ 2 + (c[3] - q[3]) ^ 2 < PATH_CELL * PATH_CELL then near = true break end
-                    end
-                    if not near then cur[#cur + 1] = q end
-                end
-                AutoPlaceModule.sameMapDone[key] = true
-            end
-        else
-            AutoPlaceModule.sameMapDone[key] = true
-        end
+        local same = AutoPlaceModule.SameMapPath(key)
+        if same then AutoPlace.paths[key] = same end
     end
     return AutoPlace.paths[key]
 end
@@ -3695,15 +3497,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
     end
     local free, nearRefused = {}, {}
     for _, c in ipairs(candidates) do
-        -- (normal stages: candidates are built once and kept until the road grows 10%; a spot made
-        -- beside the end of a short road is ON the road once it grows past it - refused, auto_place)
-        local onRoad = false
-        if not State.eventMode and not c.onPath then
-            for _, q in ipairs(pts) do
-                if (q[1] - c.x) ^ 2 + (q[3] - c.z) ^ 2 < 12.25 then onRoad = true break end
-            end
-        end
-        if not onRoad and not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) and not (attacks and cover(c) == 0) then
+        if not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) and not (attacks and cover(c) == 0) then
             local ok = true
             for _, p in ipairs(mine) do
                 local dx, dz = p.X - c.x, p.Z - c.z
@@ -3711,12 +3505,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             end
             if ok then
                 local near = c.part ~= nil and AutoPlaceModule.badParts[c.part] == true
-                -- (normal stages: spots by an earlier BAD_SPOT are tried last)
-                if not near and attacks and not State.eventMode then
-                    for _, b in ipairs(AutoPlaceModule.badAreas or {}) do
-                        if (b[1] - c.x) ^ 2 + (b[2] - c.z) ^ 2 < 64 then near = true break end
-                    end
-                end
                 for _, b in ipairs(refused) do
                     local dx, dz = b[1] - c.x, b[2] - c.z
                     if dx * dx + dz * dz < BAD_REACH * BAD_REACH then near = true break end
@@ -3767,8 +3555,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
     end
     if role ~= "buff" and role ~= "support" then
         local r = (range and range > 0) and range or DEFAULT_RANGE
-        -- (scores only: the road not learned yet is taken as straight from the known end to our base)
-        local pts = AutoPlaceModule.ScorePath(pts)
         -- Fast clear: prefer spots near the enemy spawn (kills early, waves end sooner);
         -- Safe: near our base (last line, nothing slips past). Balanced: road covered only.
         local mode = AutoPlaceModule.Mode()
@@ -3820,31 +3606,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             for i, q in ipairs(pts) do
                 local prog = (i - 1) / math.max(1, #pts - 1)
                 if far > near then prog = (far - math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)) / (far - near) end
-                -- (Safe: steeper, with a half-strength spot factor below - the old (1 - nearSpawn)^2 on
-                -- top of 0.5 + prog put all 6 damage units on the last 25 studs of known road)
-                if mode == "Safe" then weight[i] = aoe and (0.6 + 0.8 * prog) or (0.25 + 1.5 * prog)
-                elseif mode == "Fast clear" then weight[i] = 1 -- (forward on purpose: no lean to the base)
-                else weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog) end
-            end
-            -- road already in reach of k of our damage units is worth COVER_DECAY^k to the next one:
-            -- Ant Kingdom (2026-10-25 dump) had six damage units on one spot, together covering 22% of
-            -- the known road; with this about 75% in the replay (work/ sim on the dump)
-            local reach = {}
-            for _, u in ipairs(ownedUnits()) do
-                if unitRole(u) == "dps" then
-                    local p = rootPos(u)
-                    local ur = AutoPlaceModule.StatNum(u, "range") or AutoPlaceModule.Range({ name = unitType(u) or "" })
-                    if p and ur and ur > 0 then reach[#reach + 1] = { p.X, p.Z, ur * ur } end
-                end
-            end
-            if #reach > 0 then
-                for i, q in ipairs(pts) do
-                    local k = 0
-                    for _, e in ipairs(reach) do
-                        if (q[1] - e[1]) ^ 2 + (q[3] - e[2]) ^ 2 <= e[3] then k = k + 1 end
-                    end
-                    if k > 0 then weight[i] = weight[i] * AutoPlaceModule.COVER_DECAY ^ k end
-                end
+                weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog)
             end
             for _, tm in pairs(AutoPlaceModule.team) do
                 local tr = (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" and tm.name ~= AutoPlaceModule.placingName and AutoPlaceModule.Range(tm)
@@ -3895,9 +3657,6 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 -- (back alone leans softer than Safe: a spot that still covers a lot of road
                 -- near the base beats a tiny corner right at the gate)
                 if mode == "Fast clear" and not back then n = n * nearSpawn ^ 2
-                -- (normal stages: half-strength - the steep road weights lean too; squared on top put
-                -- every unit on the last 25 studs of known road, Ant Kingdom dump 2026-10-25)
-                elseif mode == "Safe" and not State.eventMode then n = n * (1 - 0.5 * nearSpawn)
                 elseif mode == "Safe" then n = n * (1 - nearSpawn) ^ 2
                 else n = n * (1 - nearSpawn) end
             end
@@ -3915,8 +3674,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
                 top[i] = { x = math.floor(e.c.x * 10) / 10, z = math.floor(e.c.z * 10) / 10, n = math.floor(e.n * 100) / 100, kind = e.c.kind }
             end
             local log = AutoPlaceModule.scoredLog
-            table.insert(log, { unit = AutoPlaceModule.placingName, range = r, defRange = AutoPlaceModule.DefRangeAt(AutoPlaceModule.placingName or "", 0),
-                buff = AutoPlaceModule.RangeBuff(), aoe = aoe == true, mode = mode, wave = AutoPlaceModule.WaveNumber(), top = top })
+            table.insert(log, { unit = AutoPlaceModule.placingName, range = r, aoe = aoe == true, mode = mode, wave = AutoPlaceModule.WaveNumber(), top = top })
             while #log > 4 do table.remove(log, 1) end
         end
         return scored[skip + 1] and scored[skip + 1].c
@@ -4879,100 +4637,6 @@ end
 -- or nil when nothing is left.
 AutoPlaceModule.upNeed = setmetatable({}, { __mode = "k" })
 -- Hard stage with no damage unit at HARD_CARRY_LEVEL yet: damage upgrades before farm ones.
--- Range a unit really gets (normal stages, owner 2026-10-25): data range at an upgrade level (the last
--- upgrade entry with a range at or below it), the run's range buffs seen on our placed units (median of
--- their _stats.range / data range at their level, 1 - 1.6), and for the carry the range at PLAN_LEVEL
--- (cid went down with 19 and had 28-30 at level 3-5). Rolls and traits are in Range(t) already.
-AutoPlaceModule.PLAN_LEVEL = 3
-function AutoPlaceModule.DefRangeAt(name, level)
-    local def = AutoPlaceModule.UnitDef(name) or {}
-    local r = tonumber(def.range) or DEFAULT_RANGE
-    if type(def.upgrade) == "table" then
-        for i = 1, math.min(level or 0, #def.upgrade) do
-            local up = def.upgrade[i]
-            if type(up) == "table" and tonumber(up.range) then r = tonumber(up.range) end
-        end
-    end
-    return r
-end
-function AutoPlaceModule.RangeBuff()
-    local ratios = {}
-    for _, u in ipairs(ownedUnits()) do
-        local real = AutoPlaceModule.StatNum(u, "range")
-        local base = AutoPlaceModule.DefRangeAt(unitType(u) or "", AutoPlaceModule.StatNum(u, "upgrade") or 0)
-        if real and base and base > 0 then ratios[#ratios + 1] = real / base end
-    end
-    if #ratios < 2 then return 1 end
-    table.sort(ratios)
-    return math.max(1, math.min(1.6, ratios[math.ceil(#ratios / 2)]))
-end
-function AutoPlaceModule.CarryName()
-    local best, bv
-    for _, tm in pairs(AutoPlaceModule.team) do
-        if (AutoPlaceModule.RoleOf(tm) or "dps") == "dps" then
-            local v = AutoPlaceModule.Value(tm, tm.cost)
-            if not bv or v > bv then best, bv = tm.name, v end
-        end
-    end
-    return best
-end
-function AutoPlaceModule.PlanRange(t)
-    local r = AutoPlaceModule.Range(t)
-    if State.eventMode then return r end
-    -- (a placed copy's _stats.range already has the buffs and its level)
-    if not (t.placedSample and t.placedSample.Parent) then
-        r = r * AutoPlaceModule.RangeBuff()
-        if t.name == AutoPlaceModule.CarryName() then
-            local now = AutoPlaceModule.DefRangeAt(t.name, 0)
-            if now > 0 then r = r * AutoPlaceModule.DefRangeAt(t.name, AutoPlaceModule.PLAN_LEVEL) / now end
-        end
-    end
-    return r
-end
-
--- After a damage unit goes down (normal stages): its share of the learned road inside its range, and
--- where it stands along the road. BAD_SPOT when it covers under half of what its range could on this
--- road (owner asked for "cov < 25%", but on a 600-stud road no single unit reaches that), or when it
--- stands in the spawn-side 20% of the road before wave 10. Noted, counted for the shared game row
--- (bad), kept for the dump; the next units avoid 8 studs around it.
-AutoPlaceModule.badLog, AutoPlaceModule.badCount, AutoPlaceModule.badAreas = {}, 0, {}
-function AutoPlaceModule.CheckSpot(name, spot, range)
-    local pts = AutoPlaceModule.PathPoints()
-    if State.eventMode or #pts < 8 or not range or range <= 0 then return end
-    local w = AutoPlaceModule.WaveNumber()
-    if w < (AutoPlaceModule.badWave or 0) then
-        AutoPlaceModule.badLog, AutoPlaceModule.badCount, AutoPlaceModule.badAreas = {}, 0, {}
-    end
-    AutoPlaceModule.badWave = w
-    local inside, len = 0, 0
-    for i, q in ipairs(pts) do
-        if (q[1] - spot.x) ^ 2 + (q[3] - spot.z) ^ 2 <= range * range then inside = inside + 1 end
-        if i > 1 then len = len + math.min(10, math.sqrt((q[1] - pts[i - 1][1]) ^ 2 + (q[3] - pts[i - 1][3]) ^ 2)) end
-    end
-    local cov = inside / #pts
-    local could = math.min(1, 2 * range / math.max(1, len))
-    local _, goal = AutoPlaceModule.Ends()
-    local prog
-    if goal then
-        local far, near, nd, nq = 0, math.huge, nil, nil
-        for _, q in ipairs(pts) do
-            local dq = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
-            far, near = math.max(far, dq), math.min(near, dq)
-            local ds = (q[1] - spot.x) ^ 2 + (q[3] - spot.z) ^ 2
-            if not nd or ds < nd then nd, nq = ds, dq end
-        end
-        if far > near then prog = (far - nq) / (far - near) end
-    end
-    local bad = cov < 0.5 * could or (prog ~= nil and prog < 0.2 and w < 10)
-    if not bad then return end
-    AutoPlaceModule.badCount = AutoPlaceModule.badCount + 1
-    table.insert(AutoPlaceModule.badLog, { unit = name, cov = math.floor(cov * 100 + 0.5), could = math.floor(could * 100 + 0.5),
-        prog = prog and math.floor(prog * 100 + 0.5) or -1, wave = w, x = math.floor(spot.x), z = math.floor(spot.z), range = range })
-    table.insert(AutoPlaceModule.badAreas, { spot.x, spot.z })
-    AutoPlaceModule.Note(string.format("BAD_SPOT %s cov %d%% (could %d%%) at %d%% along the road", name, math.floor(cov * 100 + 0.5),
-        math.floor(could * 100 + 0.5), prog and math.floor(prog * 100 + 0.5) or -1))
-end
-
 function AutoPlaceModule.HardLow(units)
     if not AutoPlaceModule.Hard() then return false end
     local top = 0
@@ -5371,9 +5035,7 @@ function AutoPlaceModule.FarmPays(u, level, cost)
         if not (nowAmt and nextAmt and nextAmt > nowAmt) then return AutoPlaceModule.WaveNumber() < 10 end
         return (nextAmt - nowAmt) * (30 - AutoPlaceModule.WaveNumber()) >= 1.5 * cost
     end
-    -- (portals run past wave 15: a fixed 15-wave horizon stopped every farm upgrade there, so
-    -- at least 8 waves are always counted; farms are sold on the last wave anyway)
-    local left = math.max(AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber(), 8)
+    local left = AutoPlaceModule.FARM_HORIZON - AutoPlaceModule.WaveNumber()
     return cost / (nextAmount - now) <= left / 2
 end
 
@@ -5783,8 +5445,6 @@ local function tick()
         for _, u in ipairs(ownedUnits()) do
             if AutoPlaceModule.AirCapable(unitType(u) or "", math.huge) then any = true end
         end
-        -- (a dungeon room's map with flyers is remembered for the room choice: DungeonRun.RoomFlies)
-        if DungeonRun.InRoom() then pcall(DungeonRun.NoteFlyMap) end
         if any then
             AutoPlaceModule.Note("flying enemies on the map: hill / hybrid units first")
         elseif not AutoPlaceModule.flyWarned then
@@ -5810,12 +5470,10 @@ local function tick()
     -- is known when the first unit goes down, so every unit stood forward) the 2nd+ damage unit
     -- waits until the learned path reaches our base - HOLD_PATH s at most, never in danger, not in
     -- Fast clear (units forward on purpose there)
-    -- (a new stage only: where the enemies never reach our base the road stays "short" for good, and
-    -- the script reloads every game - the hold came back each game there, auto_place next game)
-    if t and role == "dps" and (dpsPlaced or 0) > 0 and not danger and not State.eventMode and not AutoPlaceModule.flying
-        and AutoPlaceModule.freshStage[stageKey()] and AutoPlaceModule.Mode() ~= "Fast clear" and AutoPlaceModule.PathShort() then
-        -- (no early end when the path stops growing: Future City 2026-10-25, homura froze the enemies
-        -- by the spawn and the units went down on a 25-point stub 150 studs from our base)
+    if t and role == "dps" and (dpsPlaced or 0) > 0 and not danger and not State.eventMode
+        and AutoPlaceModule.Mode() ~= "Fast clear" and AutoPlaceModule.PathShort()
+        -- (path not grown for 10 s: enemies die before they get further - this is the road that matters)
+        and os.clock() - (AutoPlaceModule.pathGrewAt or 0) < 10 then
         local key = stageKey()
         AutoPlaceModule.holdAt[key] = AutoPlaceModule.holdAt[key] or os.clock()
         if os.clock() - AutoPlaceModule.holdAt[key] < AutoPlaceModule.HOLD_PATH then
@@ -5823,12 +5481,8 @@ local function tick()
                 AutoPlaceModule.holdNoted = key
                 AutoPlaceModule.Note("new stage: more damage units once the enemy path reaches our base")
             end
-            -- (the money waits for the next unit: upgrading during the hold put upgrades before placing -
-            -- auto_place_upgrade; flyers on the map end the hold, see above)
             AutoPlaceModule.status = string.format("Learning the road to our base (%d points) before more damage units", #pathPoints())
-            -- (0.1: the path is sampled once a tick - at 0.5 the enemies moved past PATH_CELL between
-            -- samples and the saved road had gaps; spots in them were on the road, refused next game)
-            return 0.1
+            return 0.5
         end
     end
     -- Fool's Hunt: its own brain decides (EventChoose); the normal-stage rules below are skipped
@@ -5952,7 +5606,7 @@ local function tick()
     end
     end
     local unknown = not (cost and money)
-    local range = AutoPlaceModule.PlanRange(t)
+    local range = AutoPlaceModule.Range(t)
     local kind = AutoPlaceModule.PlacementKind(t)
     local aoe = AutoPlaceModule.IsAoe(t.name)
     local back = AutoPlaceModule.IsTrap(t.name) and AutoPlaceModule.AirCapable(t.name, 0)
@@ -6002,7 +5656,6 @@ local function tick()
             or (role == "buff" and string.format("buff rotation needs %d", AutoPlaceModule.BuffNeed(t)))
             or (role == "support" and "support before upgrades") or "damage"
         AutoPlaceModule.Note(string.format("placed %s #%d on %s (%s)", t.name, #placedOf(t.uuid), spot.kind or "ground", why))
-        if role == "dps" and not State.eventMode then pcall(AutoPlaceModule.CheckSpot, t.name, spot, range) end
         return 0.2
     end
     local why = refusalReason()
@@ -6311,47 +5964,7 @@ function AutoPlaceModule.ResetSpots() candidates, candidatesFor = nil, -1 end
 -- units (role, range, spot, road cover %), the bases and the scored spots of the last damage
 -- placements - read on the PC (work/dump_map.js draws it) to judge the placer against the real map.
 AutoPlaceModule.scoredLog = {}
-AutoPlaceModule.DUMP_WAVES = { 1, 5, 10, 20 } -- wave 1: the map scan (lanes) without playing on
--- For the dump: workspace's top folders, and anything named like a path / waypoint / node / lane /
--- route (the game has "Show Paths Info" for multi-path modes, so its own path data may be readable).
--- workspace._road (a Model seen on Planet Greenie): its children, for the dump.
-function AutoPlaceModule.RoadModel()
-    local out = {}
-    local road = workspace:FindFirstChild("_road")
-    for _, c in ipairs(road and road:GetChildren() or {}) do
-        local okp, p = pcall(function() return c:IsA("BasePart") and c.Position or c:GetPivot().Position end)
-        local ok, n = pcall(function() return #c:GetChildren() end)
-        out[#out + 1] = { name = c.Name, class = c.ClassName, children = ok and n or -1,
-            x = okp and p and math.floor(p.X * 10) / 10 or nil, z = okp and p and math.floor(p.Z * 10) / 10 or nil }
-    end
-    return out
-end
-function AutoPlaceModule.MapScan()
-    local out = { top = {}, named = {} }
-    for _, c in ipairs(workspace:GetChildren()) do
-        local ok, n = pcall(function() return #c:GetChildren() end)
-        table.insert(out.top, c.Name .. ":" .. c.ClassName .. ":" .. tostring(ok and n or "?"))
-    end
-    local skip = { _UNITS = true, _DEAD_UNITS = true, _PETS = true }
-    local seen = 0
-    local function walk(node, depth)
-        for _, c in ipairs(node:GetChildren()) do
-            seen = seen + 1
-            if seen > 20000 or #out.named >= 40 then return end
-            local n = string.lower(c.Name)
-            if n:find("path", 1, true) or n:find("waypoint", 1, true) or n:find("node", 1, true)
-                or n:find("lane", 1, true) or n:find("route", 1, true) or n:find("road", 1, true) then
-                local ok, kids = pcall(function() return #c:GetChildren() end)
-                local okp, p = pcall(function() return c:IsA("BasePart") and c.Position or (c:IsA("Model") and c:GetPivot().Position) or nil end)
-                table.insert(out.named, { path = c:GetFullName(), class = c.ClassName, children = ok and kids or -1,
-                    x = okp and p and math.floor(p.X) or nil, z = okp and p and math.floor(p.Z) or nil })
-            end
-            if depth < 6 and not skip[c.Name] then walk(c, depth + 1) end
-        end
-    end
-    pcall(walk, workspace, 1)
-    return out
-end
+AutoPlaceModule.DUMP_WAVES = { 5, 10, 20 }
 function AutoPlaceModule.DumpStep()
     if State.eventMode then return end
     local w = AutoPlaceModule.WaveNumber()
@@ -6388,19 +6001,10 @@ function AutoPlaceModule.DumpStep()
     local function xz(v) return v and { x = math.floor(v.X * 10) / 10, z = math.floor(v.Z * 10) / 10 } or nil end
     local data = { stage = State.stage, key = stageKey(), wave = w, mode = AutoPlaceModule.Mode(), hard = AutoPlaceModule.Hard(),
         version = Lobby and Lobby.VERSION, time = os.date("%Y-%m-%d %H:%M:%S"), spawn = xz(s), base = xz(g), swapped = swapped,
-        pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog,
-        short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
-        road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath() }
+        pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
-        -- (a copy per map and wave in AAMacro/dumps/, so the next game does not overwrite a bad case)
-        pcall(function()
-            local dir = Config.Folder .. "/dumps"
-            if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(dir) then makefolder(dir) end
-            local name = string.sub(string.gsub(tostring(stageKey()), "[^%w]+", "_"), 1, 80)
-            writefile(dir .. "/" .. name .. "_w" .. tostring(mark) .. ".json", text)
-        end)
         AutoPlaceModule.Note(string.format("placement dump written (wave %d)", w))
     end
 end
@@ -8325,57 +7929,11 @@ function DungeonRun.PickRoom(rooms)
 end
 
 -- One step of the auto run. Returns seconds to wait.
--- In the lobby the room choice only opens in the Dungeon Run window (friends' scripts sat in the lobby
--- for the whole run - 2026-10-25). With a run going (or keys and no run) and the choice still closed
--- after 8 s: tap the left menu's "Dungeon" button (PlayerGui.LeftUI_test.Buttons.Dungeon), 2 s later the
--- window's green Start (DungeonUI ... StartHolder.Main.Start) when it shows; again 20 s later at most.
-DungeonRun.OPEN_AFTER, DungeonRun.OPEN_EVERY = 8, 20
-function DungeonRun.StartButton()
-    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local ui = gui and gui:FindFirstChild("DungeonUI")
-    local holder = ui and ui:FindFirstChild("StartHolder", true)
-    local b = holder and holder:FindFirstChild("Start", true)
-    if b and b:IsA("GuiButton") and isOnScreen(b) then return b end
-end
-function DungeonRun.OpenWindowStep(st)
-    if DungeonRun.ChoiceOpen() then DungeonRun.closedSince = nil return nil end
-    local running = st ~= nil and st.live and #st.rooms > 0 and not st.ended
-    local keys = DungeonRun.KeyCount()
-    if not running and not (keys and keys > 0) then return nil end
-    DungeonRun.closedSince = DungeonRun.closedSince or os.clock()
-    if os.clock() - DungeonRun.closedSince < DungeonRun.OPEN_AFTER then return nil end
-    if os.clock() - (DungeonRun.openTryAt or -1e9) < DungeonRun.OPEN_EVERY then return nil end
-    DungeonRun.openTryAt = os.clock()
-    local menu = Lobby.ButtonFor("Dungeon")
-    if not menu then
-        pcall(Lobby.ShareLog, "dungeon: lobby - no Dungeon button on screen")
-        return nil
-    end
-    Lobby.TapGui(menu)
-    pcall(Lobby.ShareLog, "dungeon: lobby - tapped Dungeon (" .. (running and "run going" or ("keys " .. tostring(keys))) .. ")")
-    task.wait(2)
-    local start = DungeonRun.StartButton()
-    if start then
-        Lobby.TapGui(start)
-        pcall(Lobby.ShareLog, "dungeon: lobby - tapped the window's green Start")
-    end
-    DungeonRun.status = "opened the Dungeon window"
-    DungeonRun.Refresh(st)
-    return 2
-end
-
 function DungeonRun.Step()
-    pcall(DungeonRun.ScanData)
     pcall(DungeonRun.LearnIcons)
-    pcall(DungeonRun.LearnItemIcons)
     local st = DungeonRun.Read()
-    -- (only a fresh dungeon_changed shows a run still going: an old copy in memory still has rooms)
-    if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and st.table == DungeonRun.live and #st.rooms > 0 and not st.ended) then
+    if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and #st.rooms > 0 and not st.ended) then
         return DungeonRun.TryStart()
-    end
-    if DungeonRun.InLobby() then
-        local wait = DungeonRun.OpenWindowStep(st)
-        if wait then return wait end
     end
     if st and st.live then return DungeonRun.LiveStep(st) end
     if not st or ((not st.rooms or #st.rooms == 0) and not (st.shop and #st.shop > 0) and not st.dead) then
@@ -8410,9 +7968,14 @@ function DungeonRun.Step()
             end
         end
     end
-    -- ("You Died!" is handled only by Lobby.DiedStep: a second sender here doubled the calls)
     if st.dead then
-        DungeonRun.status = "lost a room"
+        if DungeonRun.autoContinueDeath and not DungeonRun.deathTried then
+            DungeonRun.deathTried = true
+            DungeonRun.status = "lost a room: continuing"
+            DungeonRun.Call("dungeon_continue_death", nil, st)
+        else
+            DungeonRun.status = "lost a room: auto continue after death is off"
+        end
         DungeonRun.Refresh(st)
         return 2
     end
@@ -8504,44 +8067,42 @@ function DungeonRun.TagType(tags) return DungeonRun.MainType(DungeonRun.TagTypes
 function DungeonRun.HasType(r, t) return r.type == t or (r.types ~= nil and r.types[t] == true) end
 function DungeonRun.TypeText(r)
     local parts = {}
-    for _, t in ipairs({ "CURSE", "HOARD", "GOLD", "CHEST", "SHOP", "BATTLE", "SHRINE", "BOSS" }) do
+    for _, t in ipairs({ "CURSE", "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE", "BOSS" }) do
         if DungeonRun.HasType(r, t) then table.insert(parts, t) end
     end
     return table.concat(parts, "+")
 end
 
--- The Dungeon Run window (PlayerGui.DungeonUI) shows what the data lacks. Real layout (dungeon_ui_dump,
--- 18:23 2026-10-25): LevelSelection.Inset.MainRow.Frame = a room tile (97x97, this depth's choices, left
--- to right = 1, 2, 3), its FrameTop.Frame tiles (53x53) = the rooms after it; each tile has
--- Main.LevelAttributes with one ImageLabel per attribute, NAMED by type (money, treasure, treasure_gold,
--- shop, shrine, bossfinal, chestopen, Curse) and visible when the room has it; a tile with none is a
--- plain battle. Configuration.Frame is the game's template (0x0): skipped. Lives: a visible "n/m" label.
-DungeonRun.ATTR_TYPES = { money = "HOARD", treasure = "CHEST", treasure_gold = "GOLD", chestopen = "CHEST", shop = "SHOP",
-    shrine = "SHRINE", bossfinal = "BOSS", curse = "CURSE" }
+-- The Dungeon Run window (PlayerGui.DungeonUI) shows what the data lacks: labels under each room
+-- tile ("CURSE", "CHEST", "HOARD" ...) and the lives "4/5". Tiles are grouped by their button
+-- (else 2 levels up); the biggest tiles are this depth's choices, left to right = choice 1, 2, 3
+-- (the small ones are the depth after). Lives: a visible "n/m" label with m <= 10.
 function DungeonRun.ReadScreen()
     local out = {}
     pcall(function()
         local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local ui = gui and gui:FindFirstChild("DungeonUI")
         if not ui or (ui:IsA("LayerCollector") and not ui.Enabled) then return end
-        local tiles = {}
+        local byTile, tiles = {}, {}
         for _, d in ipairs(ui:GetDescendants()) do
-            if d:IsA("TextLabel") and not out.lives and isOnScreen(d) then
-                local a, b = tostring(d.Text):match("^%s*(%d+)%s*/%s*(%d+)%s*$")
-                if a and tonumber(b) <= 10 then out.lives, out.maxLives = tonumber(a), tonumber(b) end
-            end
-            if d.Name == "LevelAttributes" and isOnScreen(d) and not d:FindFirstAncestor("Configuration") then
-                local tile = d.Parent and d.Parent.Parent
-                local size = tile and tile:IsA("GuiObject") and tile.AbsoluteSize
-                if size and size.X > 0 then
-                    local types = {}
-                    for _, x in ipairs(d:GetChildren()) do
-                        local t = (x:IsA("ImageLabel") or x:IsA("ImageButton")) and x.Visible and DungeonRun.ATTR_TYPES[string.lower(x.Name)]
-                        if t then types[t] = true end
-                        if t == "GOLD" then types.CHEST = true end
+            if d:IsA("TextLabel") and isOnScreen(d) then
+                local text = string.upper(tostring(d.Text)):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                local a, b = text:match("^(%d+)%s*/%s*(%d+)$")
+                if a and tonumber(b) <= 10 and not out.lives then out.lives, out.maxLives = tonumber(a), tonumber(b) end
+                local t = text == "CURSE" and "CURSE" or nil
+                for _, w in ipairs(DungeonRun.TYPES) do if text == w then t = w end end
+                if t then
+                    local tile, n = d.Parent, 0
+                    while tile and not tile:IsA("GuiButton") and n < 3 do tile, n = tile.Parent, n + 1 end
+                    if not (tile and tile:IsA("GuiButton")) then tile = d.Parent and d.Parent.Parent or d.Parent end
+                    if tile then
+                        if not byTile[tile] then
+                            byTile[tile] = { types = {}, x = tile.AbsolutePosition.X, y = tile.AbsolutePosition.Y,
+                                size = tile.AbsoluteSize.X * tile.AbsoluteSize.Y }
+                            table.insert(tiles, byTile[tile])
+                        end
+                        byTile[tile].types[t] = true
                     end
-                    if not DungeonRun.MainType(types) then types.BATTLE = true end
-                    table.insert(tiles, { types = types, x = tile.AbsolutePosition.X, y = tile.AbsolutePosition.Y, size = size.X * size.Y })
                 end
             end
         end
@@ -8673,65 +8234,6 @@ end
 
 DungeonRun.LOW_LIVES = 1     -- lives at or below this: weaknesses are not trusted, the easiest room wins
 DungeonRun.LOOKAHEAD = 0.3   -- part of the best room after it that counts
--- Rooms lost in this run: lostRooms["<depth>:<map>"] = losses (saved: every room reloads the script).
-DungeonRun.LOST_X = 1.5
-function DungeonRun.RoomKey(depth, l)
-    return tostring(depth) .. ":" .. tostring(type(l) == "table" and (l.map or l._location_name) or "?")
-end
-function DungeonRun.LostCount(r)
-    return tonumber((DungeonRun.lostRooms or {})[DungeonRun.RoomKey(r.depth, r.l)]) or 0
-end
--- In a Dungeon Room: the room just lost, from its level data (_dungeon.depth + map).
-function DungeonRun.NoteLoss()
-    local ok, d = pcall(Stage.levelData)
-    if not ok or type(d) ~= "table" then return end
-    local depth = type(d._dungeon) == "table" and d._dungeon.depth
-    if not depth then return end
-    local key = DungeonRun.RoomKey(depth, d)
-    DungeonRun.lostRooms = DungeonRun.lostRooms or {}
-    DungeonRun.lostRooms[key] = (tonumber(DungeonRun.lostRooms[key]) or 0) + 1
-    pcall(DungeonRun.Log, "lost room " .. key .. " x" .. DungeonRun.lostRooms[key])
-    saveConfig()
-end
--- Flying enemies: only hill / hybrid units hit them. A room flies when its map had flyers in an
--- earlier dungeon room (flyMaps, saved) or it carries the flying curse; with no air-capable unit in
--- the team such a room counts FLY_X times harder.
-DungeonRun.FLY_X = 3
-function DungeonRun.RoomFlies(r)
-    local map = type(r.l) == "table" and (r.l.map or r.l._location_name)
-    if map and (DungeonRun.flyMaps or {})[tostring(map)] then return true end
-    for _, v in pairs(type(r.tags) == "table" and r.tags or {}) do
-        if type(v) == "table" and tostring(v.id or "") == "_curse_fly" then return true end
-    end
-    return false
-end
-function DungeonRun.TeamHitsAir()
-    if os.clock() - (DungeonRun.airAt or -1e9) < 30 then return DungeonRun.air end
-    DungeonRun.airAt = os.clock()
-    local names = {}
-    pcall(function() names = (AutoPlaceModule.TeamNames()) end)
-    pcall(function() for _, u in ipairs(ownedUnits()) do table.insert(names, unitType(u)) end end)
-    local air = false
-    for _, n in ipairs(names) do
-        if AutoPlaceModule.AirCapable(n, math.huge) then air = true end
-    end
-    DungeonRun.air = air
-    return air
-end
--- In a Dungeon Room with flyers on the map: remember the map.
-function DungeonRun.NoteFlyMap()
-    local ok, d = pcall(Stage.levelData)
-    local map = ok and type(d) == "table" and (d.map or d._location_name)
-    if not map then return end
-    DungeonRun.flyMaps = DungeonRun.flyMaps or {}
-    if DungeonRun.flyMaps[tostring(map)] then return end
-    DungeonRun.flyMaps[tostring(map)] = true
-    pcall(DungeonRun.Log, "flyers on map " .. tostring(map))
-    saveConfig()
-end
--- What a room gives, as a cut of its effective difficulty: gold (rare) chest > chest > shrine / shop
--- > hoard > battle (nothing). A room up to ~1.5x harder with a gold chest still wins over a battle.
-DungeonRun.REWARDS = { { "GOLD", 0.35 }, { "CHEST", 0.25 }, { "SHRINE", 0.18 }, { "SHOP", 0.18 }, { "HOARD", 0.12 } }
 -- One room's score = - effective difficulty: the room's difficulty scale divided by how much its
 -- weaknesses raise our team's damage (our share of that type x (amplification - 1)), times what it
 -- resists. (The old score took difficulty x2 minus the weakness bonus: difficulty grows with depth,
@@ -8754,22 +8256,6 @@ function DungeonRun.ScoreRoom(r, share, lives)
     if lives ~= nil and lives <= DungeonRun.LOW_LIVES then mult = 1 end
     local scale = tonumber(l._lobby_difficulty_scale) or 1
     r.mult, r.eff = mult, scale / mult
-    -- (a room lost before is x1.5 harder per loss: "Ant Kingdom" depth 18 was lost five times in a row
-    -- while a SHOP room scored almost the same, 16:56-18:04 2026-10-25)
-    r.lost = DungeonRun.LostCount(r)
-    if r.lost > 0 then r.eff = r.eff * DungeonRun.LOST_X ^ r.lost end
-    -- (flyers and no hill / hybrid unit in the team: lost Assassin Park depth 5 at wave 15, 19:16 2026-10-25)
-    r.fly = DungeonRun.RoomFlies(r)
-    if r.fly and not DungeonRun.TeamHitsAir() then r.eff = r.eff * DungeonRun.FLY_X end
-    -- (owner 2026-10-25: BATTLE gives nothing - a room with a reward wins unless it is clearly harder;
-    -- with 1 life left only the easiest room counts)
-    r.reward, r.rewardType = 0, nil
-    if not (lives ~= nil and lives <= DungeonRun.LOW_LIVES) then
-        for _, rw in ipairs(DungeonRun.REWARDS) do
-            if DungeonRun.HasType(r, rw[1]) and rw[2] > r.reward then r.reward, r.rewardType = rw[2], rw[1] end
-        end
-        r.eff = r.eff * (1 - r.reward)
-    end
     return -r.eff
 end
 -- One option for the log: "2 Ant Kingdom [CHEST] diff 4.31 weak dark x3.0 (ours 18%) lightning x3.7 -> eff 3.31 score -4.20"
@@ -8785,10 +8271,8 @@ function DungeonRun.OptionLine(r, share)
     for _, w in ipairs(DungeonRun.AsList(r.l and r.l._strong_against)) do
         table.insert(weak, "strong " .. DungeonRun.Norm(type(w) == "table" and w.damage_type or w))
     end
-    return string.format("%s %s [%s] diff %.2f %s%s-> eff %.2f score %.2f", tostring(r.id), tostring(r.label or "?"), DungeonRun.TypeText(r),
+    return string.format("%s %s [%s] diff %.2f %s-> eff %.2f score %.2f", tostring(r.id), tostring(r.label or "?"), DungeonRun.TypeText(r),
         tonumber(r.l and r.l._lobby_difficulty_scale) or 1, #weak > 0 and ("weak " .. table.concat(weak, " ") .. " ") or "no weakness ",
-        ((r.lost or 0) > 0 and ("lost x" .. r.lost .. " ") or "") .. (r.fly and (DungeonRun.TeamHitsAir() and "flyers " or "flyers-no-air ") or "")
-            .. ((r.reward or 0) > 0 and string.format("reward %s -%d%% ", r.rewardType, math.floor(r.reward * 100 + 0.5)) or ""),
         r.eff or 0, r.score or 0)
 end
 -- Auto mode: the best scored room (plus a part of the best one after it); room types, when the
@@ -8807,9 +8291,8 @@ function DungeonRun.AutoPick(rooms, lives)
         if after then sc = sc + DungeonRun.LOOKAHEAD * after end
         local rank = r.type and table.find(order, r.type)
         if rank then sc = sc + 0.01 * (#order - rank + 1) end
-        -- WANT / AVOID types: 10% / 15% of this room's effective difficulty (My picks only: Auto
-        -- decides everything itself - owner 2026-10-25)
-        for t, p in pairs(DungeonRun.mode == "Auto" and {} or DungeonRun.prefs or {}) do
+        -- WANT / AVOID types: 10% / 15% of this room's effective difficulty
+        for t, p in pairs(DungeonRun.prefs or {}) do
             if DungeonRun.HasType(r, t) then
                 if p == "prefer" then sc = sc + 0.1 * (r.eff or 1) elseif p == "avoid" then sc = sc - 0.15 * (r.eff or 1) end
             end
@@ -8827,149 +8310,14 @@ end
 -- - 1); false is not known yet, so silver chests are left alone. (Watch, real game 15:59 2026-10-25)
 DungeonRun.SHOP_DEFAULT = { "shroom", "branch", "bow" }   -- cost down first, then range
 DungeonRun.PRICES = { gold_branch = 300, bow2 = 300, gold_shroom = 500 }
--- Shop items and shrine buffs seen in the real game (names / effects from the owner's screenshots,
--- 2026-10-25). New shop ids are learned from each shop page (Lobby.cfg.dungeonItems) and item
--- pictures from the open shop window (Lobby.cfg.dungeonItemIcons, same shape as room icons).
-DungeonRun.ITEMS = {
-    { id = "gold_branch", kind = "shop", name = "Golden Branch", effect = "-15% Placement/Upgrade Cost" },
-    { id = "gold_shroom", kind = "shop", name = "Golden Mushroom", effect = "-30% Placement/Upgrade Cost" },
-    { id = "bow2", kind = "shop", name = "Longbow", effect = "+30% Range" },
-    { id = "philosophers_stone", kind = "shop", name = "Philosopher's Stone", effect = "All chests become rare chests (id not seen yet)" },
-    -- (curse ids from the run's _items; names / effects from the AA wiki's Dungeon page, 2026-10-25)
-    { id = "_curse_money", kind = "shrine", name = "Curse of Money", effect = "-10% Hoard drops" },
-    { id = "_curse_fly", kind = "shrine", name = "Curse of Flight", effect = "+20% chance of flying enemies" },
-    { id = "_curse_speed", kind = "shrine", name = "Curse of Wind / Frenzy", effect = "Enemies +25% / +50% faster" },
-    { id = "_curse_regen", kind = "shrine", name = "Curse of Regen", effect = "Enemies +1% regen" },
-    { id = "_curse_health", kind = "shrine", name = "Curse of Health", effect = "Enemies +80% HP" },
-    { id = "_curse_shop", kind = "shrine", name = "Curse of Shopping", effect = "+10% shop prices" },
-    { id = "speedy boots", kind = "shrine", name = "Speedy Boots", effect = "-20% Attack cooldown" },
-    { id = "treasure chest", kind = "shrine", name = "Treasure Chest", effect = "+1 Treasure chest" },
-}
--- Blessing (shop item) and curse effects from the AA wiki's Dungeon page (2026-10-25), by name: used
--- for items learned in game whose id reads as one of these names. Text only - pictures come from the game.
-DungeonRun.WIKI_EFFECTS = {
-    ["mask of riches"] = "-50% Placement/Upgrade Cost", ["golden mushroom"] = "-30% Placement/Upgrade Cost",
-    ["golden branch"] = "-15% Placement/Upgrade Cost", ["genie lamp"] = "+100% chest luck", ["golden fishhook"] = "+40% chest luck",
-    ["fish hook"] = "+20% chest luck", ["archmages hat"] = "+250% Magic damage", ["magic tome"] = "+100% Magic damage",
-    ["mage coat"] = "+50% Magic damage", ["aures maul"] = "+200% Physical damage", ["headsplitter"] = "+75% Physical damage",
-    ["axe"] = "+50% Physical crit chance", ["solar cleaver"] = "+100% Physical crit chance", ["sylvanthorn"] = "+150% Range",
-    ["elf bow"] = "+50% Range", ["reaper scythe"] = "+75% boss damage", ["celestial blade"] = "+777% True damage",
-    ["scimitar"] = "+75% attack", ["sword"] = "+30% damage", ["ninja belt"] = "-12% attack speed",
-    ["glacial axe"] = "Enemies 30% slower", ["philosophers stone"] = "All chests become rare chests",
-    ["shimmering moon fragment"] = "+1 star Star Remnant per chest",
-    ["curse of wind"] = "Enemies +25% faster", ["curse of frenzy"] = "Enemies +50% faster", ["curse of burst"] = "+100% Burst trait",
-    ["curse of shielding"] = "Enemies +3 shield", ["curse of armor"] = "+100% Armor trait", ["curse of chaos"] = "All curses random",
-    ["curse of eruption"] = "+24 explosive death range", ["curse of explosion"] = "+12 explosive death range",
-    ["curse of vampirism"] = "Enemies +3% regen",
-}
--- The rows of a picker page: the catalog of that kind, then ids learned in game.
-function DungeonRun.ItemList(kind)
-    local out, seen = {}, {}
-    for _, it in ipairs(DungeonRun.ITEMS) do
-        if it.kind == kind then table.insert(out, it) seen[it.id] = true end
-    end
-    local learned = {}
-    for id, v in pairs(Lobby.cfg.dungeonItems or {}) do
-        if type(v) == "table" and v.kind == kind and not seen[id] then table.insert(learned, id) end
-    end
-    table.sort(learned)
-    for _, id in ipairs(learned) do
-        local pretty = (id:gsub("^_", ""):gsub("_", " "):gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
-        table.insert(out, { id = id, kind = kind, name = pretty, effect = DungeonRun.WIKI_EFFECTS[string.lower(pretty)] or "(seen in game)" })
-    end
-    return out
-end
--- Ids seen in shop pages and in the run's items, remembered for the picker pages.
-function DungeonRun.LearnItems(p)
-    Lobby.cfg.dungeonItems = Lobby.cfg.dungeonItems or {}
-    local known, added = {}, {}
-    for _, it in ipairs(DungeonRun.ITEMS) do known[it.id] = true end
-    local function add(id, kind)
-        id = string.lower(tostring(id or ""))
-        if id ~= "" and not known[id] and not Lobby.cfg.dungeonItems[id] then
-            Lobby.cfg.dungeonItems[id] = { kind = kind }
-            table.insert(added, kind .. " " .. id)
-        end
-    end
-    for _, page in ipairs(type(p.current_shops) == "table" and p.current_shops or {}) do
-        if type(page) == "table" and tostring(page._t) == "1" and type(page.data) == "table" then
-            for _, it in ipairs(page.data) do add(type(it) == "table" and it.id or it, "shop") end
-        end
-    end
-    for _, it in ipairs(type(p._items) == "table" and p._items or {}) do
-        local id = type(it) == "table" and tostring(it.id or "") or ""
-        if id:find("^_curse") then add(id, "shrine") end
-    end
-    if #added > 0 then
-        pcall(DungeonRun.Log, "new items " .. table.concat(added, ", "))
-        saveConfig()
-    end
-end
--- Item pictures from the open shop window: a label with an item's name and the picture next to it.
-function DungeonRun.LearnItemIcons()
-    if os.clock() - (DungeonRun.itemIconsAt or -1e9) < 15 then return end
-    DungeonRun.itemIconsAt = os.clock()
-    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local ui = gui and gui:FindFirstChild("DungeonUI")
-    if not ui or (ui:IsA("LayerCollector") and not ui.Enabled) then return end
-    Lobby.cfg.dungeonItemIcons = Lobby.cfg.dungeonItemIcons or {}
-    local icons, byName, found = Lobby.cfg.dungeonItemIcons, {}, {}
-    for _, kind in ipairs({ "shop", "shrine" }) do
-        for _, it in ipairs(DungeonRun.ItemList(kind)) do byName[string.upper(it.name)] = it.id end
-    end
-    for _, d in ipairs(ui:GetDescendants()) do
-        local id = (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and byName[string.upper(tostring(d.Text):gsub("<[^>]->", ""))]
-        if id and not icons[id] then
-            local node = d.Parent
-            for level = 1, 2 do
-                if not node or icons[id] then break end
-                for _, x in ipairs(level == 1 and node:GetChildren() or node:GetDescendants()) do
-                    if (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) ~= "" then
-                        local icon = { image = tostring(x.Image) }
-                        pcall(function()
-                            local o, z = x.ImageRectOffset, x.ImageRectSize
-                            if z and z.X > 0 and z.Y > 0 then icon.offset, icon.size = { o.X, o.Y }, { z.X, z.Y } end
-                        end)
-                        icons[id] = icon
-                        table.insert(found, id .. "=" .. icon.image .. (icon.size and string.format(" rect %d,%d %dx%d", icon.offset[1], icon.offset[2], icon.size[1], icon.size[2]) or ""))
-                        break
-                    end
-                end
-                node = node.Parent
-            end
-        end
-    end
-    if #found > 0 then
-        pcall(DungeonRun.Log, "item icons " .. table.concat(found, ", "))
-        saveConfig()
-    end
-end
--- Which item to buy: WANT items first (in the shop's order), then the wish-list / default order;
--- never an AVOID item, never one whose known price is over the coins.
 function DungeonRun.ShopPick(items, money)
-    local auto = DungeonRun.mode == "Auto"
-    local prefs = auto and {} or DungeonRun.itemPrefs or {}
-    local list = type(items) == "table" and items or {}
-    local function idOf(it) return string.lower(tostring(type(it) == "table" and it.id or it)) end
-    local function affordable(id) local price = DungeonRun.PRICES[id] return not price or not money or money >= price end
-    -- (owner 2026-10-25: Philosopher's Stone first - every chest after it is rare - while the run has
-    -- chests to come; never when set to AVOID)
-    if (DungeonRun.lastDepth or 0) < 18 then
-        for i, it in ipairs(list) do
-            local id = idOf(it)
-            if id:find("philosoph", 1, true) and prefs[id] ~= "avoid" and affordable(id) then return i, id end
-        end
-    end
-    for i, it in ipairs(list) do
-        local id = idOf(it)
-        if prefs[id] == "prefer" and affordable(id) then return i, id end
-    end
-    local wishes = auto and {} or DungeonRun.wishes()
+    local wishes = DungeonRun.wishes()
     if #wishes == 0 then wishes = DungeonRun.SHOP_DEFAULT end
     for _, w in ipairs(wishes) do
-        for i, it in ipairs(list) do
-            local id = idOf(it)
-            if id:find(w, 1, true) and prefs[id] ~= "avoid" and affordable(id) then return i, id end
+        for i, it in ipairs(type(items) == "table" and items or {}) do
+            local id = string.lower(tostring(type(it) == "table" and it.id or it))
+            local price = DungeonRun.PRICES[id]
+            if id:find(w, 1, true) and (not price or not money or money >= price) then return i, id end
         end
     end
 end
@@ -8977,7 +8325,7 @@ function DungeonRun.PageStep(st, page)
     local kind = type(page) == "table" and tostring(page._t) or "?"
     local seq = DungeonRun.liveSeq or 0
     local money = st.coins
-    if kind == "1" and (DungeonRun.mode == "Auto" or DungeonRun.autoShop ~= false) and DungeonRun.buyStop ~= seq then
+    if kind == "1" and DungeonRun.autoShop ~= false and DungeonRun.buyStop ~= seq then
         local slot, id = DungeonRun.ShopPick(page.data, money)
         if slot then
             DungeonRun.status = "shop: buying " .. id
@@ -8990,9 +8338,7 @@ function DungeonRun.PageStep(st, page)
         end
     elseif kind == "6" then
         local gold = tonumber(st.goldKeys) or 0
-        -- (AA wiki: rare chests opened before the end lose the Secret Unit chance - Auto keeps them for depth 19+)
-        local keep = DungeonRun.mode == "Auto" or DungeonRun.goldChests == "end"
-        local now = not keep or (DungeonRun.lastDepth or 0) >= 19
+        local now = DungeonRun.goldChests ~= "end" or (DungeonRun.lastDepth or 0) >= 19
         if gold > 0 and now and DungeonRun.chestTried ~= seq then
             DungeonRun.chestTried = seq
             DungeonRun.status = "opening a gold chest"
@@ -9030,12 +8376,6 @@ function DungeonRun.LiveStep(st)
         DungeonRun.status = DungeonRun.blocked
         DungeonRun.Refresh(st)
         return 2
-    end
-    -- (no lives left: the run is over, a room call only answers "error" - 18:05 2026-10-25)
-    if st.hearts ~= nil and st.hearts <= 0 then
-        DungeonRun.status = "no lives left - the run is over"
-        DungeonRun.Refresh(st)
-        return 3
     end
     -- shop / chest pages come first (current_shops; continue_shop closes the first one)
     if st.table == DungeonRun.live and type(st.table.current_shops) == "table" and st.table.current_shops[1] ~= nil then
@@ -9114,7 +8454,6 @@ function DungeonRun.OnChanged(p)
     DungeonRun.live = p
     DungeonRun.liveSeq = (DungeonRun.liveSeq or 0) + 1
     pcall(function() DungeonRun.Log("<- dungeon_changed(" .. HttpService:JSONEncode(p) .. ")") end)
-    pcall(DungeonRun.LearnItems, p)
     DungeonRun.blocked = nil
     local rooms = DungeonRun.LiveRooms(p.next)
     if rooms[1] and rooms[1].depth then DungeonRun.lastDepth = rooms[1].depth end
@@ -9137,28 +8476,19 @@ function DungeonRun.OnChanged(p)
         local ok, j = pcall(function() return HttpService:JSONEncode(p.current_shops) end)
         note("shop " .. clip(ok and j or "?", 300))
     end
-    -- (a run going on: _started with rooms ahead. After the owner pressed Continue on You Died! the game
-    -- sent dungeon_changed({}) and at once a new run with only next1.. in next, no dungeon_start - 18:23 2026-10-25)
-    local running = p._started == true and type(p.next) == "table" and next(p.next) ~= nil
-    local over = next(p) == nil or (not running and #rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
+    local over = next(p) == nil or (#rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
     if over then
         note("run over at depth " .. tostring(DungeonRun.lastDepth))
-        DungeonRun.lostRooms = {}
         if DungeonRun.enabled then DungeonRun.pendingStart = true saveConfig() end
     elseif #rooms > 0 then DungeonRun.startNote = nil end
-    if not over and (running or #rooms > 0) and DungeonRun.pendingStart then
+    if not over and #rooms > 0 and DungeonRun.pendingStart then
         DungeonRun.pendingStart = false
         saveConfig()
     end
 end
 function DungeonRun.OnSelected(p)
     if type(p) ~= "table" then return end
-    -- (kept in the config: every room reloads the script and the status read "Lives ?" - 2026-10-25)
-    local lives = tonumber(p.lives)
-    if lives and lives ~= DungeonRun.lives then
-        DungeonRun.lives = lives
-        saveConfig()
-    end
+    DungeonRun.lives = tonumber(p.lives) or DungeonRun.lives
     DungeonRun.selSeq = (DungeonRun.selSeq or 0) + 1
     pcall(function() DungeonRun.Log("<- dungeon_selected_changed(" .. HttpService:JSONEncode(p) .. ")") end)
 end
@@ -9178,13 +8508,6 @@ end
 function DungeonRun.TryStart()
     DungeonRun.pendingStart = false
     saveConfig()
-    -- (the game may already have started the next run itself, after You Died! Continue)
-    local live = DungeonRun.live
-    if type(live) == "table" and live._started == true and type(live.next) == "table" and next(live.next) ~= nil then
-        DungeonRun.status = "next run already started by the game"
-        DungeonRun.Refresh(false)
-        return 2
-    end
     local keys = DungeonRun.KeyCount()
     if keys ~= nil and keys <= 0 then
         DungeonRun.status = "run over - no Dungeon Run Key, not starting another"
@@ -9276,21 +8599,12 @@ end
 -- naming a room type in DungeonUI with the picture next to it, or a dungeon data module entry with
 -- an image / icon field. The room icons are one sprite sheet (rbxassetid://120321831419148 for every
 -- type), so an icon is the image AND its ImageRectOffset / ImageRectSize. Saved in
--- Lobby.cfg.dungeonIcons4[type] = { image, offset = {x, y}, size = {x, y} }; emoji until found.
+-- Lobby.cfg.dungeonIcons3[type] = { image, offset = {x, y}, size = {x, y} }; emoji until found.
 -- (the same image + rect for 2+ types is a card frame, not a room icon: dropped)
 DungeonRun.EMOJI = { HOARD = "💰", CHEST = "📦", SHOP = "🛒", BATTLE = "⚔️", SHRINE = "⛩️", BOSS = "👹" }
--- The game's own attribute pictures, read from its room tiles (dungeon_ui_dump 18:23 2026-10-25); SHOP
--- shows only a placeholder (120321831419148) until a shop tile is visible, BATTLE has none (swords).
-DungeonRun.ICON_DEFAULTS = {
-    HOARD = { image = "rbxassetid://95202532327953", offset = { 18, 0 }, size = { 18, 18 } },
-    CHEST = { image = "rbxassetid://116030223007249" },
-    SHRINE = { image = "rbxassetid://119641795033383" },
-    BOSS = { image = "rbxassetid://130798371196238" },
-}
-DungeonRun.ICON_PLACEHOLDER = "rbxassetid://120321831419148"
 function DungeonRun.FindIcons()
-    Lobby.cfg.dungeonIcons4 = Lobby.cfg.dungeonIcons4 or {}
-    local icons, found, cands = Lobby.cfg.dungeonIcons4, {}, {}
+    Lobby.cfg.dungeonIcons3 = Lobby.cfg.dungeonIcons3 or {}
+    local icons, found, cands = Lobby.cfg.dungeonIcons3, {}, {}
     local function typeOf(text)
         local w = string.upper(tostring(text or "")):gsub("<[^>]->", "")
         for _, t in ipairs(DungeonRun.TYPES) do
@@ -9315,16 +8629,24 @@ function DungeonRun.FindIcons()
         end
         table.insert(cands, { t = t, icon = icon, key = keyOf(icon), from = from })
     end
-    -- the room tiles' attribute pictures, by their names (visible ones, not the template, not the placeholder)
     pcall(function()
         local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local ui = gui and gui:FindFirstChild("DungeonUI")
         for _, d in ipairs(ui and ui:GetDescendants() or {}) do
-            local t = (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Parent and d.Parent.Name == "LevelAttributes"
-                and DungeonRun.ATTR_TYPES[string.lower(d.Name)]
-            if t and t ~= "CURSE" and isOnScreen(d) and not d:FindFirstAncestor("Configuration")
-                and tostring(d.Image) ~= "" and tostring(d.Image) ~= DungeonRun.ICON_PLACEHOLDER then
-                learn(t, d.Image, "DungeonUI." .. d.Name, d)
+            local t = (d:IsA("TextLabel") or d:IsA("TextButton")) and typeOf(d.Text)
+            if t then
+                -- the closest picture: the label's own siblings first, then one level up
+                local node, got = d.Parent, false
+                for level = 1, 2 do
+                    if not node then break end
+                    for _, x in ipairs(level == 1 and node:GetChildren() or node:GetDescendants()) do
+                        if (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) ~= "" then
+                            learn(t, x.Image, "DungeonUI." .. node.Name, x) got = true break
+                        end
+                    end
+                    if got then break end
+                    node = node.Parent
+                end
             end
         end
     end)
@@ -9375,95 +8697,6 @@ end
 -- dungeon_ui_dump.txt): every descendant of the room area with path, class, text, image + sprite
 -- rect, visibility, position and size - icon learning matched the depth slider, not the tiles,
 -- in the real game (17:32-17:50 2026-10-25), so the tile layout has to be seen first.
--- The other Dungeon Run pages, once each per script load while on screen (AAMacro/
--- dungeon_pages_dump.txt): shop rows, shrine offer, chest page, You Died - to find the pictures of
--- shop items and shrine buffs (owner 2026-10-25: "find every dungeon picture").
-DungeonRun.PAGES = { "ShopSelection", "ShrineRoom", "OpenTreasure", "YouDied" }
-function DungeonRun.DumpPages()
-    if not hasFileApi() then return end
-    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local ui = gui and gui:FindFirstChild("DungeonUI")
-    if not ui or (ui:IsA("LayerCollector") and not ui.Enabled) then return end
-    DungeonRun.pagesDumped = DungeonRun.pagesDumped or {}
-    for _, name in ipairs(DungeonRun.PAGES) do
-        local page = not DungeonRun.pagesDumped[name] and ui:FindFirstChild(name, true)
-        if page and isOnScreen(page) then
-            DungeonRun.pagesDumped[name] = true
-            local lines = { "# " .. name .. " " .. os.date("%Y-%m-%d %H:%M:%S") }
-            for _, d in ipairs(page:GetDescendants()) do
-                if #lines >= 400 then table.insert(lines, "... (capped)") break end
-                pcall(function()
-                    local parts = { (d:GetFullName():gsub("^.-" .. name .. "%.", "")), d.ClassName }
-                    if d:IsA("TextLabel") or d:IsA("TextButton") then table.insert(parts, "text=" .. clip(tostring(d.Text), 60)) end
-                    if d:IsA("ImageLabel") or d:IsA("ImageButton") then
-                        table.insert(parts, "image=" .. tostring(d.Image))
-                        pcall(function()
-                            local o, z = d.ImageRectOffset, d.ImageRectSize
-                            if z and (z.X > 0 or z.Y > 0) then table.insert(parts, string.format("rect=%d,%d %dx%d", o.X, o.Y, z.X, z.Y)) end
-                        end)
-                    end
-                    if d:IsA("GuiObject") then table.insert(parts, "visible=" .. tostring(isOnScreen(d))) end
-                    table.insert(lines, table.concat(parts, " | "))
-                end)
-            end
-            local path = "AAMacro/dungeon_pages_dump.txt"
-            local old = isfile(path) and readfile(path) or ""
-            if #old > 300000 then old = "" end
-            writefile(path, old .. table.concat(lines, "\n") .. "\n")
-            pcall(Lobby.ShareLog, "dungeon: dumped page " .. name)
-        end
-    end
-end
-
--- The game's data modules, once per script load: every entry for a dungeon item / curse id we know,
--- with its fields (AAMacro/dungeon_data_dump.txt); an image / icon field becomes that item's picture.
-function DungeonRun.ScanData()
-    if DungeonRun.dataScanned then return end
-    DungeonRun.dataScanned = true
-    local ids = {}
-    for _, kind in ipairs({ "shop", "shrine" }) do
-        for _, it in ipairs(DungeonRun.ItemList(kind)) do ids[it.id] = true end
-    end
-    local lines, found = { "# dungeon data " .. os.date("%Y-%m-%d %H:%M:%S") }, {}
-    Lobby.cfg.dungeonItemIcons = Lobby.cfg.dungeonItemIcons or {}
-    pcall(function()
-        for _, m in ipairs(ReplicatedStorage.src.Data:GetDescendants()) do
-            if m:IsA("ModuleScript") then
-                local ok, mod = pcall(require, m)
-                local function walk(v, key, depth)
-                    if type(v) ~= "table" or depth > 4 or #lines > 600 then return end
-                    local id = ids[tostring(key)] and tostring(key) or (type(v.id) == "string" and ids[v.id] and v.id)
-                    if id then
-                        local fields = {}
-                        for k, x in pairs(v) do
-                            if type(x) == "string" or type(x) == "number" or type(x) == "boolean" then
-                                table.insert(fields, tostring(k) .. "=" .. clip(tostring(x), 60))
-                                local lk = string.lower(tostring(k))
-                                if (lk:find("image", 1, true) or lk:find("icon", 1, true)) and not Lobby.cfg.dungeonItemIcons[id] then
-                                    local img = type(x) == "number" and ("rbxassetid://" .. x) or tostring(x)
-                                    if img:find("%d") then
-                                        Lobby.cfg.dungeonItemIcons[id] = { image = img }
-                                        table.insert(found, id .. "=" .. img)
-                                    end
-                                end
-                            end
-                        end
-                        table.sort(fields)
-                        table.insert(lines, m:GetFullName() .. " [" .. id .. "] " .. table.concat(fields, " "))
-                    end
-                    for k, x in pairs(v) do walk(x, k, depth + 1) end
-                end
-                if ok then walk(mod, m.Name, 0) end
-            end
-        end
-    end)
-    if hasFileApi() then writefile("AAMacro/dungeon_data_dump.txt", table.concat(lines, "\n")) end
-    if #found > 0 then
-        pcall(DungeonRun.Log, "item icons from data " .. table.concat(found, ", "))
-        saveConfig()
-    end
-end
-
 function DungeonRun.DumpUI()
     if DungeonRun.uiDumped or not hasFileApi() then return end
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -9502,39 +8735,16 @@ end
 -- Learn while the room choice is on screen (every 15 s at most, until every room type has one).
 function DungeonRun.LearnIcons()
     if os.clock() - (DungeonRun.iconsAt or -1e9) < 15 then return end
-    local icons = Lobby.cfg.dungeonIcons4 or {}
+    local icons = Lobby.cfg.dungeonIcons3 or {}
     local missing = false
     for _, t in ipairs(DungeonRun.ROOM_TYPES) do if not icons[t] then missing = true end end
     if not missing or not DungeonRun.ChoiceOpen() then return end
     DungeonRun.iconsAt = os.clock()
     pcall(DungeonRun.FindIcons)
 end
--- An item's picture on a picker row: learned from the shop window, else an emoji.
-function DungeonRun.ItemIconOn(parent, it, x, y, size)
-    local icon = (Lobby.cfg.dungeonItemIcons or {})[it.id]
-    if type(icon) == "table" and icon.image then
-        local img = Instance.new("ImageLabel")
-        img.BackgroundTransparency, img.Image = 1, icon.image
-        if icon.size then
-            pcall(function()
-                img.ImageRectOffset = Vector2.new(icon.offset[1] or 0, icon.offset[2] or 0)
-                img.ImageRectSize = Vector2.new(icon.size[1], icon.size[2])
-            end)
-        end
-        img.Position, img.Size = UDim2.new(0, x, 0, y), UDim2.new(0, size, 0, size)
-        img.Parent = parent
-        return img
-    end
-    local e = Instance.new("TextLabel")
-    e.BackgroundTransparency, e.TextSize, e.TextColor3 = 1, 26, DungeonRun.COLORS.text
-    e.Text = it.kind == "shrine" and "🔮" or "🛍️"
-    e.Position, e.Size = UDim2.new(0, x, 0, y), UDim2.new(0, size, 0, size)
-    e.Parent = parent
-    return e
-end
 -- An icon on a tile: the learned picture (sprite rect when it has one), else the emoji.
 function DungeonRun.IconOn(parent, t, x, y, size)
-    local icon = (Lobby.cfg.dungeonIcons4 or {})[t] or DungeonRun.ICON_DEFAULTS[t]
+    local icon = (Lobby.cfg.dungeonIcons3 or {})[t]
     if type(icon) == "table" and icon.image then
         local img = Instance.new("ImageLabel")
         img.BackgroundTransparency, img.Image = 1, icon.image
@@ -9559,62 +8769,35 @@ end
 -- draft; Save & Close applies and saves, X closes without saving.
 DungeonRun.COLORS = { bg = Color3.fromRGB(24, 24, 30), panel = Color3.fromRGB(44, 44, 54), on = Color3.fromRGB(60, 130, 240),
     prefer = Color3.fromRGB(40, 150, 80), avoid = Color3.fromRGB(180, 55, 55), text = Color3.fromRGB(235, 235, 240),
-    frame = Color3.fromRGB(14, 14, 20), gold = Color3.fromRGB(255, 205, 60), dim = Color3.fromRGB(190, 190, 200),
     preferEdge = Color3.fromRGB(110, 230, 140), avoidEdge = Color3.fromRGB(255, 120, 120) }
 function DungeonRun.OpenSetup()
     pcall(function() if DungeonRun.setupGui then DungeonRun.setupGui:Destroy() end end)
     pcall(DungeonRun.FindIcons)
-    pcall(DungeonRun.ScanData)
     local C = DungeonRun.COLORS
     local prefs = {}
     for k, v in pairs(DungeonRun.prefs or {}) do prefs[k] = v end
     local draft = { mode = DungeonRun.mode, prefs = prefs, shrineRule = DungeonRun.shrineRule or (DungeonRun.acceptShrines and "always" or "never"),
-        openRare = DungeonRun.openRareAtEnd ~= false, autoShop = DungeonRun.autoShop ~= false, goldChests = DungeonRun.goldChests or "end",
-        itemPrefs = {} }
-    for k, v in pairs(DungeonRun.itemPrefs or {}) do draft.itemPrefs[k] = v end
+        openRare = DungeonRun.openRareAtEnd ~= false, autoShop = DungeonRun.autoShop ~= false, goldChests = DungeonRun.goldChests or "now" }
     local g = Instance.new("ScreenGui")
-    -- (owner 2026-10-25: the popup opened BEHIND the hub window - it now sits on top of everything and
-    -- the hub is hidden until Save & Close / X)
-    g.Name, g.ResetOnSpawn, g.DisplayOrder = "MoseeriDungeonSetup", false, 1000000
-    pcall(function() g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
-    local holder = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
-    local hidden = {}
-    pcall(function()
-        for _, c in ipairs(holder:GetChildren()) do
-            if c:IsA("ScreenGui") and c.Name ~= "MoseeriDungeonSetup" and c.Enabled then
-                for _, d in ipairs(c:GetDescendants()) do
-                    if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text == "moseeri hub" then
-                        c.Enabled = false
-                        table.insert(hidden, c)
-                        break
-                    end
-                end
-            end
-        end
-    end)
-    local function close()
-        for _, c in ipairs(hidden) do pcall(function() c.Enabled = true end) end
-        pcall(function() g:Destroy() end)
-        DungeonRun.setupGui = nil
-    end
+    g.Name, g.ResetOnSpawn, g.DisplayOrder = "MoseeriDungeonSetup", false, 60
     local win = Instance.new("Frame")
-    win.Name, win.Size, win.Position = "Window", UDim2.new(0, 380, 0, 410), UDim2.new(0.5, -190, 0.5, -205)
+    win.Name, win.Size, win.Position = "Window", UDim2.new(0, 380, 0, 488), UDim2.new(0.5, -190, 0.5, -244)
     win.BackgroundColor3, win.BorderSizePixel, win.Active = C.bg, 0, true
     win.Parent = g
     pcall(function() Instance.new("UICorner").Parent = win end)
-    local function label(text, x, y, w, h, size, parent)
+    local function label(text, x, y, w, h, size)
         local l = Instance.new("TextLabel")
         l.BackgroundTransparency, l.TextColor3, l.Font, l.TextSize = 1, C.text, Enum.Font.GothamBold, size or 14
         l.TextXAlignment, l.TextWrapped = Enum.TextXAlignment.Left, true
         l.Position, l.Size, l.Text = UDim2.new(0, x, 0, y), UDim2.new(0, w, 0, h), text
-        l.Parent = parent or win
+        l.Parent = win
         return l
     end
-    local function button(text, x, y, w, h, onClick, parent)
+    local function button(text, x, y, w, h, onClick)
         local b = Instance.new("TextButton")
         b.Position, b.Size, b.Text = UDim2.new(0, x, 0, y), UDim2.new(0, w, 0, h), text
         b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize, b.AutoButtonColor, b.BorderSizePixel = C.panel, C.text, Enum.Font.GothamBold, 14, true, 0
-        b.Parent = parent or win
+        b.Parent = win
         pcall(function() Instance.new("UICorner").Parent = b end)
         b.Activated:Connect(function() pcall(onClick, b) end)
         return b
@@ -9622,7 +8805,7 @@ function DungeonRun.OpenSetup()
     -- (the "moseeri hub" label marks the window as ours: our own result-screen clicker skips it)
     label("moseeri hub", 12, 6, 120, 16, 11)
     local title = label("Dungeon setup", 12, 20, 300, 24, 18)
-    button("X", 340, 8, 30, 30, close)
+    button("X", 340, 8, 30, 30, function() g:Destroy() DungeonRun.setupGui = nil end)
     -- drag by the title
     pcall(function()
         local UIS = game:GetService("UserInputService")
@@ -9647,109 +8830,26 @@ function DungeonRun.OpenSetup()
     local function repaint() for _, f in ipairs(paint) do pcall(f) end end
     -- mode (owner 2026-10-25: plain names and one line saying the difference)
     label("Room choice", 12, 50, 200, 18)
-    -- (owner 2026-10-25: each mode button says what it does - bold title, small line under it)
-    for i, m in ipairs({ { "Auto", "Auto", "script picks rooms, shops and chests for you" },
-        { "My picks", "Fixed", "you choose rooms, shop items and chests" } }) do
-        local b = button("", 12 + (i - 1) * 182, 70, 174, 60, function() draft.mode = m[2] repaint() end)
-        local t = label(m[1], 8, 4, 158, 22, 16, b)
-        t.TextXAlignment = Enum.TextXAlignment.Center
-        local sub = label(m[3], 8, 26, 158, 30, 11, b)
-        sub.TextXAlignment, sub.TextColor3 = Enum.TextXAlignment.Center, C.dim
-        table.insert(paint, function()
-            b.BackgroundColor3 = draft.mode == m[2] and C.on or C.panel
-            sub.TextColor3 = draft.mode == m[2] and C.text or C.dim
-        end)
+    for i, m in ipairs({ { "Auto (script picks)", "Auto" }, { "My picks", "Fixed" } }) do
+        local b = button(m[1], 12 + (i - 1) * 182, 70, 174, 36, function() draft.mode = m[2] repaint() end)
+        table.insert(paint, function() b.BackgroundColor3 = draft.mode == m[2] and C.on or C.panel end)
     end
-    -- one page per room type (owner 2026-10-25: tap the room TILE to open its page - its WANT / ANY /
-    -- AVOID, and SHOP: buying + the items like the game's shop window, SHRINE: the buffs, CHEST: gold
-    -- chests). Back returns; everything goes to the draft until Save & Close.
-    local pageFrame
-    local function closePage() pcall(function() pageFrame:Destroy() end) pageFrame = nil repaint() end
-    local function itemList(kind, top, parent)
-        local list = Instance.new("ScrollingFrame")
-        list.Name, list.Position, list.Size = "List", UDim2.new(0, 8, 0, top), UDim2.new(1, -16, 0, 300 - top)
-        list.BackgroundColor3, list.BorderSizePixel = C.frame, 0
-        list.Parent = parent
-        pcall(function() Instance.new("UICorner").Parent = list end)
-        local items = DungeonRun.ItemList(kind)
-        pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, #items * 62 + 8) end)
-        for i, it in ipairs(items) do
-            local row = Instance.new("Frame")
-            row.Name, row.Position, row.Size = "Row_" .. it.id, UDim2.new(0, 4, 0, 4 + (i - 1) * 62), UDim2.new(1, -14, 0, 58)
-            row.BackgroundColor3, row.BorderSizePixel = C.panel, 0
-            row.Parent = list
-            pcall(function() Instance.new("UICorner").Parent = row end)
-            DungeonRun.ItemIconOn(row, it, 6, 7, 44)
-            local name = label(it.name, 58, 6, 170, 20, 14, row)
-            name.TextColor3 = C.gold
-            local eff = label(it.effect, 58, 28, 170, 24, 11, row)
-            eff.TextColor3 = C.dim
-            local stateBtn = button("", 236, 13, 84, 32, function()
-                local p = draft.itemPrefs[it.id]
-                draft.itemPrefs[it.id] = p == nil and "prefer" or (p == "prefer" and "avoid" or nil)
-                repaint()
-            end, row)
-            stateBtn.Name = "State_" .. it.id
-            table.insert(paint, function()
-                if not stateBtn.Parent then return end
-                local p = draft.itemPrefs[it.id]
-                stateBtn.Text = p == "prefer" and "WANT" or (p == "avoid" and "AVOID" or "ANY")
-                stateBtn.BackgroundColor3 = p == "prefer" and C.prefer or (p == "avoid" and C.avoid or C.panel)
-            end)
-        end
-    end
-    local function openPage(t)
-        pcall(function() if pageFrame then pageFrame:Destroy() end end)
-        pageFrame = Instance.new("Frame")
-        pageFrame.Name, pageFrame.Position, pageFrame.Size = "Page_" .. t, UDim2.new(0, 0, 0, 48), UDim2.new(1, 0, 1, -48)
-        pageFrame.BackgroundColor3, pageFrame.BorderSizePixel, pageFrame.Active = C.bg, 0, true
-        pageFrame.Parent = win
-        local page = pageFrame
-        DungeonRun.IconOn(page, t, 0, 0, 30).Position = UDim2.new(0, 12, 0, 0)
-        label(t .. " room", 50, 2, 200, 26, 16, page)
-        -- this room: WANT / ANY / AVOID
-        for i, o in ipairs({ { "WANT", "prefer", C.prefer }, { "ANY", nil, C.on }, { "AVOID", "avoid", C.avoid } }) do
-            local b = button(o[1], 12 + (i - 1) * 120, 34, 114, 32, function() draft.prefs[t] = o[2] repaint() end, page)
-            b.Name = "Room_" .. o[1]
-            table.insert(paint, function()
-                if b.Parent then b.BackgroundColor3 = draft.prefs[t] == o[2] and o[3] or C.panel end
-            end)
-        end
-        label("WANT = go there, AVOID = skip it, ANY = let the script decide", 12, 68, 356, 18, 11, page).TextColor3 = C.dim
-        if t == "SHOP" then
-            label("Buy in shops (WANT items first, never AVOID)", 12, 92, 280, 26, 13, page)
-            local shopBtn = button("", 300, 90, 68, 28, function() draft.autoShop = not draft.autoShop repaint() end, page)
-            table.insert(paint, function()
-                if not shopBtn.Parent then return end
-                shopBtn.Text = draft.autoShop and "ON" or "OFF"
-                shopBtn.BackgroundColor3 = draft.autoShop and C.prefer or C.panel
-            end)
-            itemList("shop", 124, page)
-        elseif t == "SHRINE" then
-            label("Shrine buffs - used once the shrine's accept / deny call is recorded", 12, 92, 356, 28, 11, page)
-            itemList("shrine", 124, page)
-        elseif t == "CHEST" then
-            label("Gold chests", 12, 94, 100, 28, 14, page)
-            for i, c in ipairs({ { "Open now", "now" }, { "Keep for the end", "end" } }) do
-                local b = button(c[1], 112 + (i - 1) * 130, 92, 124, 30, function() draft.goldChests = c[2] repaint() end, page)
-                table.insert(paint, function() if b.Parent then b.BackgroundColor3 = draft.goldChests == c[2] and C.on or C.panel end end)
-            end
-        end
-        button("Back", 130, 312, 120, 34, closePage, page)
-        repaint()
-    end
-    -- the five room tiles: icon, name and its choice; a tap opens the room's page
-    local tapHelp = label("Tap a room to set it up", 12, 140, 356, 22, 12)
-    -- Auto: nothing to choose, only what it will do (owner 2026-10-25)
-    local summary = label("", 12, 140, 356, 116, 13)
-    summary.Text = "What Auto does:\n- Rooms: the one your team's damage hits hardest; a room lost before counts harder\n"
-        .. "- Shops: buys cost-down items, then range\n- Gold (rare) chests: kept for the end - Secret Unit chance\n- Shrines: skipped until supported"
+    local modeHelp = label("", 12, 108, 356, 30, 12)
     table.insert(paint, function()
-        tapHelp.Visible = draft.mode ~= "Auto"
-        summary.Visible = draft.mode == "Auto"
+        modeHelp.Text = draft.mode == "Auto" and "Auto: picks the room your team's damage hits hardest."
+            or "My picks: goes to WANT rooms first, skips AVOID rooms when it can."
     end)
+    -- rooms: tap = WANT -> AVOID -> ANY
+    -- (phase 1, owner 2026-10-25: the tiles only in My picks; shrines and rare chests stay hidden
+    -- until their game calls are recorded - a button that does nothing confuses)
+    local tapHelp = label("Tap a room: WANT = go there, AVOID = skip it, ANY = let the script decide", 12, 140, 356, 30, 12)
+    table.insert(paint, function() tapHelp.Visible = draft.mode == "Fixed" end)
     for i, t in ipairs(DungeonRun.ROOM_TYPES) do
-        local tile = button("", 12 + (i - 1) * 72, 166, 66, 86, function() openPage(t) end)
+        local tile = button("", 12 + (i - 1) * 72, 174, 66, 86, function()
+            local p = draft.prefs[t]
+            draft.prefs[t] = p == nil and "prefer" or (p == "prefer" and "avoid" or nil)
+            repaint()
+        end)
         DungeonRun.IconOn(tile, t, 0, 6, 40)
         local name = Instance.new("TextLabel")
         name.BackgroundTransparency, name.TextColor3, name.Font, name.TextSize = 1, C.text, Enum.Font.GothamBold, 11
@@ -9764,15 +8864,27 @@ function DungeonRun.OpenSetup()
             stroke.Thickness, stroke.Parent = 3, tile
         end)
         table.insert(paint, function()
-            tile.Visible = draft.mode ~= "Auto"
+            tile.Visible = draft.mode == "Fixed"
             local p = draft.prefs[t]
             tile.BackgroundColor3 = p == "prefer" and C.prefer or (p == "avoid" and C.avoid or C.panel)
             state.Text = p == "prefer" and "WANT" or (p == "avoid" and "AVOID" or "ANY")
             if stroke then pcall(function() stroke.Color = p == "prefer" and C.preferEdge or (p == "avoid" and C.avoidEdge or C.panel) end) end
         end)
     end
+    -- shop and gold chests (their calls are known since 15:59 2026-10-25)
+    label("Buy in shops (cost down, then range)", 12, 272, 280, 26, 14)
+    local shopBtn = button("", 300, 270, 68, 28, function() draft.autoShop = not draft.autoShop repaint() end)
+    table.insert(paint, function()
+        shopBtn.Text = draft.autoShop and "ON" or "OFF"
+        shopBtn.BackgroundColor3 = draft.autoShop and C.prefer or C.panel
+    end)
+    label("Gold chests", 12, 306, 120, 28, 14)
+    for i, c in ipairs({ { "Open now", "now" }, { "Keep for the end", "end" } }) do
+        local b = button(c[1], 112 + (i - 1) * 130, 304, 124, 30, function() draft.goldChests = c[2] repaint() end)
+        table.insert(paint, function() b.BackgroundColor3 = draft.goldChests == c[2] and C.on or C.panel end)
+    end
     -- the next rooms with the score reason (Auto)
-    local nextLabel = label("", 12, 262, 356, 84, 12)
+    local nextLabel = label("", 12, 346, 356, 84, 12)
     table.insert(paint, function()
         local st = DungeonRun.Read()
         local lines = {}
@@ -9789,19 +8901,20 @@ function DungeonRun.OpenSetup()
         end
         nextLabel.Text = #lines > 0 and ("Next rooms:\n" .. table.concat(lines, "\n")) or "Next rooms: shown when the game opens the room choice"
     end)
-    button("Copy report", 12, 366, 120, 32, function() pcall(DungeonRun.Report) end)
-    button("Save & Close", 218, 366, 150, 32, function()
+    button("Copy report", 12, 444, 120, 32, function() pcall(DungeonRun.Report) end)
+    button("Save & Close", 218, 444, 150, 32, function()
         DungeonRun.mode, DungeonRun.prefs, DungeonRun.shrineRule, DungeonRun.openRareAtEnd = draft.mode, draft.prefs, draft.shrineRule, draft.openRare
-        DungeonRun.autoShop, DungeonRun.goldChests, DungeonRun.itemPrefs = draft.autoShop, draft.goldChests, draft.itemPrefs
+        DungeonRun.autoShop, DungeonRun.goldChests = draft.autoShop, draft.goldChests
         DungeonRun.acceptShrines = draft.shrineRule ~= "never"
         DungeonRun.ApplyPrefs()
         DungeonRun.blocked = nil
         saveConfig()
         DungeonRun.Refresh(false)
-        close()
+        g:Destroy()
+        DungeonRun.setupGui = nil
     end)
     repaint()
-    g.Parent = holder
+    g.Parent = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
     DungeonRun.setupGui = g
     return g
 end
@@ -10636,46 +9749,6 @@ end
 -- Infinity Mansion: the game starts the player's current room (watched:
 -- request_start_infinite_tower(141, "Hard")). The room comes from the stage name of the
 -- last tower game ("Infinity Mansion Room 141"): won = the next room, lost = the same.
--- Map survey (owner 2026-10-25): every Story and Raid world once, act 1 - join, leave 6 s after
--- wave 1 (the placement dump with the map lanes is written at wave 1), then the next world.
--- Worlds done are kept in surveyDone; it turns itself off when none is left.
-function Lobby.SurveyStep(inLobbyNow)
-    local c = Lobby.cfg
-    if not c.survey then return end
-    if inLobbyNow then
-        Lobby.surveyAt = nil
-        if os.clock() - (Lobby.surveyTry or -1e9) < 30 then return end
-        for _, mode in ipairs({ "Story", "Raid" }) do
-            for _, w in ipairs(Lobby.Worlds(mode)) do
-                local key = mode .. ":" .. w
-                if not c.surveyDone[key] then
-                    c.surveyDone[key] = true
-                    c.mode, c.world, c.act = mode, w, "1"
-                    saveConfig()
-                    Lobby.surveyTry = os.clock()
-                    Lobby.Status("Map survey: " .. key)
-                    pcall(Lobby.Join)
-                    return
-                end
-            end
-        end
-        c.survey = false
-        saveConfig()
-        Lobby.Status("Map survey: every world done")
-        return
-    end
-    if AutoPlaceModule.WaveNumber() < 1 then return end
-    Lobby.surveyAt = Lobby.surveyAt or os.clock()
-    if os.clock() - Lobby.surveyAt < 6 then return end
-    Lobby.surveyAt = os.clock() + 30 -- then one try every 36 s
-    local remote = getAARemote("teleport_back_to_lobby")
-    if remote then
-        pcall(function() if remote:IsA("RemoteFunction") then remote:InvokeServer() else remote:FireServer() end end)
-    else
-        pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
-    end
-end
-
 function Lobby.TowerResult(win)
     local n = tonumber(tostring(State.stage or ""):match("[Ii]nfinity [Mm]ansion[^%d]*(%d+)"))
     if not n then return end
@@ -10707,7 +9780,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-204218"
+Lobby.VERSION = "20261025-210101"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "stable"
@@ -10799,13 +9872,7 @@ function Lobby.ShareGame(win, wave)
     if #units == 0 then units = Lobby.lastUnitRows or {} end
     -- (pl = players in the room: a duo game is much easier than solo, so stats compare like with like)
     local data = { v = 1, mode = State.eventMode and "event" or "other", ver = Lobby.VERSION, ch = Lobby.CHANNEL, pl = #game:GetService("Players"):GetPlayers(), id = Lobby.ShareId(), t = os.time(), map = tostring(State.stage), w = wave, win = win and 1 or 0,
-        candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units,
-        -- (normal stages: BAD_SPOT count and whether the learned road reached our base)
-        bad = not State.eventMode and (AutoPlaceModule.badCount or 0) or nil,
-        pathOk = (function()
-            if State.eventMode or not AutoPlaceModule.Reaches then return nil end
-            return AutoPlaceModule.Reaches(AutoPlaceModule.PathPoints()) == true
-        end)() }
+        candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units }
     local body = HttpService:JSONEncode(data)
     -- (a Discord message holds 2000 characters: the last-placed units go first when it is long)
     while #body > 1900 and #units > 0 do
@@ -10918,68 +9985,6 @@ function Lobby.RecordWaves()
     end
 end
 
--- "You Died!" (all lives lost): one step at a time, each waiting 8 s for the game's answer
--- (a dungeon_changed, 10 s each): 1 tap Continue (what the owner does by hand - answered at once at 11:43),
--- 2 open a gold chest left, 3 open a chest left (the server may want them first), 4 one direct
--- dungeon_continue_death(), 5 in a room: back to the lobby. Never two sends at once, nothing
--- repeated (18:05-18:16 2026-10-25: taps every 5 s and three calls in one second, none answered).
-function Lobby.DiedStep(inLobbyNow)
-    if not Lobby.ButtonFor("You Died!") then Lobby.died = nil return end
-    if DungeonRun.enabled and not DungeonRun.pendingStart then
-        DungeonRun.pendingStart = true
-        saveConfig()
-    end
-    local d = Lobby.died
-    if not d then d = { step = 0, at = -1e9 } Lobby.died = d end
-    local function log(text)
-        pcall(Lobby.ShareLog, "dungeon: You Died! " .. text)
-        pcall(DungeonRun.Log, "You Died! " .. text)
-    end
-    if d.step > 0 and (DungeonRun.liveSeq or 0) ~= d.seq then
-        if not d.answered then d.answered = true log("answered after step " .. d.step) end
-        return
-    end
-    if d.step >= 5 or os.clock() - d.at < 10 then return end
-    if d.step > 0 then log("no answer to step " .. d.step .. " in 10 s") end
-    d.step, d.at, d.seq = d.step + 1, os.clock(), DungeonRun.liveSeq or 0
-    local res = type(DungeonRun.live) == "table" and type(DungeonRun.live._resources) == "table" and DungeonRun.live._resources or {}
-    local function call(name, arg, have)
-        if have ~= nil and have <= 0 then d.at = -1e9 log("step " .. d.step .. ": " .. name .. " skipped (none left)") return end
-        local r = getAARemote(name)
-        if not r then d.at = -1e9 log("step " .. d.step .. ": " .. name .. " not found") return end
-        local ok, answer = pcall(function()
-            if arg == nil then return r:InvokeServer() end
-            return r:InvokeServer(arg)
-        end)
-        log(string.format("step %d: %s(%s) answered %s", d.step, name, arg == nil and "" or tostring(arg), clip(tostring(ok and answer or "error"), 40)))
-    end
-    if d.step == 1 then
-        local b = Lobby.ButtonFor("Continue")
-        if b then Lobby.TapGui(b) log("step 1: tapped Continue") else log("step 1: no Continue button") end
-    elseif d.step == 2 then
-        call("dungeon_open_chest", true, tonumber(res.treasure_gold))
-    elseif d.step == 3 then
-        call("dungeon_open_chest", false, tonumber(res.treasure))
-    elseif d.step == 4 then
-        call("dungeon_continue_death", nil)
-    elseif inLobbyNow then
-        log("still up in the lobby - press Continue by hand")
-    else
-        local back, remote = Lobby.ButtonFor("Return to lobby"), getAARemote("teleport_back_to_lobby")
-        local how
-        if back then
-            Lobby.TapGui(back) how = "tapped Return to lobby"
-        elseif remote then
-            pcall(function() if remote:IsA("RemoteFunction") then remote:InvokeServer() else remote:FireServer() end end)
-            how = "teleport_back_to_lobby()"
-        else
-            pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
-            how = "teleport to the lobby"
-        end
-        log("step 5: no answer - " .. how)
-    end
-end
-
 -- Every 5 s in the lobby (not while Watch is teaching): join again 20 s after a try.
 function Lobby.Loop()
     while not State.unloaded do
@@ -11012,11 +10017,19 @@ function Lobby.Loop()
         end
         if State.eventMode and not inLobbyNow then pcall(Lobby.SampleDepth) end
         pcall(DungeonRun.DumpUI)
-        pcall(DungeonRun.DumpPages)
         -- (Dungeon Run "You Died!" - all lives lost, the run is over: its Continue collects the rewards
-        -- and leaves. Left alone it sat there until the idle kick - 2026-10-25. It shows in the lobby too)
-        pcall(Lobby.DiedStep, inLobbyNow)
+        -- and leaves. Left alone it sat there until the idle kick - 2026-10-25)
         if not inLobbyNow then
+            pcall(function()
+                if os.clock() - (Lobby.diedTapAt or -1e9) < 4 then return end
+                if not Lobby.ButtonFor("You Died!") then return end
+                local b = Lobby.ButtonFor("Continue")
+                if b then
+                    Lobby.diedTapAt = os.clock()
+                    Lobby.TapGui(b)
+                    pcall(Lobby.ShareLog, "dungeon: You Died! - tapped Continue")
+                end
+            end)
             -- (Dungeon Room result, win or defeat: "Next" goes back to the room choice / You Died!
             -- page. Left alone it sat on DEFEAT Depth 6 for 5+ minutes - 2026-10-25)
             pcall(function()
@@ -11032,7 +10045,6 @@ function Lobby.Loop()
                     -- (after a lost room the game itself selects the same room again:
                     -- dungeon_selected_changed with lives - 1 at the defeat, 2026-10-25)
                     local won = AutoFarmModule.ResultIsVictory()
-                    if not won and not Lobby.lossNoted then Lobby.lossNoted = true pcall(DungeonRun.NoteLoss) end
                     Lobby.roomNextAt = os.clock()
                     Lobby.TapGui(b)
                     pcall(Lobby.ShareLog, "dungeon: room result (" .. (won and "won" or "lost") .. ") - tapped " .. word)
