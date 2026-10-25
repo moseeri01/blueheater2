@@ -2006,6 +2006,7 @@ end
 -- MODULE: Auto Farm (Replay Automation)
 --------------------------------------------------------------------------------
 local AutoFarmModule = {}
+AutoFarmModule.ResultsShowing = isResultsShowing
 
 local function refreshAutoStatus()
     if not UIRef.autoStatusParagraph then return end
@@ -2033,6 +2034,8 @@ local endHandling = false
 
 -- Decides what to do with this result screen; nil = leave it for the player.
 local function endGoal()
+    -- (a Dungeon Room result only has Next, tapped by Lobby.Loop: Replay / Leave would leave the run)
+    if DungeonRun.InRoom() then return nil end
     local victory = resultIsVictory()
     if AutoFarm.autoNextStage and victory then return "next_story", Words.NEXT_STAGE end
     if AutoFarm.autoReplay then return "replay", Words.REPLAY end
@@ -3519,14 +3522,15 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         -- stretch, area units lean the same way but less; a long-range unit leaves the spots a
         -- shorter-range team unit covers best (half of that short cover is taken off its score)
         local weight, shortR = {}, nil
+        -- (measured from our base only: maps with several spawn lanes, e.g. Dungeon city rooms)
         if not State.eventMode then
+            local far = 0
+            if goal then
+                for _, q in ipairs(pts) do far = math.max(far, math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)) end
+            end
             for i, q in ipairs(pts) do
                 local prog = (i - 1) / math.max(1, #pts - 1)
-                if spawn and goal then
-                    local ds = math.sqrt((q[1] - spawn.X) ^ 2 + (q[3] - spawn.Z) ^ 2)
-                    local dg = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
-                    prog = ds / math.max(1, ds + dg)
-                end
+                if far > 0 then prog = 1 - math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2) / far end
                 weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog)
             end
             for _, tm in pairs(AutoPlaceModule.team) do
@@ -5260,6 +5264,7 @@ local function tick()
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
     if not isGameRunning() or isResultsShowing() then AutoPlaceModule.status = "Waiting for a game" return 1 end
     local grew = samplePath()
+    if grew then AutoPlaceModule.pathGrewAt = os.clock() end
     if grew and #pathPoints() % 20 == 0 then saveConfig() end
     if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
     -- event hotbar: new random units arrive during the game (read again every 5 s)
@@ -5343,8 +5348,12 @@ local function tick()
     if AutoPlace.manual then t = nil end
     -- (owner 2026-10-25: on a stage played for the first time only the road near the enemy spawn
     -- is known when the first unit goes down, so every unit stood forward) the 2nd+ damage unit
-    -- waits until the learned path reaches our base - HOLD_PATH s at most, never in danger
-    if t and role == "dps" and (dpsPlaced or 0) > 0 and not danger and not State.eventMode and AutoPlaceModule.PathShort() then
+    -- waits until the learned path reaches our base - HOLD_PATH s at most, never in danger, not in
+    -- Fast clear (units forward on purpose there)
+    if t and role == "dps" and (dpsPlaced or 0) > 0 and not danger and not State.eventMode
+        and AutoPlaceModule.Mode() ~= "Fast clear" and AutoPlaceModule.PathShort()
+        -- (path not grown for 10 s: enemies die before they get further - this is the road that matters)
+        and os.clock() - (AutoPlaceModule.pathGrewAt or 0) < 10 then
         local key = stageKey()
         AutoPlaceModule.holdAt[key] = AutoPlaceModule.holdAt[key] or os.clock()
         if os.clock() - AutoPlaceModule.holdAt[key] < AutoPlaceModule.HOLD_PATH then
@@ -7822,6 +7831,13 @@ end
 -- _l = { _dungeon = { choice_str, depth }, _lobby_difficulty_scale, map, boss, _location_name,
 -- _weak_against = { { damage_type = "air_damage", amplification = 3.1 } }, _strong_against } }.
 -- dungeon_changed({}) = the run is over (after "You Died!" Continue).
+-- In a Dungeon Room game (its level is "Dungeon Room (Depth N)", the level data has _dungeon).
+function DungeonRun.InRoom()
+    if DungeonRun.InLobby() then return false end
+    if string.lower(tostring(State.stage or "")):find("dungeon room", 1, true) then return true end
+    local ok, d = pcall(Stage.levelData)
+    return ok and type(d) == "table" and (d._dungeon ~= nil or string.lower(tostring(d.name or "")):find("dungeon room", 1, true) ~= nil)
+end
 function DungeonRun.Norm(kind)
     return (string.lower(tostring(kind or "")):gsub("_damage$", ""))
 end
@@ -8908,7 +8924,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-123240"
+Lobby.VERSION = "20261025-125125"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -9134,6 +9150,18 @@ function Lobby.Loop()
                     Lobby.diedTapAt = os.clock()
                     Lobby.TapGui(b)
                     pcall(Lobby.ShareLog, "dungeon: You Died! - tapped Continue")
+                end
+            end)
+            -- (Dungeon Room result, win or defeat: "Next" goes back to the room choice / You Died!
+            -- page. Left alone it sat on DEFEAT Depth 6 for 5+ minutes - 2026-10-25)
+            pcall(function()
+                if os.clock() - (Lobby.roomNextAt or -1e9) < 4 then return end
+                if not DungeonRun.InRoom() or not AutoFarmModule.ResultsShowing() then return end
+                local b = Lobby.ButtonFor("Next")
+                if b then
+                    Lobby.roomNextAt = os.clock()
+                    Lobby.TapGui(b)
+                    pcall(Lobby.ShareLog, "dungeon: room result - tapped Next")
                 end
             end)
         end
