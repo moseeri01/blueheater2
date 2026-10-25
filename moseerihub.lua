@@ -5053,6 +5053,9 @@ function AutoPlaceModule.EventChoose(money)
             -- (under 6 damage units any damage copy goes down - Snowy Town was lost at wave 7 with 4 units;
             -- Arlem only never: 5000 for a hit every 60 s)
             local thin = role == "dps" and AutoPlaceModule.DamageCount(units) < 6 and t.name ~= "armin"
+            -- (from wave 20 a free map place is worth more than the yen: losses at waves 28-30 had only
+            -- 10-16 of 20 units while copies were cleared - owner 2026-10-25)
+            local lateRoom = AutoPlaceModule.WaveNumber() >= 20 and #units < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2
             -- (the owner's Never list always wins - shared data 2026-10-25: natsu, sabo, narberal, vanilla_ice,
             -- akainu were placed in 52 games while the team was thin, all left at level 0)
             if AutoPlaceModule.InList(Lobby.cfg.eventNever, t.name) or (AutoPlace.skip[t.name] and not thin) then why = "on the never / skip list"
@@ -5078,11 +5081,10 @@ function AutoPlaceModule.EventChoose(money)
                 if buffs >= EV.buffUnits then why = "enough buff units" end
             -- (owner: only the units on the Always list - the rest just while fewer than 4 damage units
             -- are down, so the early waves are held)
-            -- (from wave 20 a free map place is worth more than the yen: losses at waves 28-30 had only
-            -- 10-16 of 20 units while copies were cleared - owner 2026-10-25)
             elseif not always and role == "dps" and AutoPlaceModule.mainSeen and AutoPlaceModule.DamageCount(units) >= 8
-                and not (AutoPlaceModule.WaveNumber() >= 20 and #units < math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) - 2) then why = "not on the Always list"
-            elseif not always and not thin and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
+                and not lateRoom then why = "not on the Always list"
+            -- (also weak copies late: lost at wave 30 with 48k unspent while gilgamesh was cleared as weak)
+            elseif not always and not thin and not (lateRoom and role == "dps") and AutoPlaceModule.EventWeak(t, role) then why = "far below the team"
             end
             local first = AutoPlaceModule.copySeen[t.uuid] or now
             AutoPlaceModule.copySeen[t.uuid] = first
@@ -8459,7 +8461,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-092913"
+Lobby.VERSION = "20261025-093233"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
