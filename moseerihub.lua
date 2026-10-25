@@ -8461,7 +8461,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-093233"
+Lobby.VERSION = "20261025-095922"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8697,17 +8697,21 @@ end
 -- in event also the Always list: the first card comes before the mains are down (owner
 -- 2026-10-24: Magic Resistance +75 taken at the start, then judar came).
 function Lobby.DamageShare()
-    local share, total, names = {}, 0, {}
-    for _, u in ipairs(ownedUnits()) do table.insert(names, unitType(u)) end
-    if State.eventMode then
-        for _, n in ipairs(Lobby.cfg.eventAlways or {}) do table.insert(names, n) end
-    end
-    for _, name in ipairs(names) do
+    local share, total = {}, 0
+    local function add(name, dmg, cd)
         local def = AutoPlaceModule.UnitDef(name) or {}
         local kind = tostring(def._base_damage_type or "physical")
-        local dps = (tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.DefCd(def))
+        local dps = (dmg or tonumber(def.damage) or 0) / math.max(0.5, cd or AutoPlaceModule.DefCd(def))
         share[kind] = (share[kind] or 0) + dps
         total = total + dps
+    end
+    -- (placed units by their damage as upgraded now: three judar at level 8 counted as three level-0
+    -- ones, and Spellproof II was taken - 2026-10-25)
+    for _, u in ipairs(ownedUnits()) do
+        add(unitType(u), AutoPlaceModule.StatNum(u, "damage"), AutoPlaceModule.StatNum(u, "attack_cooldown"))
+    end
+    if State.eventMode then
+        for _, n in ipairs(Lobby.cfg.eventAlways or {}) do add(n) end
     end
     if total <= 0 then return { physical = 0.5, magic = 0.5 } end
     for k, v in pairs(share) do share[k] = v / total end
@@ -8747,8 +8751,13 @@ function Lobby.CardCost(opt, share)
             -- most RES_CAP in all - past it the card goes behind every other one)
             local kind = tostring(e.damage_type)
             local mine = share[kind] or 0
-            local over = ((Lobby.resTaken or {})[kind] or 0) + a > Lobby.RES_CAP
-            cost = cost + 1.5 * (a / 100) * mine + ((mine >= 0.3 or over) and Lobby.AVOID or 0)
+            local prev = (Lobby.resTaken or {})[kind] or 0
+            local over = prev + a > Lobby.RES_CAP
+            -- (the share of our damage it takes away: damage x100/(100+resist), on top of what was
+            -- taken before - +150 on +100 cuts that type by 43%%, more than Enemy Health +50%% (33%%)
+            -- cuts everyone; counted against Enemy Health = AVOID)
+            local loss = mine * (1 - (100 + prev) / (100 + prev + a))
+            cost = cost + Lobby.AVOID * loss / 0.33 + ((mine >= 0.3 or over) and Lobby.AVOID or 0)
         -- (regen once is fine, more of it stacks up: each one taken costs more)
         elseif t == "enemy_regen" then cost = cost + 100 * a * (1 + (Lobby.regenTaken or 0))
         elseif t == "enemy_shield" then cost = cost + 0.1 * a
