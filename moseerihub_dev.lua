@@ -2006,7 +2006,7 @@ end
 -- MODULE: Auto Farm (Replay Automation)
 --------------------------------------------------------------------------------
 local AutoFarmModule = {}
-AutoFarmModule.ResultsShowing = isResultsShowing
+AutoFarmModule.ResultsShowing, AutoFarmModule.ResultIsVictory = isResultsShowing, resultIsVictory
 
 local function refreshAutoStatus()
     if not UIRef.autoStatusParagraph then return end
@@ -7484,6 +7484,33 @@ function DungeonRun.priority()
     return list
 end
 
+-- Room choice names on screen (saved as "Auto" / "Fixed") and the 1st / 2nd / 3rd room dropdowns:
+-- the order is the three picks, then the other room types.
+DungeonRun.MODE_AUTO, DungeonRun.MODE_ORDER = "Auto (script decides)", "My order"
+DungeonRun.ROOM_TYPES = { "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE" }
+function DungeonRun.ModeLabel()
+    return DungeonRun.mode == "Auto" and DungeonRun.MODE_AUTO or DungeonRun.MODE_ORDER
+end
+function DungeonRun.SetChoice(i, v)
+    local cur = DungeonRun.priority()
+    local picks = { cur[1], cur[2], cur[3] }
+    -- (picking a type that sits in another slot swaps the two)
+    for j = 1, 3 do if j ~= i and picks[j] == v then picks[j] = picks[i] end end
+    picks[i] = v
+    local order = {}
+    for _, t in ipairs(picks) do if t and not table.find(order, t) then table.insert(order, t) end end
+    for _, t in ipairs(DungeonRun.ROOM_TYPES) do if not table.find(order, t) then table.insert(order, t) end end
+    DungeonRun.roomPriority = table.concat(order, ">")
+    DungeonRun.SyncChoices()
+end
+function DungeonRun.SyncChoices()
+    local cur = DungeonRun.priority()
+    DungeonRun.choiceSyncing = true
+    for i, c in ipairs(Controls.dungeonChoice or {}) do
+        pcall(function() if cur[i] and c.value ~= cur[i] then c:UpdateSelection(cur[i]) end end)
+    end
+    DungeonRun.choiceSyncing = false
+end
 function DungeonRun.wishes()
     local list = {}
     for w in tostring(DungeonRun.wishList or ""):gmatch("[^,;\n]+") do
@@ -7704,7 +7731,7 @@ function DungeonRun.Call(name, arg, before)
     local remote = getAARemote(name)
     if not remote then DungeonRun.status = name .. " remote not found" return false end
     DungeonRun.calls = (DungeonRun.calls or 0) + 1
-    local sel = DungeonRun.selSeq or 0
+    local sel, seq = DungeonRun.selSeq or 0, DungeonRun.liveSeq or 0
     local ok, res = pcall(function()
         if remote:IsA("RemoteFunction") then return remote:InvokeServer(arg) end
         remote:FireServer(arg)
@@ -7715,7 +7742,7 @@ function DungeonRun.Call(name, arg, before)
         local now = DungeonRun.Read()
         if now and before and DungeonRun.Changed(before, now) then return true, res end
         -- (live run: the game answers a room with dungeon_selected_changed, then teleports)
-        if (DungeonRun.selSeq or 0) ~= sel then return true, res end
+        if (DungeonRun.selSeq or 0) ~= sel or (DungeonRun.liveSeq or 0) ~= seq then return true, res end
         task.wait(0.25)
     end
     return false, ok and res or "error"
@@ -7856,8 +7883,13 @@ function DungeonRun.TagText(tags)
     table.sort(parts)
     return table.concat(parts, ",")
 end
--- a room type only when the data names one (the _t codes are not known yet)
+-- _t codes seen in the real game (2026-10-25): "6" = a shrine follows (current_shops held
+-- {_t = "6"} while the owner stood at the shrine), "7" = a shop follows; the rest are not known.
+DungeonRun.TAG_TYPES = { ["6"] = "SHRINE", ["7"] = "SHOP" }
 function DungeonRun.TagType(tags)
+    for k, v in pairs(type(tags) == "table" and tags or {}) do
+        if v == true and DungeonRun.TAG_TYPES[tostring(k)] then return DungeonRun.TAG_TYPES[tostring(k)] end
+    end
     for _, v in pairs(type(tags) == "table" and tags or {}) do
         local w = string.upper(tostring(type(v) == "table" and (v.type or v.id) or v))
         for _, t in ipairs(DungeonRun.TYPES) do
@@ -8004,6 +8036,13 @@ function DungeonRun.LiveStep(st)
         DungeonRun.Refresh(st)
         return 2
     end
+    -- (the copy found in memory in the lobby is the last room choice, not an open one: rooms sent
+    -- from there were never taken - 2026-10-25. The game sends dungeon_changed when the choice opens)
+    if st.table ~= DungeonRun.live then
+        DungeonRun.status = "waiting for the game to open the room choice"
+        DungeonRun.Refresh(st)
+        return 3
+    end
     if DungeonRun.enteredTable == st.table then
         DungeonRun.status = "in room " .. tostring(DungeonRun.enteredId) .. " - waiting for its result"
         DungeonRun.Refresh(st)
@@ -8034,14 +8073,15 @@ function DungeonRun.LiveStep(st)
     table.sort(team)
     pcall(Lobby.ShareLog, string.format("dungeon: depth %s %s -> room %s %s (%s) lives %s team %s", tostring(st.depth), DungeonRun.mode, arg,
         tostring(room.label), tostring(why), tostring(st.hearts), table.concat(team, ", ")))
-    local changed = DungeonRun.Call("dungeon_enter_room", arg, st)
+    local changed, answer = DungeonRun.Call("dungeon_enter_room", arg, st)
+    pcall(Lobby.ShareLog, string.format("dungeon: dungeon_enter_room(%q) -> %s, answered %s", arg, changed and "taken" or "nothing", clip(tostring(answer), 60)))
     if changed then
         DungeonRun.enteredTable, DungeonRun.enteredId = st.table, arg
         DungeonRun.picks = DungeonRun.picks or {}
         table.insert(DungeonRun.picks, arg)
         DungeonRun.status = "entered room " .. arg .. " " .. tostring(room.label or "")
     else
-        DungeonRun.blocked = string.format("dungeon_enter_room(%s) changed nothing - %s", arg, DungeonRun.WAITING)
+        DungeonRun.blocked = string.format("room %s: the game did not take it (answered %s) - pick by hand", arg, clip(tostring(answer), 30))
     end
     DungeonRun.Refresh()
     return 1
@@ -8924,7 +8964,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-125125"
+Lobby.VERSION = "20261025-125757"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -9159,9 +9199,12 @@ function Lobby.Loop()
                 if not DungeonRun.InRoom() or not AutoFarmModule.ResultsShowing() then return end
                 local b = Lobby.ButtonFor("Next")
                 if b then
+                    -- (after a lost room the game itself selects the same room again:
+                    -- dungeon_selected_changed with lives - 1 at the defeat, 2026-10-25)
+                    local won = AutoFarmModule.ResultIsVictory()
                     Lobby.roomNextAt = os.clock()
                     Lobby.TapGui(b)
-                    pcall(Lobby.ShareLog, "dungeon: room result - tapped Next")
+                    pcall(Lobby.ShareLog, "dungeon: room result (" .. (won and "won" or "lost") .. ") - tapped Next")
                 end
             end)
         end
@@ -10334,20 +10377,27 @@ Controls.dungeonAuto = dataSection:Toggle({
 dataSection:Button({ Name = "Copy dungeon report", Callback = function() pcall(DungeonRun.Report) end })
 
 setSection:Header({ Text = "Choices" })
-Controls.dungeonMode = setSection:Dropdown({ Name = "Room choice", Multi = false, Required = true, Options = { "Fixed", "Auto" },
-    Default = DungeonRun.mode,
-    Callback = function(v) DungeonRun.mode = v == "Auto" and "Auto" or "Fixed"; DungeonRun.blocked = nil; DungeonRun.Refresh(false); saveConfig() end,
+-- (owner 2026-10-25: plain words, and the room order by clicks, not typed)
+Controls.dungeonMode = setSection:Dropdown({ Name = "Room choice", Multi = false, Required = true, Options = { DungeonRun.MODE_AUTO, DungeonRun.MODE_ORDER },
+    Default = DungeonRun.ModeLabel(),
+    Callback = function(v)
+        DungeonRun.mode = (v == DungeonRun.MODE_AUTO or v == "Auto") and "Auto" or "Fixed"
+        DungeonRun.blocked = nil; DungeonRun.Refresh(false); saveConfig()
+    end,
 }, "DungeonMode")
-Controls.dungeonPriority = setSection:Input({
-    Name = "Room priority",
-    Placeholder = "HOARD>CHEST>SHOP",
-    Default = DungeonRun.roomPriority,
-    AcceptedCharacters = "All",
-    Callback = function(text) DungeonRun.roomPriority = text or ""; DungeonRun.Refresh(false); saveConfig() end,
-}, "DungeonPriority")
+Controls.dungeonChoice = {}
+for i, name in ipairs({ "1st room", "2nd room", "3rd room" }) do
+    Controls.dungeonChoice[i] = setSection:Dropdown({ Name = name, Multi = false, Required = true, Options = DungeonRun.ROOM_TYPES,
+        Default = DungeonRun.priority()[i],
+        Callback = function(v)
+            if DungeonRun.choiceSyncing then return end
+            DungeonRun.SetChoice(i, v); DungeonRun.Refresh(false); saveConfig()
+        end,
+    }, "DungeonChoice" .. i)
+end
 Controls.dungeonWish = setSection:Input({
     Name = "Shop wish-list",
-    Placeholder = "item, item",
+    Placeholder = "item names, e.g. damage",
     Default = DungeonRun.wishList,
     AcceptedCharacters = "All",
     Callback = function(text) DungeonRun.wishList = text or ""; DungeonRun.Refresh(false); saveConfig() end,
@@ -10357,7 +10407,7 @@ Controls.shrineEnabled = setSection:Toggle({
     Default = DungeonRun.acceptShrines,
     Callback = function(on) DungeonRun.acceptShrines = on; DungeonRun.Refresh(false); saveConfig() end,
 }, "Shrine")
-setSection:Paragraph({ Header = "", Body = "Auto: picks rooms our damage types hit hard.\nFixed: Room priority order." })
+setSection:Paragraph({ Header = "", Body = "Auto: picks rooms our damage types hit hard.\nMy order: 1st / 2nd / 3rd room first." })
 end
 
 -- TAB 5: Settings
@@ -10672,7 +10722,8 @@ applyRuntimeFeatures = function()
     setControl(Controls.dungeonContinueDeath, DungeonRun.autoContinueDeath)
     setControl(Controls.dungeonPriority, DungeonRun.roomPriority)
     setControl(Controls.dungeonWish, DungeonRun.wishList)
-    pcall(function() Controls.dungeonMode:UpdateSelection(DungeonRun.mode) end)
+    pcall(function() Controls.dungeonMode:UpdateSelection(DungeonRun.ModeLabel()) end)
+    pcall(DungeonRun.SyncChoices)
     setControl(Controls.profileName, Profile.name)
 
     UnitAI.autoAbilities = pendingToggles.autoAbilities == true
