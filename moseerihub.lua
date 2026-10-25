@@ -8325,6 +8325,45 @@ function DungeonRun.PickRoom(rooms)
 end
 
 -- One step of the auto run. Returns seconds to wait.
+-- In the lobby the room choice only opens in the Dungeon Run window (friends' scripts sat in the lobby
+-- for the whole run - 2026-10-25). With a run going (or keys and no run) and the choice still closed
+-- after 8 s: tap the left menu's "Dungeon" button (PlayerGui.LeftUI_test.Buttons.Dungeon), 2 s later the
+-- window's green Start (DungeonUI ... StartHolder.Main.Start) when it shows; again 20 s later at most.
+DungeonRun.OPEN_AFTER, DungeonRun.OPEN_EVERY = 8, 20
+function DungeonRun.StartButton()
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local ui = gui and gui:FindFirstChild("DungeonUI")
+    local holder = ui and ui:FindFirstChild("StartHolder", true)
+    local b = holder and holder:FindFirstChild("Start", true)
+    if b and b:IsA("GuiButton") and isOnScreen(b) then return b end
+end
+function DungeonRun.OpenWindowStep(st)
+    if DungeonRun.ChoiceOpen() then DungeonRun.closedSince = nil return nil end
+    local running = st ~= nil and st.live and #st.rooms > 0 and not st.ended
+    local keys = DungeonRun.KeyCount()
+    if not running and not (keys and keys > 0) then return nil end
+    DungeonRun.closedSince = DungeonRun.closedSince or os.clock()
+    if os.clock() - DungeonRun.closedSince < DungeonRun.OPEN_AFTER then return nil end
+    if os.clock() - (DungeonRun.openTryAt or -1e9) < DungeonRun.OPEN_EVERY then return nil end
+    DungeonRun.openTryAt = os.clock()
+    local menu = Lobby.ButtonFor("Dungeon")
+    if not menu then
+        pcall(Lobby.ShareLog, "dungeon: lobby - no Dungeon button on screen")
+        return nil
+    end
+    Lobby.TapGui(menu)
+    pcall(Lobby.ShareLog, "dungeon: lobby - tapped Dungeon (" .. (running and "run going" or ("keys " .. tostring(keys))) .. ")")
+    task.wait(2)
+    local start = DungeonRun.StartButton()
+    if start then
+        Lobby.TapGui(start)
+        pcall(Lobby.ShareLog, "dungeon: lobby - tapped the window's green Start")
+    end
+    DungeonRun.status = "opened the Dungeon window"
+    DungeonRun.Refresh(st)
+    return 2
+end
+
 function DungeonRun.Step()
     pcall(DungeonRun.ScanData)
     pcall(DungeonRun.LearnIcons)
@@ -8333,6 +8372,10 @@ function DungeonRun.Step()
     -- (only a fresh dungeon_changed shows a run still going: an old copy in memory still has rooms)
     if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and st.table == DungeonRun.live and #st.rooms > 0 and not st.ended) then
         return DungeonRun.TryStart()
+    end
+    if DungeonRun.InLobby() then
+        local wait = DungeonRun.OpenWindowStep(st)
+        if wait then return wait end
     end
     if st and st.live then return DungeonRun.LiveStep(st) end
     if not st or ((not st.rooms or #st.rooms == 0) and not (st.shop and #st.shop > 0) and not st.dead) then
@@ -10641,7 +10684,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-202654"
+Lobby.VERSION = "20261025-203658"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "stable"
