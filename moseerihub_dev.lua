@@ -10911,10 +10911,23 @@ end
 -- (selected) | "avoid" (not selected) | nil = the script's recommendation (an older save with item
 -- choices: nil was ANY = selected). Recommended = worth buying for this team (value > 0.3); a curse is
 -- recommended when it is not a dangerous one (> -4).
-function DungeonRun.ItemScore(id) return DungeonRun.ItemValue(DungeonRun.ItemText(id)) end
+-- (kept 5 s: every glowing card asks on each repaint - a tap re-scored the whole page)
+DungeonRun.scoreMemo = {}
+function DungeonRun.ItemScore(id)
+    local m = DungeonRun.scoreMemo[id]
+    if m and os.clock() - m.at < 5 and os.clock() >= m.at then return m.v, m.curse end
+    local v, curse = DungeonRun.ItemValue(DungeonRun.ItemText(id))
+    DungeonRun.scoreMemo[id] = { at = os.clock(), v = v, curse = curse }
+    return v, curse
+end
 function DungeonRun.ItemRecommended(id)
     local v, curse = DungeonRun.ItemScore(id)
     if curse then return v > -4 end
+    -- (a shrine blessing costs nothing: yes unless it hurts - an unknown new one denied the offer)
+    local known = (Lobby.cfg.dungeonItems or {})[id]
+    local kind = known and known.kind
+    for _, it in ipairs(DungeonRun.ITEMS) do if it.id == id then kind = it.kind break end end
+    if kind == "shrine" then return v >= 0 end
     return v > 0.3
 end
 function DungeonRun.ItemSelected(id, prefs)
@@ -13210,7 +13223,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-020057"
+Lobby.VERSION = "20261026-020206"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
