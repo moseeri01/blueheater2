@@ -7255,7 +7255,9 @@ end)
 
 -- Snapshot when a game starts, report when its result screen shows (once per game).
 task.spawn(function()
-    local wasStarted, wasResults = false, false
+    -- (a result screen already up when this copy starts - an auto-update at the result screen - is
+    -- the game the copy before already reported: counted twice in games.txt otherwise, 2026-10-25)
+    local wasStarted, wasResults = false, (pcall(isResultsShowing) and isResultsShowing()) or false
     local unitsBefore, reported
     while not State.unloaded do
         task.wait(1)
@@ -8464,7 +8466,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-103025"
+Lobby.VERSION = "20261025-103315"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
