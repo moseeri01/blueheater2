@@ -9282,7 +9282,7 @@ function DungeonRun.ItemText(id)
     local norm = string.lower(id):gsub("[^a-z]", "")
     for name, effect in pairs(DungeonRun.WIKI_EFFECTS) do
         local n = name:gsub("[^a-z]", "")
-        if norm ~= "" and #n >= 3 and (norm:find(n, 1, true) or n:find(norm, 1, true)) then return name .. " " .. effect end
+        if norm ~= "" and #n >= 3 and (norm:find(n, 1, true) or (#norm >= 6 and n:find(norm, 1, true))) then return name .. " " .. effect end
     end
     return id
 end
@@ -9396,6 +9396,7 @@ function DungeonRun.ShrineStep(st, seq)
     local live = type(DungeonRun.live) == "table" and DungeonRun.live.current_shops
     local data = type(live) == "table" and type(live[1]) == "table" and tostring(live[1]._t) == "7" and live[1].data or nil
     pcall(DungeonRun.LearnRowIcons, "ShrineRoom", data)
+    pcall(DungeonRun.LearnRowTexts, "ShrineRoom", data, "shrine")
     local rows, total, curses, gold = DungeonRun.ShrineOffer(page, lives, data)
     local accept = total > 0
     if lives ~= nil and lives <= 1 and curses > 0 and not gold then accept = false end
@@ -9948,8 +9949,11 @@ function DungeonRun.ItemList(kind)
     end
     table.sort(learned)
     for _, id in ipairs(learned) do
+        local v = Lobby.cfg.dungeonItems[id]
         local pretty = (id:gsub("^_", ""):gsub("_", " "):gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
-        table.insert(out, { id = id, kind = kind, name = pretty, effect = DungeonRun.WIKI_EFFECTS[string.lower(pretty)] or "(seen in game)" })
+        -- (the name / effect the game's own page showed, when read: Bow / +20% Range)
+        table.insert(out, { id = id, kind = kind, name = v.name or pretty,
+            effect = v.effect or DungeonRun.WIKI_EFFECTS[string.lower(pretty)] or "(seen in game)" })
     end
     return out
 end
@@ -10076,6 +10080,7 @@ function DungeonRun.PageStep(st, page)
     if kind == "1" then
         pcall(DungeonRun.LearnRowIcons, "ShopSelection", page.data)
         pcall(DungeonRun.ReadRowPrices, "ShopSelection", page.data)
+        pcall(DungeonRun.LearnRowTexts, "ShopSelection", page.data, "shop")
     end
     if kind == "1" and (DungeonRun.mode == "Auto" or DungeonRun.autoShop ~= false) and DungeonRun.buyStop ~= seq then
         local slot, id = DungeonRun.ShopPick(page.data, money)
@@ -10092,17 +10097,14 @@ function DungeonRun.PageStep(st, page)
             DungeonRun.buyStop = DungeonRun.liveSeq or 0
         end
     elseif kind == "6" then
-        local gold = tonumber(st.goldKeys) or 0
-        -- (AA wiki: rare chests opened before the end lose the Secret Unit chance - Auto keeps them for depth 19+)
+        local gold, normal = tonumber(st.goldKeys) or 0, tonumber(st.silverKeys) or 0
+        -- (AA wiki: rare chests opened before the end lose the Secret Unit chance - Auto keeps them for depth 19+;
+        -- normal chests wait with them: a Philosopher's Stone bought later turns them rare)
         local keep = DungeonRun.mode == "Auto" or DungeonRun.goldChests == "end"
         local now = not keep or (DungeonRun.lastDepth or 0) >= 19
-        if gold > 0 and now and DungeonRun.chestTried ~= seq then
+        if now and DungeonRun.chestTried ~= seq and (gold > 0 or normal > 0) then
             DungeonRun.chestTried = seq
-            DungeonRun.status = "opening a gold chest"
-            DungeonRun.Refresh(st)
-            local ok, answer = DungeonRun.Call("dungeon_open_chest", true, st)
-            pcall(DungeonRun.Log, "dungeon_open_chest(true) -> " .. (ok and "opened" or "nothing") .. ", answered " .. clip(tostring(answer), 40))
-            pcall(Lobby.ShareLog, "dungeon: gold chest " .. (ok and "opened" or "not opened"))
+            DungeonRun.OpenChest(st, gold > 0)
             return 1
         end
     elseif kind == "7" and DungeonRun.ShrineStep(st, seq) then
@@ -10165,6 +10167,31 @@ function DungeonRun.ReadRowPrices(pageName, data)
             end
         end
     end
+end
+
+-- One chest from the chest page: dungeon_open_chest(true) = gold (seen in Watch), (false) = a normal chest
+-- (owner: it opens the same way). A call that errors or changes nothing: the page's Open button by GUI;
+-- the reward popups after it are tapped away by Lobby.ClickAnywhere. Which way worked is logged.
+function DungeonRun.OpenChest(st, gold)
+    local what = gold and "gold chest" or "chest"
+    DungeonRun.status = "opening a " .. what
+    DungeonRun.Refresh(st)
+    local ok, answer = DungeonRun.Call("dungeon_open_chest", gold, st)
+    local how = string.format("open_chest(%s)", tostring(gold))
+    if not ok then
+        local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local ui = gui and gui:FindFirstChild("DungeonUI")
+        local page = ui and ui:FindFirstChild("OpenTreasure", true)
+        local b = page and isOnScreen(page) and DungeonRun.FindButton(page, "open")
+        if b then
+            Lobby.TapGui(b)
+            how = how .. " answered " .. clip(tostring(answer), 30) .. " - tapped " .. b.Name
+        else
+            how = how .. " answered " .. clip(tostring(answer), 30) .. " - no Open button"
+        end
+    end
+    pcall(DungeonRun.Log, what .. ": " .. how)
+    pcall(Lobby.ShareLog, "dungeon: " .. what .. " - " .. (ok and "opened via " or "") .. how)
 end
 
 function DungeonRun.LiveStep(st)
@@ -10709,6 +10736,51 @@ function DungeonRun.LearnRowIcons(pageName, data)
         saveConfig()
     end
 end
+-- Each row's name and effect as the game's page shows them (rows in the order of the page data's ids):
+-- the first text that is not a number is the name, the next the effect. Kept by id in Lobby.cfg.dungeonItems.
+function DungeonRun.LearnRowTexts(pageName, data, kind)
+    if type(data) ~= "table" or #data == 0 then return end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local ui = gui and gui:FindFirstChild("DungeonUI")
+    local page = ui and ui:FindFirstChild(pageName, true)
+    if not page or not isOnScreen(page) then return end
+    local list = page:FindFirstChildWhichIsA("ScrollingFrame", true) or page
+    local rows = {}
+    for _, c in ipairs(list:GetChildren()) do
+        if c:IsA("GuiObject") then table.insert(rows, c) end
+    end
+    if #rows ~= #data then return end
+    local function order(x) local ok, v = pcall(function() return x.LayoutOrder end) return ok and tonumber(v) or 0 end
+    table.sort(rows, function(a, b)
+        if order(a) ~= order(b) then return order(a) < order(b) end
+        return a.AbsolutePosition.Y < b.AbsolutePosition.Y
+    end)
+    Lobby.cfg.dungeonItems = Lobby.cfg.dungeonItems or {}
+    local found = {}
+    for i, row in ipairs(rows) do
+        local id = type(data[i]) == "table" and tostring(data[i].id or "") or tostring(data[i])
+        local texts = {}
+        for _, d in ipairs(row:GetDescendants()) do
+            if d:IsA("TextLabel") and not d:FindFirstAncestorWhichIsA("GuiButton") then
+                local t = tostring(d.Text):gsub("<[^>]->", ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+                if t ~= "" and not t:match("^[%d%s,%.xX/]+$") then table.insert(texts, t) end
+            end
+        end
+        local name, effect = texts[1], texts[2]
+        if id ~= "" and name then
+            local v = Lobby.cfg.dungeonItems[id] or { kind = kind }
+            if v.name ~= name or v.effect ~= effect then
+                v.name, v.effect = name:gsub("^%[%*%]%s*", ""), effect
+                Lobby.cfg.dungeonItems[id] = v
+                table.insert(found, id .. "=" .. v.name .. " / " .. tostring(effect))
+            end
+        end
+    end
+    if #found > 0 then
+        pcall(DungeonRun.Log, "item names from " .. pageName .. ": " .. table.concat(found, ", "))
+        saveConfig()
+    end
+end
 -- One item for a row: name and effect from our list / the wiki, by the game's id.
 function DungeonRun.ItemInfo(id)
     id = tostring(id or "")
@@ -10885,6 +10957,21 @@ function DungeonRun.OpenSetup()
     -- chests). Back returns; everything goes to the draft until Save & Close.
     local pageFrame
     local function closePage() pcall(function() pageFrame:Destroy() end) pageFrame = nil repaint() end
+    -- (owner 2026-10-25: like the game's shop - icon, yellow name, effect under it, a WANT / ANY / AVOID
+    -- pill on the right; rows in groups: shop by what they do, shrine blessings first then curses by danger)
+    local function itemGroup(it)
+        local text = string.lower(it.name .. " " .. it.effect)
+        if it.kind == "shrine" then
+            local v, curse = DungeonRun.ItemValue(it.name .. " " .. it.effect)
+            if not curse then return 1, "Blessings" end
+            return (v <= -4) and 2 or 3, (v <= -4) and "Dangerous curses" or "Other curses"
+        end
+        if text:find("cost", 1, true) then return 1, "Cost cuts" end
+        if text:find("dmg", 1, true) or text:find("damage", 1, true) or text:find("crit", 1, true) or text:find("attack", 1, true) and not text:find("speed", 1, true) then return 2, "Damage" end
+        if text:find("range", 1, true) or text:find("speed", 1, true) or text:find("cooldown", 1, true) or text:find("slower", 1, true) then return 3, "Range & speed" end
+        if text:find("luck", 1, true) or text:find("chest", 1, true) then return 4, "Chest luck" end
+        return 5, "Special"
+    end
     local function itemList(kind, top, parent)
         local list = Instance.new("ScrollingFrame")
         list.Name, list.Position, list.Size = "List", UDim2.new(0, 8, 0, top), UDim2.new(1, -16, 0, 300 - top)
@@ -10892,31 +10979,42 @@ function DungeonRun.OpenSetup()
         list.Parent = parent
         pcall(function() Instance.new("UICorner").Parent = list end)
         local items = DungeonRun.ItemList(kind)
-        pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, #items * 62 + 8) end)
+        local sorted = {}
         for i, it in ipairs(items) do
+            local g, title = itemGroup(it)
+            table.insert(sorted, { it = it, g = g, title = title, i = i })
+        end
+        table.sort(sorted, function(a, b) if a.g ~= b.g then return a.g < b.g end return a.i < b.i end)
+        local y, lastGroup = 4, nil
+        for _, e in ipairs(sorted) do
+            local it = e.it
+            if e.g ~= lastGroup then
+                lastGroup = e.g
+                local head = label(e.title, 8, y, 300, 20, 12, list)
+                head.Name, head.TextColor3 = "Group_" .. e.title, C.dim
+                y = y + 22
+            end
             local row = Instance.new("Frame")
-            row.Name, row.Position, row.Size = "Row_" .. it.id, UDim2.new(0, 4, 0, 4 + (i - 1) * 62), UDim2.new(1, -14, 0, 58)
+            row.Name, row.Position, row.Size = "Row_" .. it.id, UDim2.new(0, 4, 0, y), UDim2.new(1, -14, 0, 58)
             row.BackgroundColor3, row.BorderSizePixel = C.panel, 0
             row.Parent = list
             pcall(function() Instance.new("UICorner").Parent = row end)
             DungeonRun.ItemIconOn(row, it, 6, 7, 44)
-            local name = label(it.name, 58, 6, 170, 20, 14, row)
+            local name = label(it.name, 58, 6, 142, 20, 14, row)
             name.TextColor3 = C.gold
-            local eff = label(it.effect, 58, 28, 170, 24, 11, row)
+            local eff = label(it.effect, 58, 28, 142, 24, 11, row)
             eff.TextColor3 = C.dim
-            local stateBtn = button("", 236, 13, 84, 32, function()
-                local p = draft.itemPrefs[it.id]
-                draft.itemPrefs[it.id] = p == nil and "prefer" or (p == "prefer" and "avoid" or nil)
-                repaint()
-            end, row)
-            stateBtn.Name = "State_" .. it.id
-            table.insert(paint, function()
-                if not stateBtn.Parent then return end
-                local p = draft.itemPrefs[it.id]
-                stateBtn.Text = p == "prefer" and "WANT" or (p == "avoid" and "AVOID" or "ANY")
-                stateBtn.BackgroundColor3 = p == "prefer" and C.prefer or (p == "avoid" and C.avoid or C.panel)
-            end)
+            -- the 3-way pill: WANT / ANY / AVOID, the chosen one lit
+            for j, o in ipairs({ { "WANT", "prefer", C.prefer }, { "ANY", nil, C.on }, { "AVOID", "avoid", C.avoid } }) do
+                local b = button(o[1], 204 + (j - 1) * 46, 15, 44, 28, function() draft.itemPrefs[it.id] = o[2] repaint() end, row)
+                b.Name, b.TextSize = "Pick_" .. it.id .. "_" .. o[1], 11
+                table.insert(paint, function()
+                    if b.Parent then b.BackgroundColor3 = draft.itemPrefs[it.id] == o[2] and o[3] or C.panel end
+                end)
+            end
+            y = y + 62
         end
+        pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, y + 4) end)
     end
     local function openPage(t)
         pcall(function() if pageFrame then pageFrame:Destroy() end end)
@@ -10946,7 +11044,7 @@ function DungeonRun.OpenSetup()
             end)
             itemList("shop", 124, page)
         elseif t == "SHRINE" then
-            label("Shrine buffs - used once the shrine's accept / deny call is recorded", 12, 92, 356, 28, 11, page)
+            label("Offers are scored and ACCEPT / DENY is tapped on the game's page (its own call is not recorded yet)", 12, 92, 356, 28, 11, page)
             itemList("shrine", 124, page)
         elseif t == "CHEST" then
             label("Gold chests", 12, 94, 100, 28, 14, page)
@@ -11003,7 +11101,10 @@ function DungeonRun.OpenSetup()
         summary.Visible = draft.mode == "Auto"
     end)
     for i, t in ipairs(DungeonRun.ROOM_TYPES) do
-        local tile = button("", 12 + (i - 1) * 72, 166, 66, 86, function() openPage(t) end)
+        -- (the tiles share the row's width: 4 since BATTLE has none - owner 2026-10-25)
+        local n = #DungeonRun.ROOM_TYPES
+        local w = math.floor((356 - (n - 1) * 8) / n)
+        local tile = button("", 12 + (i - 1) * (w + 8), 166, w, 86, function() openPage(t) end)
         DungeonRun.IconOn(tile, t, 0, 6, 40)
         local name = Instance.new("TextLabel")
         name.BackgroundTransparency, name.TextColor3, name.Font, name.TextSize = 1, C.text, Enum.Font.GothamBold, 11
@@ -11977,7 +12078,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-235313"
+Lobby.VERSION = "20261026-000519"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
