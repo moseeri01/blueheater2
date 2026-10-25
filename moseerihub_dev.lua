@@ -2952,9 +2952,12 @@ AutoPlaceModule.holdAt = {}    -- [stageKey] = when that wait began
 -- (owner 2026-10-25: units went to the front). Returns spawn, base, swapped.
 function AutoPlaceModule.Ends()
     local spawn, goal = AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos("player")
-    if State.eventMode or not (spawn and goal) then return spawn, goal, false end
+    if State.eventMode then return spawn, goal, false end
     local pts = AutoPlaceModule.PathPoints()
-    if #pts < 8 then return spawn, goal, false end
+    -- (no _BASES.pve on a map - Ant Kingdom Dungeon Room: the first recorded road point is where the
+    -- enemies came in)
+    if not spawn and goal and #pts >= 8 then return { X = pts[1][1], Y = pts[1][2], Z = pts[1][3] }, goal, false end
+    if not (spawn and goal) or #pts < 8 then return spawn, goal, false end
     local ds, dg = 0, 0
     for i = 1, 5 do
         ds = ds + math.sqrt((pts[i][1] - spawn.X) ^ 2 + (pts[i][3] - spawn.Z) ^ 2)
@@ -3590,13 +3593,19 @@ local function bestSpot(skip, role, range, kind, aoe, back)
         local weight, shortR = {}, nil
         -- (measured from our base only: maps with several spawn lanes, e.g. Dungeon city rooms)
         if not State.eventMode then
-            local far = 0
+            -- (over the road learned so far, nearest point to our base = 1: on Ant Kingdom the whole
+            -- known road was 130-210 studs from the base, 1 - d / far only spanned 0-0.37 and every
+            -- damage unit stood at the spawn end)
+            local far, near = 0, math.huge
             if goal then
-                for _, q in ipairs(pts) do far = math.max(far, math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)) end
+                for _, q in ipairs(pts) do
+                    local dq = math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)
+                    far, near = math.max(far, dq), math.min(near, dq)
+                end
             end
             for i, q in ipairs(pts) do
                 local prog = (i - 1) / math.max(1, #pts - 1)
-                if far > 0 then prog = 1 - math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2) / far end
+                if far > near then prog = (far - math.sqrt((q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2)) / (far - near) end
                 weight[i] = aoe and (0.8 + 0.4 * prog) or (0.5 + prog)
             end
             for _, tm in pairs(AutoPlaceModule.team) do
@@ -9693,7 +9702,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-163058"
+Lobby.VERSION = "20261025-173259"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
