@@ -5654,7 +5654,9 @@ AutoPlaceModule.prioTries = setmetatable({}, { __mode = "k" })
 function AutoPlaceModule.TargetStep()
     -- (event: every unit on "first" - a boss comes most waves there, and chasing it let the
     -- front enemies through; owner 2026-10-24)
-    local boss = not State.eventMode and AutoPlaceModule.Threat() == "boss on the map"
+    -- (but the LAST wave of the event: the final boss decides the game - 2026-10-25, most late losses
+    -- were exactly at wave 30 with a strong team; single-target units go for it there)
+    local boss = (not State.eventMode or AutoPlaceModule.LastWave()) and AutoPlaceModule.Threat() == "boss on the map"
     local now = os.clock()
     for _, u in ipairs(ownedUnits()) do
         local st = u:FindFirstChild("_stats")
@@ -8496,7 +8498,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-114614"
+Lobby.VERSION = "20261025-115541"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
