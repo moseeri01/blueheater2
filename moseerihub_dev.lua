@@ -1558,7 +1558,12 @@ function PlaybackModule.Play(fromGameStart)
     local folder = unitsFolder()
     if folder then
         conn = folder.ChildAdded:Connect(function(unit)
-            if gen == playGen then table.insert(replayNewUnits, { unit = unit, at = os.clock() }) end
+            if gen ~= playGen then return end
+            local stats = unit:FindFirstChild("_stats")
+            local base = stats and stats:FindFirstChild("base")
+            if base and tostring(base.Value) == "pve" then return end -- an enemy
+            table.insert(replayNewUnits, { unit = unit, at = os.clock() })
+            if #replayNewUnits > 50 then table.remove(replayNewUnits, 1) end
         end)
         replayUnitConnection = conn
     end
@@ -7548,6 +7553,24 @@ end
 
 -- AA keeps the bag in ItemInventoryServiceClient.session.inventory.inventory_profile_data;
 -- if the loader cannot be required here, find that table in memory instead.
+-- (getgc walks the whole Lua heap and the lobby asks every few seconds: the table found is
+-- kept by a weak ref and reused while it still has its items; a new walk at most once a minute)
+local gcFound = setmetatable({}, { __mode = "v" })
+local gcScanAt = {}
+local function gcFind(key, ok)
+    local c = gcFound[key]
+    if c ~= nil and ok(c) then return c end
+    if type(getgc) ~= "function" or os.clock() - (gcScanAt[key] or -math.huge) < 60 then return nil end
+    gcScanAt[key] = os.clock()
+    local found
+    pcall(function()
+        for _, v in ipairs(getgc(true)) do
+            if type(v) == "table" and ok(v) then found = v break end
+        end
+    end)
+    gcFound[key] = found
+    return found
+end
 local function inventoryData()
     local data
     pcall(function()
@@ -7555,17 +7578,14 @@ local function inventoryData()
         local svc = loader.load_client_service(script, "ItemInventoryServiceClient")
         data = svc.session.inventory.inventory_profile_data
     end)
-    if type(data) ~= "table" and type(getgc) == "function" then
-        pcall(function()
-            for _, v in ipairs(getgc(true)) do
-                if type(v) == "table" and type(rawget(v, "normal_items")) == "table" then data = v break end
-            end
-        end)
+    if type(data) ~= "table" then
+        data = gcFind("normal", function(v) return type(rawget(v, "normal_items")) == "table" end)
     end
     return type(data) == "table" and data or nil
 end
 
 -- { [item id] = count } from normal + unique items, whatever shape the game uses.
+Lobby.GcFind = gcFind
 local function itemCounts(data)
     local counts, total = {}, 0
     local function add(id, n)
@@ -8205,15 +8225,26 @@ local function listOf(v)
 end
 
 -- The run as the game holds it: the getgc table with a depth and room choices (or a shop).
+-- (perf review 2026-10-25: Read scanned getgc every 2 s on normal stages and Refresh(nil) read again -
+-- two full scans per step. Now: the last read is reused for 2 s, no scan outside a dungeon room / the
+-- lobby, and a scan that found nothing holds 25 s)
+DungeonRun.MISS_HOLD = 25
 function DungeonRun.Read()
+    local st = DungeonRun.ReadNow()
+    DungeonRun.lastRead = { os.clock(), st }
+    return st
+end
+function DungeonRun.ReadNow()
     local live = DungeonRun.live
+    if not live and not (DungeonRun.InRoom() or DungeonRun.InLobby()) then return nil end
     if not live and (DungeonRun.InLobby() or DungeonRun.ChoiceOpen()) then live = DungeonRun.FindLive() end
     if live then return DungeonRun.FromLive(live) end
     local best, bestScore
     -- the table found last time is read again while it still looks like the run
     local last = DungeonRun.runTable
     if last and DungeonRun.score(last) >= 2 then best = last end
-    if not best and type(getgc) == "function" then
+    if not best and type(getgc) == "function" and os.clock() - (DungeonRun.missAt or -1e9) >= DungeonRun.MISS_HOLD then
+        DungeonRun.missAt = os.clock()
         pcall(function()
             for _, t in ipairs(getgc(true)) do
                 if type(t) == "table" then
@@ -8231,6 +8262,7 @@ function DungeonRun.Read()
     end
     DungeonRun.runTable = best
     if not best then return nil end
+    DungeonRun.missAt = nil
     local st = { table = best }
     pcall(function()
         st.depth = select(2, findKey(best, { "^depth$", "current_depth", "^floor$", "depth", "floor" }, "number"))
@@ -8302,7 +8334,10 @@ end
 
 function DungeonRun.Refresh(st)
     if not UIRef.dungeonStatus then return end
-    if st == nil then st = DungeonRun.Read() end
+    if st == nil then
+        local last = DungeonRun.lastRead
+        if last and os.clock() - last[1] < 2 then st = last[2] or false else st = DungeonRun.Read() end
+    end
     pcall(function() UIRef.dungeonStatus:UpdateBody(DungeonRun.StatusText(st)) end)
 end
 
@@ -8366,9 +8401,12 @@ function DungeonRun.Call(name, arg, before)
         return true
     end)
     local deadline = os.clock() + 5
+    local legacy = before ~= nil and not before.live
     while os.clock() < deadline do
-        local now = DungeonRun.Read()
-        if now and before and DungeonRun.Changed(before, now) then return true, res end
+        if legacy then
+            local now = DungeonRun.Read()
+            if now and DungeonRun.Changed(before, now) then return true, res end
+        end
         -- (live run: the game answers a room with dungeon_selected_changed, then teleports)
         if (DungeonRun.selSeq or 0) ~= sel or (DungeonRun.liveSeq or 0) ~= seq then return true, res end
         task.wait(0.25)
@@ -8446,7 +8484,7 @@ end
 --   screen          detected by                                    action (who)                     next screen
 --   click_continue  TextLabel "(Click anywhere to continue)"       tap the popup (Lobby.ClickAnywhere) next reward / room result
 --   you_died        label "You Died!"                              Continue, then chests, continue_death, lobby (Lobby.DiedStep) run over -> lobby
---   shrine_page     DungeonUI ShrineRoom on screen / page _t "7"   accept by GUI (ShrineStep)        room choice
+--   shrine_page     DungeonUI ShrineRoom on screen / page _t "7"   offer scored: ACCEPT or DENY (ShrineStep) room choice
 --   shop_page       DungeonUI ShopSelection / page _t "1"          buy_shop + continue_shop (PageStep) next page / room choice
 --   chest_page      DungeonUI OpenTreasure / page _t "6"           open_chest(true) + continue_shop  room choice
 --   room_popup      DungeonUI button "Enter" (LevelInfo)           Enter after 8 s (EnterPopupStep)  loading into the room
@@ -8458,7 +8496,7 @@ end
 --   run over        dungeon_changed({})                            next run when keys (TryStart)     start page / lobby
 DungeonRun.PRIMARY = {
     room_popup = { "enter" }, room_result = { "next", "open dungeon" }, chest_page = { "open", "continue", "close" },
-    shop_page = { "continue", "leave", "close" }, shrine_page = { "accept", "take", "claim" }, start_page = { "start" },
+    shop_page = { "continue", "leave", "close" }, shrine_page = {}, start_page = { "start" },   -- (shrine: ShrineStep decides)
     room_choice = {},
 }
 function DungeonRun.Screen()
@@ -8541,10 +8579,7 @@ function DungeonRun.Watchdog()
                 table.insert(lines, d:GetFullName() .. " | " .. d.ClassName .. ((d:IsA("TextLabel") or d:IsA("TextButton")) and (" | text=" .. clip(tostring(d.Text), 50)) or ""))
             end
         end
-        local path = "AAMacro/dungeon_ui_dump.txt"
-        local old = isfile(path) and readfile(path) or ""
-        if #old > 300000 then old = "" end
-        writefile(path, old .. "\n" .. table.concat(lines, "\n"))
+        DungeonRun.Append("AAMacro/dungeon_ui_dump.txt", "\n" .. table.concat(lines, "\n"), 300000)
     end)
     saveConfig()
 end
@@ -8566,10 +8601,88 @@ function DungeonRun.EnterPopupStep()
     pcall(Lobby.ShareLog, "dungeon: room popup open 8 s - tapped Enter")
     pcall(DungeonRun.Log, "room popup open 8 s - tapped Enter (" .. enter:GetFullName() .. ")")
 end
--- After a SHRINE room the game shows its offer (page _t "7", DungeonUI ShrineRoom). The accept call
--- is not recorded yet: the page's accept / take button is tapped by GUI and logged (its path goes to
--- dungeon_log for the remote later). false = no such button: left to the player.
-DungeonRun.SHRINE_WORDS = { "accept", "take", "claim", "yes" }
+-- After a SHRINE room the game shows its offer (page _t "7", DungeonUI ShrineRoom): "Do you accept the
+-- shrine's offer?", rows under "YOU WILL RECEIVE:" (name + effect; curses marked [*]) and ACCEPT / DENY
+-- (owner screenshot 2026-10-25). Every row is read (the list scrolls: hidden rows too) and scored -
+-- buffs and chests plus, curses minus by how bad they are for this team - ACCEPT when the total is
+-- above 0; with 1 life left any curse is DENIED unless a gold chest comes with it. The accept / deny
+-- call is not recorded yet: the button is tapped by GUI (Watch logs the call the game sends).
+DungeonRun.SHRINE_GOOD = { { "philosoph", 5 }, { "gold", 4 }, { "rare chest", 4 }, { "cost", 3 }, { "attack cooldown", 3 }, { "boots", 3 },
+    { "attack speed", 3 }, { "chest", 2.5 }, { "damage", 2.5 }, { "dmg", 2.5 }, { "attack", 2 }, { "range", 1.5 }, { "luck", 1 } }
+DungeonRun.SHRINE_BAD = { { "fly", 6 }, { "flight", 6 }, { "armor", 2.5 }, { "health", 2.5 }, { "hp", 2.5 }, { "speed", 2.5 },
+    { "faster", 2.5 }, { "frenzy", 2.5 }, { "wind", 2.5 }, { "regen", 2 }, { "vampir", 2 }, { "shield", 2 }, { "burst", 2 },
+    { "explo", 2 }, { "erupt", 2 }, { "chaos", 3 }, { "money", 0.8 }, { "hoard", 0.8 }, { "shop", 0.8 } }
+DungeonRun.SHRINE_SKIP = { "shrine", "accept", "deny", "do you accept", "you will receive" }
+-- The offer's rows, each "name / effect" with its value. The page data names the offer by item id
+-- ({ _t = "7", data = { {id = "boots"}, {id = "chest_mock_item"}, {id = "_curse_super_armored"} } }, device
+-- 21:31 2026-10-25); without it the page's rows are read: every label under one row of the list joined
+-- (the effect wraps: "... Armored Enemies" + "Chance"), resource numbers at the bottom skipped.
+function DungeonRun.ShrineRows(page, data)
+    local rows = {}
+    for _, it in ipairs(type(data) == "table" and data or {}) do
+        local id = type(it) == "table" and tostring(it.id or "") or tostring(it)
+        if id ~= "" then
+            local text = id
+            for _, kind in ipairs({ "shrine", "shop" }) do
+                for _, item in ipairs(DungeonRun.ItemList(kind)) do
+                    if item.id == id then text = id .. " / " .. item.name .. " / " .. item.effect end
+                end
+            end
+            if id:find("^_curse") and not text:lower():find("curse", 1, true) then text = text .. " / curse" end
+            table.insert(rows, text)
+        end
+    end
+    if #rows > 0 or not page then return rows end
+    local list = page:FindFirstChildWhichIsA("ScrollingFrame", true) or page
+    local groups, order = {}, {}
+    for _, d in ipairs(list:GetDescendants()) do
+        if d:IsA("TextLabel") and not d:FindFirstAncestorWhichIsA("GuiButton") then
+            local t = tostring(d.Text):gsub("<[^>]->", ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+            local low, skip = string.lower(t), t == "" or t:match("^[%d%s,%.xX/]+$") ~= nil
+            for _, w in ipairs(DungeonRun.SHRINE_SKIP) do
+                if low == w or low:find(w, 1, true) == 1 then skip = true end
+            end
+            if not skip then
+                -- the row: the label's ancestor right under the list
+                local key = d
+                while key.Parent and key.Parent ~= list do key = key.Parent end
+                if not groups[key] then groups[key] = {} table.insert(order, key) end
+                table.insert(groups[key], t)
+            end
+        end
+    end
+    for _, key in ipairs(order) do table.insert(rows, table.concat(groups[key], " ")) end
+    return rows
+end
+function DungeonRun.ShrineOffer(page, lives, data)
+    local rows, total, curses, gold = {}, 0, 0, false
+    local air = DungeonRun.TeamHitsAir()
+    for _, text in ipairs(DungeonRun.ShrineRows(page, data)) do
+        local low = string.lower(text)
+        local value = 0
+        if low:find("curse", 1, true) or text:find("[*]", 1, true) then
+            curses = curses + 1
+            value = -2
+            for _, b in ipairs(DungeonRun.SHRINE_BAD) do
+                if low:find(b[1], 1, true) then
+                    value = -b[2]
+                    if (b[1] == "fly" or b[1] == "flight") and air then value = -1.5 end
+                    break
+                end
+            end
+            if lives ~= nil and lives <= 2 then value = value * 1.5 end
+        else
+            value = 1
+            for _, g in ipairs(DungeonRun.SHRINE_GOOD) do
+                if low:find(g[1], 1, true) then value = g[2] break end
+            end
+            if low:find("gold", 1, true) or low:find("rare chest", 1, true) or low:find("philosoph", 1, true) then gold = true end
+        end
+        total = total + value
+        table.insert(rows, string.format("%s (%+.1f)", text, value))
+    end
+    return rows, total, curses, gold
+end
 function DungeonRun.ShrineStep(st, seq)
     if DungeonRun.shrineTried == seq then
         DungeonRun.status = "shrine: waiting for the game"
@@ -8579,31 +8692,29 @@ function DungeonRun.ShrineStep(st, seq)
     local ui = gui and gui:FindFirstChild("DungeonUI")
     local page = ui and ui:FindFirstChild("ShrineRoom", true)
     if not page or not isOnScreen(page) then return false end
-    for _, w in ipairs(DungeonRun.SHRINE_WORDS) do
-        for _, b in ipairs(page:GetDescendants()) do
-            if b:IsA("GuiButton") and isOnScreen(b) then
-                local text = string.lower(b.Name)
-                if b:IsA("TextButton") then text = text .. " " .. string.lower(tostring(b.Text)) end
-                for _, d in ipairs(b:GetDescendants()) do
-                    if d:IsA("TextLabel") then text = text .. " " .. string.lower(tostring(d.Text)) end
-                end
-                if text:find(w, 1, true) then
-                    DungeonRun.shrineTried = seq
-                    Lobby.TapGui(b)
-                    DungeonRun.status = "shrine: tapped " .. b.Name
-                    pcall(Lobby.ShareLog, "dungeon: shrine - tapped " .. b.Name)
-                    pcall(DungeonRun.Log, "shrine page - tapped " .. b:GetFullName() .. " (" .. text .. ")")
-                    DungeonRun.Refresh(st)
-                    return true
-                end
-            end
-        end
-    end
-    return false
+    local lives = st and st.hearts or DungeonRun.lives
+    local live = type(DungeonRun.live) == "table" and DungeonRun.live.current_shops
+    local data = type(live) == "table" and type(live[1]) == "table" and tostring(live[1]._t) == "7" and live[1].data or nil
+    local rows, total, curses, gold = DungeonRun.ShrineOffer(page, lives, data)
+    local accept = total > 0
+    if lives ~= nil and lives <= 1 and curses > 0 and not gold then accept = false end
+    local button = DungeonRun.FindButton(page, accept and "accept" or "deny")
+    if not button then return false end
+    DungeonRun.shrineTried = seq
+    Lobby.TapGui(button)
+    local line = string.format("SHRINE %s: %s | score %.1f%s", accept and "accept" or "deny", table.concat(rows, "; "), total,
+        (lives ~= nil and lives <= 1 and curses > 0 and not gold) and " (1 life: no curses)" or "")
+    DungeonRun.status = "shrine: " .. (accept and "accepted" or "denied")
+    pcall(Lobby.ShareLog, "dungeon: " .. line)
+    pcall(DungeonRun.Log, line .. " - tapped " .. button:GetFullName())
+    DungeonRun.Refresh(st)
+    return true
 end
 
 function DungeonRun.Step()
     pcall(DungeonRun.EnterPopupStep)
+    -- (the shrine page also opens inside the room, over the map, right after the win - 2026-10-25)
+    pcall(DungeonRun.ShrineStep, nil, DungeonRun.liveSeq or 0)
     pcall(DungeonRun.ScanData)
     pcall(DungeonRun.LearnIcons)
     pcall(DungeonRun.LearnItemIcons)
@@ -8811,12 +8922,25 @@ end
 
 -- Every dungeon_changed / dungeon_selected_changed payload and screen read, for checking the
 -- _t map after a run (lobby_watch keeps only 20 KB): AAMacro/dungeon_log.txt, last ~200 KB.
-function DungeonRun.Log(text)
+-- Adds text to a file: appendfile when the executor has it (the whole file is not rewritten per line),
+-- trimmed to the last 3/4 of cap every 100 appends; else read + write.
+function DungeonRun.Append(path, text, cap)
     if not hasFileApi() then return end
-    local path = "AAMacro/dungeon_log.txt"
+    if type(appendfile) == "function" and isfile(path) then
+        appendfile(path, text)
+        DungeonRun.appends = (DungeonRun.appends or 0) + 1
+        if DungeonRun.appends % 100 == 0 then
+            local old = readfile(path)
+            if #old > cap then writefile(path, old:sub(-math.floor(cap * 0.75))) end
+        end
+        return
+    end
     local old = isfile(path) and readfile(path) or ""
-    if #old > 200000 then old = old:sub(-150000) end
-    writefile(path, old .. os.date("%H:%M:%S ") .. text .. "\n")
+    if #old > cap then old = old:sub(-math.floor(cap * 0.75)) end
+    writefile(path, old .. text)
+end
+function DungeonRun.Log(text)
+    DungeonRun.Append("AAMacro/dungeon_log.txt", os.date("%H:%M:%S ") .. text .. "\n", 200000)
 end
 function DungeonRun.LiveRooms(nextT)
     local rooms = {}
@@ -8835,7 +8959,8 @@ function DungeonRun.LiveRooms(nextT)
 end
 -- the game's own copy of the run (lobby after a reload, before any dungeon_changed came)
 function DungeonRun.FindLive()
-    if os.clock() - (DungeonRun.findAt or -1e9) < 10 then return DungeonRun.liveGc end
+    local hold = DungeonRun.liveGc and 10 or DungeonRun.MISS_HOLD
+    if os.clock() - (DungeonRun.findAt or -1e9) < hold then return DungeonRun.liveGc end
     DungeonRun.findAt = os.clock()
     DungeonRun.liveGc = nil
     if type(getgc) ~= "function" then return nil end
@@ -9656,10 +9781,7 @@ function DungeonRun.DumpPages()
                     table.insert(lines, table.concat(parts, " | "))
                 end)
             end
-            local path = "AAMacro/dungeon_pages_dump.txt"
-            local old = isfile(path) and readfile(path) or ""
-            if #old > 300000 then old = "" end
-            writefile(path, old .. table.concat(lines, "\n") .. "\n")
+            DungeonRun.Append("AAMacro/dungeon_pages_dump.txt", table.concat(lines, "\n") .. "\n", 300000)
             pcall(Lobby.ShareLog, "dungeon: dumped page " .. name)
         end
     end
@@ -10134,7 +10256,12 @@ end
 Tools.perf = { lowGraphics = false, hideEffects = false, noDecor = false, white = false, fpsCap = "Off" }
 Tools.perfSaved = { lit = {}, fx = setmetatable({}, { __mode = "k" }), decor = setmetatable({}, { __mode = "k" }) }
 Tools.fxClasses = { "ParticleEmitter", "Trail", "Beam", "Smoke", "Fire", "Sparkles" }
+Tools.fxCheck = { BillboardGui = true }
+for _, cls in ipairs(Tools.fxClasses) do Tools.fxCheck[cls] = true end
 function ToolsModule.HideEffect(d)
+    -- (runs for every new instance in workspace: parts, enemies... - leave at once unless the
+    -- class is one we hide)
+    if not Tools.fxCheck[d.ClassName] then return end
     local saved = Tools.perfSaved.fx
     pcall(function()
         for _, cls in ipairs(Tools.fxClasses) do
@@ -10572,7 +10699,7 @@ function AutoPlaceModule.StageLine()
     local wave = getCurrentWave and getCurrentWave() or 0
     return stage .. (wave and wave > 0 and (" · Wave " .. wave) or "")
 end
-function AutoPlaceModule.HomeLine()
+function AutoPlaceModule.HomeLine(text)
     local parts = { AutoPlace.enabled and (AutoPlace.preset == "Safe" and "Safe" or "Fast farm") or "AUTO off" }
     local where = AutoPlaceModule.StageLine and AutoPlaceModule.StageLine() or tostring(State.stage or "Lobby")
     table.insert(parts, where)
@@ -10581,7 +10708,7 @@ function AutoPlaceModule.HomeLine()
     else
         local units = #ownedUnits()
         if units > 0 then table.insert(parts, units .. " units") end
-        local first = (AutoPlaceModule.StatusText and select(2, pcall(AutoPlaceModule.StatusText)) or ""):match("Status: ([^\n]*)")
+        local first = (text or (AutoPlaceModule.StatusText and select(2, pcall(AutoPlaceModule.StatusText))) or ""):match("Status: ([^\n]*)")
         table.insert(parts, first or AutoPlaceModule.status or "Off")
         local card = State.eventMode and Lobby.cardsTaken and Lobby.cardsTaken[#Lobby.cardsTaken]
         if card then table.insert(parts, "Card: " .. tostring(card[2])) end
@@ -10589,8 +10716,13 @@ function AutoPlaceModule.HomeLine()
     if DungeonRun.enabled and DungeonRun.status then table.insert(parts, "Dungeon: " .. tostring(DungeonRun.status)) end
     return table.concat(parts, " · ")
 end
-AutoPlaceModule.refreshHome = function()
-    pcall(function() UIRef.homeStatus:UpdateBody(AutoPlaceModule.HomeLine()) end)
+-- (text: the StatusText already built this tick, so it is not built twice)
+local lastHome
+AutoPlaceModule.refreshHome = function(text)
+    local line = AutoPlaceModule.HomeLine(text)
+    if line == lastHome then return end
+    lastHome = line
+    pcall(function() UIRef.homeStatus:UpdateBody(line) end)
 end
 end
 
@@ -10633,8 +10765,12 @@ Controls.showDetails = UIRef.more:Toggle({
     Callback = function(on) AutoPlace.showDetails = on; saveConfig(); pcall(AutoPlaceModule.refreshUI) end,
 }, "AutoPlaceDetails")
 local placeStatus = UIRef.more:Paragraph({ Header = "Placing", Body = "Off" })
-AutoPlaceModule.refreshUI = function()
-    pcall(function() placeStatus:UpdateBody(AutoPlaceModule.StatusText()) end)
+local lastPlacing
+AutoPlaceModule.refreshUI = function(text)
+    text = text or AutoPlaceModule.StatusText()
+    if text == lastPlacing then return end
+    lastPlacing = text
+    pcall(function() placeStatus:UpdateBody(text) end)
 end
 end
 
@@ -10959,7 +11095,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-215004"
+Lobby.VERSION = "20261025-222144"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -11184,6 +11320,9 @@ end
 -- 2 s apart; each item's text logged once. Never while a room choice is open (it needs a real choice).
 Lobby.CLICK_WORDS = { "click anywhere", "tap anywhere" }
 function Lobby.ClickLabel()
+    return (Scan.Cached("clickAnywhere", Lobby.FindClickLabel))
+end
+function Lobby.FindClickLabel()
     local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     for _, d in ipairs(gui and gui:GetDescendants() or {}) do
         if d:IsA("TextLabel") then
@@ -11405,9 +11544,9 @@ function Lobby.ButtonFor(text, root)
     local want = string.lower(tostring(text)):gsub("^%s+", ""):gsub("%s+$", "")
     root = root or Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
     for _, d in ipairs(root and root:GetDescendants() or {}) do
-        if (d:IsA("TextLabel") or d:IsA("TextButton")) and isOnScreen(d) and not isOwnGui(d) then
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
             local plain = string.lower(tostring(d.Text)):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
-            if plain == want then
+            if plain == want and isOnScreen(d) and not isOwnGui(d) then
                 -- the label itself or its closest container that holds a button (the card's
                 -- own frame comes before the frame holding all the cards)
                 local node = d
@@ -12140,13 +12279,7 @@ function Lobby.Bag()
     -- the service's copy may hold no unique items: then the table the game report reads
     -- (found in memory by its unique_items list, portals listed there with uuids)
     local function hasUniques(d) return type(d) == "table" and type(d.unique_items) == "table" and next(d.unique_items) ~= nil end
-    if not hasUniques(data) and type(getgc) == "function" then
-        pcall(function()
-            for _, v in ipairs(getgc(true)) do
-                if type(v) == "table" and hasUniques(v) then data = v break end
-            end
-        end)
-    end
+    if not hasUniques(data) then data = Lobby.GcFind("uniques", hasUniques) or data end
     for k, v in pairs(data and type(data.unique_items) == "table" and data.unique_items or {}) do
         if type(v) == "table" then
             local id, uuid = v.item_id or v.id, v.uuid or (type(k) == "string" and k or nil)
@@ -12744,6 +12877,21 @@ end)
 
 -- Heartbeat
 local nextRefresh, lastListedCount = 0, -1
+-- Auto Place / Home status: once a second off the frame thread (owner 2026-10-25: lag). The
+-- status text is built once per tick for both paragraphs; nothing is built while the window
+-- is hidden (MacLib Window:GetState, when it has one).
+task.spawn(function()
+    while not State.unloaded do
+        local okShown, shown = pcall(function() return Window:GetState() end)
+        if not (okShown and shown == false) then
+            local ok, text = pcall(AutoPlaceModule.StatusText)
+            text = ok and text or nil
+            if AutoPlace.enabled and AutoPlaceModule.refreshUI then pcall(AutoPlaceModule.refreshUI, text) end
+            if AutoPlaceModule.refreshHome then pcall(AutoPlaceModule.refreshHome, text) end
+        end
+        task.wait(1)
+    end
+end)
 local nextWaveCheck = 0
 table.insert(State.connections, RunService.Heartbeat:Connect(function()
     local now = os.clock()
@@ -12769,8 +12917,6 @@ table.insert(State.connections, RunService.Heartbeat:Connect(function()
         nextRefresh = now + 0.5
         refreshStatus()
         if UnitAI.autoBuff or UnitAI.autoAbilities then refreshUnitStatus() end
-        if AutoPlace.enabled and AutoPlaceModule.refreshUI then AutoPlaceModule.refreshUI() end
-        if AutoPlaceModule.refreshHome then AutoPlaceModule.refreshHome() end
         if #State.actions ~= lastListedCount then
             lastListedCount = #State.actions
             refreshActionList()
