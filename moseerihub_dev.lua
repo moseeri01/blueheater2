@@ -8155,12 +8155,15 @@ function DungeonRun.FindLive()
     DungeonRun.findAt = os.clock()
     DungeonRun.liveGc = nil
     if type(getgc) ~= "function" then return nil end
+    -- (old copies stay in memory after the run moves on: depth 18 was "entered" four times while the
+    -- run went 18 -> 21, 17:12-17:42 2026-10-25. The copy with the deepest rooms is the current one)
     pcall(function()
+        local bestDepth = -1
         for _, t in ipairs(getgc(true)) do
-            if type(t) == "table" and type(rawget(t, "next")) == "table" and (rawget(t, "_started") ~= nil or rawget(t, "_resources") ~= nil)
-                and #DungeonRun.LiveRooms(rawget(t, "next")) > 0 then
-                DungeonRun.liveGc = t
-                break
+            if type(t) == "table" and type(rawget(t, "next")) == "table" and (rawget(t, "_started") ~= nil or rawget(t, "_resources") ~= nil) then
+                local rooms = DungeonRun.LiveRooms(rawget(t, "next"))
+                local d = rooms[1] and rooms[1].depth or -1
+                if #rooms > 0 and d > bestDepth then DungeonRun.liveGc, bestDepth = t, d end
             end
         end
     end)
@@ -8229,16 +8232,18 @@ function DungeonRun.TeamShare()
     return share
 end
 
-DungeonRun.DIFF_W = 2        -- score lost per 1.0 of _lobby_difficulty_scale
-DungeonRun.LOW_LIVES = 1     -- lives at or below this: the easiest room wins (difficulty x5)
+DungeonRun.LOW_LIVES = 1     -- lives at or below this: weaknesses are not trusted, the easiest room wins
 DungeonRun.LOOKAHEAD = 0.3   -- part of the best room after it that counts
--- One room's score: our damage its weaknesses amplify, minus what it resists, minus difficulty.
+-- One room's score = - effective difficulty: the room's difficulty scale divided by how much its
+-- weaknesses raise our team's damage (our share of that type x (amplification - 1)), times what it
+-- resists. (The old score took difficulty x2 minus the weakness bonus: difficulty grows with depth,
+-- so every option sat near -10 and a x3.7 weakness on our type hardly counted - 2026-10-25)
 function DungeonRun.ScoreRoom(r, share, lives)
     local l = r.l or {}
-    local s = 0
+    local mult = 1
     for _, w in ipairs(DungeonRun.AsList(l._weak_against)) do
         if type(w) == "table" then
-            s = s + (share[DungeonRun.Norm(w.damage_type)] or 0) * math.max(0, (tonumber(w.amplification) or 1) - 1)
+            mult = mult + (share[DungeonRun.Norm(w.damage_type)] or 0) * math.max(0, (tonumber(w.amplification) or 1) - 1)
         end
     end
     -- (no _strong_against seen yet: a factor below 1 = damage taken, above 1 = divided, none = half)
@@ -8246,10 +8251,29 @@ function DungeonRun.ScoreRoom(r, share, lives)
         local kind = type(w) == "table" and w.damage_type or w
         local a = type(w) == "table" and tonumber(w.amplification)
         local m = (a and a < 1 and a) or (a and a > 1 and 1 / a) or 0.5
-        s = s - (share[DungeonRun.Norm(kind)] or 0) * (1 - m)
+        mult = mult * math.max(0.1, 1 - (share[DungeonRun.Norm(kind)] or 0) * (1 - m))
     end
-    local low = lives ~= nil and lives <= DungeonRun.LOW_LIVES
-    return s - (low and DungeonRun.DIFF_W * 5 or DungeonRun.DIFF_W) * (tonumber(l._lobby_difficulty_scale) or 1)
+    if lives ~= nil and lives <= DungeonRun.LOW_LIVES then mult = 1 end
+    local scale = tonumber(l._lobby_difficulty_scale) or 1
+    r.mult, r.eff = mult, scale / mult
+    return -r.eff
+end
+-- One option for the log: "2 Ant Kingdom [CHEST] diff 4.31 weak dark x3.0 (ours 18%) lightning x3.7 -> eff 3.31 score -4.20"
+function DungeonRun.OptionLine(r, share)
+    local weak = {}
+    for _, w in ipairs(DungeonRun.AsList(r.l and r.l._weak_against)) do
+        if type(w) == "table" then
+            local ours = share[DungeonRun.Norm(w.damage_type)] or 0
+            table.insert(weak, string.format("%s x%.1f%s", DungeonRun.Norm(w.damage_type), tonumber(w.amplification) or 1,
+                ours > 0 and string.format(" (ours %d%%)", math.floor(ours * 100 + 0.5)) or ""))
+        end
+    end
+    for _, w in ipairs(DungeonRun.AsList(r.l and r.l._strong_against)) do
+        table.insert(weak, "strong " .. DungeonRun.Norm(type(w) == "table" and w.damage_type or w))
+    end
+    return string.format("%s %s [%s] diff %.2f %s-> eff %.2f score %.2f", tostring(r.id), tostring(r.label or "?"), DungeonRun.TypeText(r),
+        tonumber(r.l and r.l._lobby_difficulty_scale) or 1, #weak > 0 and ("weak " .. table.concat(weak, " ") .. " ") or "no weakness ",
+        r.eff or 0, r.score or 0)
 end
 -- Auto mode: the best scored room (plus a part of the best one after it); room types, when the
 -- data names them, break ties by Room priority; shrines only when allowed.
@@ -8267,9 +8291,10 @@ function DungeonRun.AutoPick(rooms, lives)
         if after then sc = sc + DungeonRun.LOOKAHEAD * after end
         local rank = r.type and table.find(order, r.type)
         if rank then sc = sc + 0.01 * (#order - rank + 1) end
+        -- WANT / AVOID types: 10% / 15% of this room's effective difficulty
         for t, p in pairs(DungeonRun.prefs or {}) do
             if DungeonRun.HasType(r, t) then
-                if p == "prefer" then sc = sc + DungeonRun.PREF_W elseif p == "avoid" then sc = sc - DungeonRun.PREF_W end
+                if p == "prefer" then sc = sc + 0.1 * (r.eff or 1) elseif p == "avoid" then sc = sc - 0.15 * (r.eff or 1) end
             end
         end
         if DungeonRun.HasType(r, "SHRINE") and not DungeonRun.ShrineOK(lives) then sc = sc - 100 end
@@ -8396,8 +8421,18 @@ function DungeonRun.LiveStep(st)
     DungeonRun.status = string.format("entering %s %s (%s)", arg, tostring(room.label or "?"), tostring(why))
     DungeonRun.Refresh(st)
     local team = {}
-    for k, v in pairs(DungeonRun.TeamShare()) do table.insert(team, string.format("%s %d%%", k, math.floor(v * 100 + 0.5))) end
+    local share = DungeonRun.TeamShare()
+    for k, v in pairs(share) do table.insert(team, string.format("%s %d%%", k, math.floor(v * 100 + 0.5))) end
     table.sort(team)
+    -- every option with its numbers, so a pick can be checked afterwards
+    pcall(function()
+        if DungeonRun.mode == "Auto" then DungeonRun.AutoPick(st.rooms, st.hearts) end
+        local opts = {}
+        for _, r in ipairs(st.rooms) do table.insert(opts, DungeonRun.OptionLine(r, share)) end
+        local line = string.format("depth %s lives %s options: %s -> pick %s", tostring(st.depth), tostring(st.hearts), table.concat(opts, " | "), arg)
+        DungeonRun.Log(line)
+        Lobby.ShareLog("dungeon: " .. line)
+    end)
     pcall(Lobby.ShareLog, string.format("dungeon: depth %s %s -> room %s %s (%s) lives %s team %s", tostring(st.depth), DungeonRun.mode, arg,
         tostring(room.label), tostring(why), tostring(st.hearts), table.concat(team, ", ")))
     local changed, answer = DungeonRun.Call("dungeon_enter_room", arg, st)
@@ -8521,8 +8556,8 @@ for name, fn in pairs({ dungeon_changed = function(p) pcall(DungeonRun.OnChanged
 end
 
 -- Room preferences from the Setup window: prefs[type] = "prefer" | "avoid" | nil. They become
--- the priority order (prefer, then neutral, then avoid) and a +/- PREF_W score in Auto.
-DungeonRun.PREF_W = 0.5
+-- the priority order (prefer, then neutral, then avoid) and, in Auto, a bonus / penalty of 10% / 15%
+-- of the room's effective difficulty (DungeonRun.AutoPick).
 function DungeonRun.ApplyPrefs()
     local prefs = DungeonRun.prefs or {}
     local order = {}
@@ -8552,7 +8587,11 @@ function DungeonRun.AutoReason(r)
         local gain = type(w) == "table" and (share[DungeonRun.Norm(w.damage_type)] or 0) * ((tonumber(w.amplification) or 1) - 1) or 0
         if gain > 0 and (not bestGain or gain > bestGain) then best, bestGain = w, gain end
     end
-    if best then return string.format("weak to %s x%.1f", DungeonRun.Norm(best.damage_type), tonumber(best.amplification) or 1) end
+    DungeonRun.ScoreRoom(r, share, DungeonRun.lives)
+    if best then
+        return string.format("weak to %s x%.1f, +%d%% dmg", DungeonRun.Norm(best.damage_type), tonumber(best.amplification) or 1,
+            math.floor(((r.mult or 1) - 1) * 100 + 0.5))
+    end
     return string.format("easiest x%.2f", tonumber(r.l._lobby_difficulty_scale) or 1)
 end
 
@@ -8654,6 +8693,45 @@ function DungeonRun.FindIcons()
     end
     return icons
 end
+-- One dump per script load of the Dungeon Run window while its room choice is open (AAMacro/
+-- dungeon_ui_dump.txt): every descendant of the room area with path, class, text, image + sprite
+-- rect, visibility, position and size - icon learning matched the depth slider, not the tiles,
+-- in the real game (17:32-17:50 2026-10-25), so the tile layout has to be seen first.
+function DungeonRun.DumpUI()
+    if DungeonRun.uiDumped or not hasFileApi() then return end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local ui = gui and gui:FindFirstChild("DungeonUI")
+    if not ui or (ui:IsA("LayerCollector") and not ui.Enabled) then return end
+    local area = ui:FindFirstChild("LevelSelection", true)
+    local areaShown = area ~= nil and isOnScreen(area)
+    if not areaShown and not DungeonRun.ChoiceOpen() then return end
+    DungeonRun.uiDumped = true
+    local root = areaShown and area or ui
+    local lines = { "# DungeonUI dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " root " .. root:GetFullName() }
+    for _, d in ipairs(root:GetDescendants()) do
+        if #lines >= 600 then table.insert(lines, "... (capped at 600 lines)") break end
+        pcall(function()
+            local parts = { (d:GetFullName():gsub("^.-DungeonUI%.", "")), d.ClassName }
+            if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then table.insert(parts, "text=" .. clip(tostring(d.Text), 50)) end
+            if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+                table.insert(parts, "image=" .. tostring(d.Image))
+                pcall(function()
+                    local o, z = d.ImageRectOffset, d.ImageRectSize
+                    if z and (z.X > 0 or z.Y > 0) then table.insert(parts, string.format("rect=%d,%d %dx%d", o.X, o.Y, z.X, z.Y)) end
+                end)
+            end
+            if d:IsA("GuiObject") then
+                table.insert(parts, "visible=" .. tostring(isOnScreen(d)))
+                local p, z = d.AbsolutePosition, d.AbsoluteSize
+                if p and z then table.insert(parts, string.format("at=%d,%d size=%dx%d", p.X, p.Y, z.X, z.Y)) end
+            end
+            table.insert(lines, table.concat(parts, " | "))
+        end)
+    end
+    writefile("AAMacro/dungeon_ui_dump.txt", table.concat(lines, "\n"))
+    pcall(Lobby.ShareLog, "dungeon: wrote dungeon_ui_dump.txt (" .. #lines .. " lines)")
+end
+
 -- Learn while the room choice is on screen (every 15 s at most, until every room type has one).
 function DungeonRun.LearnIcons()
     if os.clock() - (DungeonRun.iconsAt or -1e9) < 15 then return end
@@ -9702,7 +9780,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-173259"
+Lobby.VERSION = "20261025-180012"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -9938,6 +10016,7 @@ function Lobby.Loop()
             end)
         end
         if State.eventMode and not inLobbyNow then pcall(Lobby.SampleDepth) end
+        pcall(DungeonRun.DumpUI)
         -- (Dungeon Run "You Died!" - all lives lost, the run is over: its Continue collects the rewards
         -- and leaves. Left alone it sat there until the idle kick - 2026-10-25)
         if not inLobbyNow then
@@ -10145,7 +10224,9 @@ function Lobby.CardGain(opt)
     for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
         local t, stat, a = tostring(e.type), tostring(e.stat), math.abs(tonumber(e.amount) or 0)
         if t == "resource_gain" then return nil
-        elseif t == "stat_mul" and stat == "damage" then gain = gain + 1.0 * a
+        -- (1.3: Attack I +12%% must beat Range I +15%% - owner order damage first; shared games took
+        -- Range I over and over in mid-game losses, 2026-10-25)
+        elseif t == "stat_mul" and stat == "damage" then gain = gain + 1.3 * a
         elseif t == "stat_mul" and stat == "range" then gain = gain + 0.9 * a
         elseif t == "stat_mul" and stat == "attack_cooldown" then gain = gain + 0.8 * a
         else gain = gain + 0.3 * a
