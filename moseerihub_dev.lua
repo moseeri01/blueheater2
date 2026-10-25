@@ -4637,7 +4637,9 @@ local function upgradeStep(money, onlyRole, airOnly, noWait)
     -- (not once the base is hit, and only to wave 5 on a short road: on Snowy Town every damage unit
     -- sat at level 0 while bulma reached 5, lost at wave 7)
     local earlyNoCarry = State.eventMode and not AutoPlaceModule.danger
-        and AutoPlaceModule.WaveNumber() < (AutoPlaceModule.shortRoad and 5 or 10)
+        -- (to wave 6 only, 4 on a short road: solo games with no main on the bar left every damage
+        -- unit at level 0 while the farms reached 4, and died at waves 8-11 - shared data 2026-10-25)
+        and AutoPlaceModule.WaveNumber() < (AutoPlaceModule.shortRoad and 4 or 6)
         and AutoPlaceModule.UnitDef("judar_evolved") ~= nil -- (only with the owner's roster in the game data)
         and not (AutoPlaceModule.EARLY_CARRY[carryKind] or (AutoPlaceModule.InList(AutoPlaceModule.RANK, carryKind) and not AutoPlaceModule.UP_CAP[carryKind]))
     local hardLow = AutoPlaceModule.HardLow(units)
@@ -9324,7 +9326,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-142202"
+Lobby.VERSION = "20261025-142436"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
