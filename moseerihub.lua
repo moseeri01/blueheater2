@@ -7739,6 +7739,21 @@ local antiAfkGen = 0
 function ToolsModule.StartAntiAfk()
     antiAfkGen = antiAfkGen + 1
     local gen = antiAfkGen
+    -- (the Space press alone did not reset the idle timer on MuMu / Delta: kicked "idle 20 minutes"
+    -- twice on 2026-10-25. Roblox fires Idled before that kick; a VirtualUser click answers it)
+    if not ToolsModule.idledConn then
+        pcall(function()
+            local vu = game:GetService("VirtualUser")
+            ToolsModule.idledConn = Players.LocalPlayer.Idled:Connect(function()
+                if not Tools.antiAfk then return end
+                pcall(function()
+                    vu:CaptureController()
+                    vu:ClickButton2(Vector2.new())
+                end)
+            end)
+            table.insert(State.connections, ToolsModule.idledConn)
+        end)
+    end
     task.spawn(function()
         while Tools.antiAfk and gen == antiAfkGen do
             pcall(function()
@@ -8466,7 +8481,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-103315"
+Lobby.VERSION = "20261025-104239"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
