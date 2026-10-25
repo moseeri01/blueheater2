@@ -8504,7 +8504,7 @@ function DungeonRun.TagType(tags) return DungeonRun.MainType(DungeonRun.TagTypes
 function DungeonRun.HasType(r, t) return r.type == t or (r.types ~= nil and r.types[t] == true) end
 function DungeonRun.TypeText(r)
     local parts = {}
-    for _, t in ipairs({ "CURSE", "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE", "BOSS" }) do
+    for _, t in ipairs({ "CURSE", "HOARD", "GOLD", "CHEST", "SHOP", "BATTLE", "SHRINE", "BOSS" }) do
         if DungeonRun.HasType(r, t) then table.insert(parts, t) end
     end
     return table.concat(parts, "+")
@@ -8516,7 +8516,7 @@ end
 -- Main.LevelAttributes with one ImageLabel per attribute, NAMED by type (money, treasure, treasure_gold,
 -- shop, shrine, bossfinal, chestopen, Curse) and visible when the room has it; a tile with none is a
 -- plain battle. Configuration.Frame is the game's template (0x0): skipped. Lives: a visible "n/m" label.
-DungeonRun.ATTR_TYPES = { money = "HOARD", treasure = "CHEST", treasure_gold = "CHEST", chestopen = "CHEST", shop = "SHOP",
+DungeonRun.ATTR_TYPES = { money = "HOARD", treasure = "CHEST", treasure_gold = "GOLD", chestopen = "CHEST", shop = "SHOP",
     shrine = "SHRINE", bossfinal = "BOSS", curse = "CURSE" }
 function DungeonRun.ReadScreen()
     local out = {}
@@ -8538,6 +8538,7 @@ function DungeonRun.ReadScreen()
                     for _, x in ipairs(d:GetChildren()) do
                         local t = (x:IsA("ImageLabel") or x:IsA("ImageButton")) and x.Visible and DungeonRun.ATTR_TYPES[string.lower(x.Name)]
                         if t then types[t] = true end
+                        if t == "GOLD" then types.CHEST = true end
                     end
                     if not DungeonRun.MainType(types) then types.BATTLE = true end
                     table.insert(tiles, { types = types, x = tile.AbsolutePosition.X, y = tile.AbsolutePosition.Y, size = size.X * size.Y })
@@ -8728,6 +8729,9 @@ function DungeonRun.NoteFlyMap()
     pcall(DungeonRun.Log, "flyers on map " .. tostring(map))
     saveConfig()
 end
+-- What a room gives, as a cut of its effective difficulty: gold (rare) chest > chest > shrine / shop
+-- > hoard > battle (nothing). A room up to ~1.5x harder with a gold chest still wins over a battle.
+DungeonRun.REWARDS = { { "GOLD", 0.35 }, { "CHEST", 0.25 }, { "SHRINE", 0.18 }, { "SHOP", 0.18 }, { "HOARD", 0.12 } }
 -- One room's score = - effective difficulty: the room's difficulty scale divided by how much its
 -- weaknesses raise our team's damage (our share of that type x (amplification - 1)), times what it
 -- resists. (The old score took difficulty x2 minus the weakness bonus: difficulty grows with depth,
@@ -8757,6 +8761,15 @@ function DungeonRun.ScoreRoom(r, share, lives)
     -- (flyers and no hill / hybrid unit in the team: lost Assassin Park depth 5 at wave 15, 19:16 2026-10-25)
     r.fly = DungeonRun.RoomFlies(r)
     if r.fly and not DungeonRun.TeamHitsAir() then r.eff = r.eff * DungeonRun.FLY_X end
+    -- (owner 2026-10-25: BATTLE gives nothing - a room with a reward wins unless it is clearly harder;
+    -- with 1 life left only the easiest room counts)
+    r.reward, r.rewardType = 0, nil
+    if not (lives ~= nil and lives <= DungeonRun.LOW_LIVES) then
+        for _, rw in ipairs(DungeonRun.REWARDS) do
+            if DungeonRun.HasType(r, rw[1]) and rw[2] > r.reward then r.reward, r.rewardType = rw[2], rw[1] end
+        end
+        r.eff = r.eff * (1 - r.reward)
+    end
     return -r.eff
 end
 -- One option for the log: "2 Ant Kingdom [CHEST] diff 4.31 weak dark x3.0 (ours 18%) lightning x3.7 -> eff 3.31 score -4.20"
@@ -8774,7 +8787,8 @@ function DungeonRun.OptionLine(r, share)
     end
     return string.format("%s %s [%s] diff %.2f %s%s-> eff %.2f score %.2f", tostring(r.id), tostring(r.label or "?"), DungeonRun.TypeText(r),
         tonumber(r.l and r.l._lobby_difficulty_scale) or 1, #weak > 0 and ("weak " .. table.concat(weak, " ") .. " ") or "no weakness ",
-        ((r.lost or 0) > 0 and ("lost x" .. r.lost .. " ") or "") .. (r.fly and (DungeonRun.TeamHitsAir() and "flyers " or "flyers-no-air ") or ""),
+        ((r.lost or 0) > 0 and ("lost x" .. r.lost .. " ") or "") .. (r.fly and (DungeonRun.TeamHitsAir() and "flyers " or "flyers-no-air ") or "")
+            .. ((r.reward or 0) > 0 and string.format("reward %s -%d%% ", r.rewardType, math.floor(r.reward * 100 + 0.5)) or ""),
         r.eff or 0, r.score or 0)
 end
 -- Auto mode: the best scored room (plus a part of the best one after it); room types, when the
@@ -8820,6 +8834,7 @@ DungeonRun.ITEMS = {
     { id = "gold_branch", kind = "shop", name = "Golden Branch", effect = "-15% Placement/Upgrade Cost" },
     { id = "gold_shroom", kind = "shop", name = "Golden Mushroom", effect = "-30% Placement/Upgrade Cost" },
     { id = "bow2", kind = "shop", name = "Longbow", effect = "+30% Range" },
+    { id = "philosophers_stone", kind = "shop", name = "Philosopher's Stone", effect = "All chests become rare chests (id not seen yet)" },
     -- (curse ids from the run's _items; names / effects from the AA wiki's Dungeon page, 2026-10-25)
     { id = "_curse_money", kind = "shrine", name = "Curse of Money", effect = "-10% Hoard drops" },
     { id = "_curse_fly", kind = "shrine", name = "Curse of Flight", effect = "+20% chance of flying enemies" },
@@ -8937,6 +8952,14 @@ function DungeonRun.ShopPick(items, money)
     local list = type(items) == "table" and items or {}
     local function idOf(it) return string.lower(tostring(type(it) == "table" and it.id or it)) end
     local function affordable(id) local price = DungeonRun.PRICES[id] return not price or not money or money >= price end
+    -- (owner 2026-10-25: Philosopher's Stone first - every chest after it is rare - while the run has
+    -- chests to come; never when set to AVOID)
+    if (DungeonRun.lastDepth or 0) < 18 then
+        for i, it in ipairs(list) do
+            local id = idOf(it)
+            if id:find("philosoph", 1, true) and prefs[id] ~= "avoid" and affordable(id) then return i, id end
+        end
+    end
     for i, it in ipairs(list) do
         local id = idOf(it)
         if prefs[id] == "prefer" and affordable(id) then return i, id end
@@ -10684,7 +10707,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-203653"
+Lobby.VERSION = "20261025-204214"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
