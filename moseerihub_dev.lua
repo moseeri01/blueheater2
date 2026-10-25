@@ -2945,8 +2945,33 @@ end
 -- within a fifth of the spawn-to-base distance (12 studs at least) of our base.
 AutoPlaceModule.HOLD_PATH = 45 -- seconds the 2nd damage unit waits for that at most (tick)
 AutoPlaceModule.holdAt = {}    -- [stageKey] = when that wait began
-function AutoPlaceModule.PathShort()
+
+-- Enemy spawn and our base, checked against the road (normal stages): _BASES.pve / _BASES.player
+-- as a rule, but swapped when the first recorded road points (where the enemies first showed up)
+-- lie clearly nearer _BASES.player - every "toward our base" score would point at the entrance
+-- (owner 2026-10-25: units went to the front). Returns spawn, base, swapped.
+function AutoPlaceModule.Ends()
     local spawn, goal = AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos("player")
+    if State.eventMode or not (spawn and goal) then return spawn, goal, false end
+    local pts = AutoPlaceModule.PathPoints()
+    if #pts < 8 then return spawn, goal, false end
+    local ds, dg = 0, 0
+    for i = 1, 5 do
+        ds = ds + math.sqrt((pts[i][1] - spawn.X) ^ 2 + (pts[i][3] - spawn.Z) ^ 2)
+        dg = dg + math.sqrt((pts[i][1] - goal.X) ^ 2 + (pts[i][3] - goal.Z) ^ 2)
+    end
+    if dg < 0.5 * ds then
+        if AutoPlaceModule.endsNoted ~= stageKey() then
+            AutoPlaceModule.endsNoted = stageKey()
+            AutoPlaceModule.Note("enemies enter at _BASES.player on this map: base sides swapped")
+        end
+        return goal, spawn, true
+    end
+    return spawn, goal, false
+end
+
+function AutoPlaceModule.PathShort()
+    local spawn, goal = AutoPlaceModule.Ends()
     if not (spawn and goal) then return false end
     local reach = math.max(12, 0.2 * math.sqrt((spawn.X - goal.X) ^ 2 + (spawn.Z - goal.Z) ^ 2))
     for _, q in ipairs(AutoPlaceModule.PathPoints()) do
@@ -3546,6 +3571,7 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             mode = (AutoPlaceModule.WaveNumber() < (short and 20 or 0)) and "Safe" or "Balanced"
         end
         local spawn, goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("pve"), AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
+        if not State.eventMode then spawn, goal = AutoPlaceModule.Ends() end
         -- (Fool's Hunt: a copy goes next to one of its own kind, inside its reach, so Merge can fold
         -- them - spread over the map, three fujitoras never could)
         local kin = {}
@@ -3631,6 +3657,17 @@ local function bestSpot(skip, role, range, kind, aoe, back)
             table.insert(scored, { c = c, n = n })
         end
         table.sort(scored, function(a, b) return a.n > b.n end)
+        -- (placement_dump.json: the top spots of the last few damage placements, to look at later)
+        if not State.eventMode then
+            local top = {}
+            for i = 1, math.min(30, #scored) do
+                local e = scored[i]
+                top[i] = { x = math.floor(e.c.x * 10) / 10, z = math.floor(e.c.z * 10) / 10, n = math.floor(e.n * 100) / 100, kind = e.c.kind }
+            end
+            local log = AutoPlaceModule.scoredLog
+            table.insert(log, { unit = AutoPlaceModule.placingName, range = r, aoe = aoe == true, mode = mode, wave = AutoPlaceModule.WaveNumber(), top = top })
+            while #log > 4 do table.remove(log, 1) end
+        end
         return scored[skip + 1] and scored[skip + 1].c
     end
     return free[skip + 1]
@@ -5339,6 +5376,7 @@ local function tick()
     local grew = samplePath()
     if grew then AutoPlaceModule.pathGrewAt = os.clock() end
     if grew and #pathPoints() % 20 == 0 then saveConfig() end
+    pcall(AutoPlaceModule.DumpStep)
     if not next(AutoPlaceModule.team) then AutoPlaceModule.RefreshTeam() end
     -- event hotbar: new random units arrive during the game (read again every 5 s)
     if AutoPlaceModule.hotbarAt and os.clock() - AutoPlaceModule.hotbarAt > 5 then AutoPlaceModule.RefreshTeam() end
@@ -5912,6 +5950,55 @@ end
 
 -- (for code outside this block: the UI toggle "Place on enemy path")
 function AutoPlaceModule.ResetSpots() candidates, candidatesFor = nil, -1 end
+
+-- AAMacro/placement_dump.json once at waves 5, 10 and 20 of a normal stage: the recorded road, our
+-- units (role, range, spot, road cover %), the bases and the scored spots of the last damage
+-- placements - read on the PC (work/dump_map.js draws it) to judge the placer against the real map.
+AutoPlaceModule.scoredLog = {}
+AutoPlaceModule.DUMP_WAVES = { 5, 10, 20 }
+function AutoPlaceModule.DumpStep()
+    if State.eventMode then return end
+    local w = AutoPlaceModule.WaveNumber()
+    if w < (AutoPlaceModule.dumpWave or 0) then AutoPlaceModule.dumpDone = {} end -- a new game
+    AutoPlaceModule.dumpWave = w
+    AutoPlaceModule.dumpDone = AutoPlaceModule.dumpDone or {}
+    local mark
+    for _, m in ipairs(AutoPlaceModule.DUMP_WAVES) do
+        if w >= m and not AutoPlaceModule.dumpDone[m] then mark = m end
+    end
+    if not mark then return end
+    for _, m in ipairs(AutoPlaceModule.DUMP_WAVES) do if m <= mark then AutoPlaceModule.dumpDone[m] = true end end
+    local pts = pathPoints()
+    local units = {}
+    for _, u in ipairs(ownedUnits()) do
+        local p = rootPos(u)
+        if p then
+            local range = AutoPlaceModule.StatNum(u, "range") or AutoPlaceModule.Range({ name = unitType(u) or "" }) or 0
+            local inside = 0
+            for _, q in ipairs(pts) do
+                if (q[1] - p.X) ^ 2 + (q[3] - p.Z) ^ 2 <= range * range then inside = inside + 1 end
+            end
+            table.insert(units, { id = unitType(u) or "?", role = unitRole(u), range = range, x = math.floor(p.X * 10) / 10,
+                y = math.floor(p.Y * 10) / 10, z = math.floor(p.Z * 10) / 10, level = AutoPlaceModule.StatNum(u, "upgrade") or 0,
+                cov = #pts > 0 and math.floor(100 * inside / #pts + 0.5) or -1 })
+        end
+    end
+    local function base(side)
+        local b = AutoPlaceModule.BasePos(side)
+        return b and { x = math.floor(b.X * 10) / 10, z = math.floor(b.Z * 10) / 10 } or nil
+    end
+    -- (spawn / base = the ends the placer uses; pve / player = the game's _BASES as they are)
+    local s, g, swapped = AutoPlaceModule.Ends()
+    local function xz(v) return v and { x = math.floor(v.X * 10) / 10, z = math.floor(v.Z * 10) / 10 } or nil end
+    local data = { stage = State.stage, key = stageKey(), wave = w, mode = AutoPlaceModule.Mode(), hard = AutoPlaceModule.Hard(),
+        version = Lobby and Lobby.VERSION, time = os.date("%Y-%m-%d %H:%M:%S"), spawn = xz(s), base = xz(g), swapped = swapped,
+        pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog }
+    local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
+    if ok and type(writefile) == "function" then
+        pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
+        AutoPlaceModule.Note(string.format("placement dump written (wave %d)", w))
+    end
+end
 
 function AutoPlaceModule.ForgetPath()
     AutoPlace.paths[stageKey()] = nil
@@ -7449,7 +7536,7 @@ task.spawn(function()
             -- (per-game card memory starts empty: a Replay keeps the script running)
             Lobby.cardsTaken, Lobby.badTaken, Lobby.resTaken, Lobby.regenTaken, Lobby.shieldTaken = nil, nil, nil, nil, nil
             Lobby.candy, Lobby.pendingVote, Lobby.spells, Lobby.buffMain = nil, nil, nil, nil
-            Lobby.depthByWave, Lobby.lastDepth, Lobby.lastUnitRows = {}, nil, nil
+            Lobby.depthByWave, Lobby.lastDepth, Lobby.lastUnitRows, Lobby.roadReversed = {}, nil, nil, nil
             -- (mainSeen is kept across games, as before: resetting it let weak copies fill the early map)
             AutoPlaceModule.capSeen, AutoPlaceModule.capFails = nil, 0
             startSnap, gameWave = playerSnapshot(), 0
@@ -7834,6 +7921,7 @@ end
 
 -- One step of the auto run. Returns seconds to wait.
 function DungeonRun.Step()
+    pcall(DungeonRun.LearnIcons)
     local st = DungeonRun.Read()
     if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and #st.rooms > 0 and not st.ended) then
         return DungeonRun.TryStart()
@@ -8460,23 +8548,38 @@ function DungeonRun.AutoReason(r)
 end
 
 -- The game's own room pictures, learned in game (owner 2026-10-25: recognisable icons): a label
--- naming a room type in DungeonUI with an image in the same card, or a dungeon data module
--- entry with an image / icon field. Saved in Lobby.cfg.dungeonIcons2; emoji until found.
--- (an image found for 2+ room types is a card frame, not a room icon: v1 put the same purple
--- picture on HOARD / CHEST / SHOP / SHRINE - 2026-10-25. Those are dropped, the old key ignored)
+-- naming a room type in DungeonUI with the picture next to it, or a dungeon data module entry with
+-- an image / icon field. The room icons are one sprite sheet (rbxassetid://120321831419148 for every
+-- type), so an icon is the image AND its ImageRectOffset / ImageRectSize. Saved in
+-- Lobby.cfg.dungeonIcons3[type] = { image, offset = {x, y}, size = {x, y} }; emoji until found.
+-- (the same image + rect for 2+ types is a card frame, not a room icon: dropped)
 DungeonRun.EMOJI = { HOARD = "💰", CHEST = "📦", SHOP = "🛒", BATTLE = "⚔️", SHRINE = "⛩️", BOSS = "👹" }
 function DungeonRun.FindIcons()
-    Lobby.cfg.dungeonIcons2 = Lobby.cfg.dungeonIcons2 or {}
-    local icons, found, cands = Lobby.cfg.dungeonIcons2, {}, {}
+    Lobby.cfg.dungeonIcons3 = Lobby.cfg.dungeonIcons3 or {}
+    local icons, found, cands = Lobby.cfg.dungeonIcons3, {}, {}
     local function typeOf(text)
         local w = string.upper(tostring(text or "")):gsub("<[^>]->", "")
         for _, t in ipairs(DungeonRun.TYPES) do
             if w == t or w == t .. " ROOM" or w == t .. "ROOM" then return t end
         end
     end
-    local function learn(t, img, from)
-        img = tostring(img or "")
-        if t and img ~= "" then table.insert(cands, { t = t, img = img, from = from }) end
+    local function keyOf(icon)
+        local o, z = icon.offset or {}, icon.size or {}
+        return string.format("%s|%s,%s|%s,%s", tostring(icon.image), tostring(o[1] or 0), tostring(o[2] or 0), tostring(z[1] or 0), tostring(z[2] or 0))
+    end
+    local function learn(t, image, from, x)
+        image = tostring(image or "")
+        if not t or image == "" then return end
+        local icon = { image = image }
+        if x then
+            pcall(function()
+                local o, z = x.ImageRectOffset, x.ImageRectSize
+                if z and (z.X or 0) > 0 and (z.Y or 0) > 0 then
+                    icon.offset, icon.size = { o and o.X or 0, o and o.Y or 0 }, { z.X, z.Y }
+                end
+            end)
+        end
+        table.insert(cands, { t = t, icon = icon, key = keyOf(icon), from = from })
     end
     pcall(function()
         local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -8490,7 +8593,7 @@ function DungeonRun.FindIcons()
                     if not node then break end
                     for _, x in ipairs(level == 1 and node:GetChildren() or node:GetDescendants()) do
                         if (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) ~= "" then
-                            learn(t, x.Image, "DungeonUI." .. node.Name) got = true break
+                            learn(t, x.Image, "DungeonUI." .. node.Name, x) got = true break
                         end
                     end
                     if got then break end
@@ -8521,24 +8624,58 @@ function DungeonRun.FindIcons()
             end
         end
     end)
-    -- one image per type: drop any image seen (now or saved) for another type
+    -- one icon per type: drop an image + rect seen (now or saved) for another type
     local typesOf = {}
-    local function mark(img, t) typesOf[img] = typesOf[img] or {} typesOf[img][t] = true end
-    for _, c in ipairs(cands) do mark(c.img, c.t) end
-    for t, img in pairs(icons) do mark(img, t) end
-    local function shared(img) local n = 0 for _ in pairs(typesOf[img] or {}) do n = n + 1 end return n > 1 end
-    for t, img in pairs(icons) do if shared(img) then icons[t] = nil end end
+    local function mark(key, t) typesOf[key] = typesOf[key] or {} typesOf[key][t] = true end
+    for _, c in ipairs(cands) do mark(c.key, c.t) end
+    for t, icon in pairs(icons) do if type(icon) == "table" then mark(keyOf(icon), t) else icons[t] = nil end end
+    local function shared(key) local n = 0 for _ in pairs(typesOf[key] or {}) do n = n + 1 end return n > 1 end
+    for t, icon in pairs(icons) do if shared(keyOf(icon)) then icons[t] = nil end end
     for _, c in ipairs(cands) do
-        if not icons[c.t] and not shared(c.img) then
-            icons[c.t] = c.img
-            found[#found + 1] = c.t .. "=" .. c.img .. " (" .. c.from .. ")"
+        if not icons[c.t] and not shared(c.key) then
+            icons[c.t] = c.icon
+            local o, z = c.icon.offset, c.icon.size
+            found[#found + 1] = c.t .. "=" .. c.icon.image .. (z and string.format(" rect %s,%s %sx%s", o[1], o[2], z[1], z[2]) or "") .. " (" .. c.from .. ")"
         end
     end
     if #found > 0 then
         pcall(Lobby.ShareLog, "dungeon: room icons " .. table.concat(found, ", "))
+        pcall(DungeonRun.Log, "room icons " .. table.concat(found, ", "))
         saveConfig()
     end
     return icons
+end
+-- Learn while the room choice is on screen (every 15 s at most, until every room type has one).
+function DungeonRun.LearnIcons()
+    if os.clock() - (DungeonRun.iconsAt or -1e9) < 15 then return end
+    local icons = Lobby.cfg.dungeonIcons3 or {}
+    local missing = false
+    for _, t in ipairs(DungeonRun.ROOM_TYPES) do if not icons[t] then missing = true end end
+    if not missing or not DungeonRun.ChoiceOpen() then return end
+    DungeonRun.iconsAt = os.clock()
+    pcall(DungeonRun.FindIcons)
+end
+-- An icon on a tile: the learned picture (sprite rect when it has one), else the emoji.
+function DungeonRun.IconOn(parent, t, x, y, size)
+    local icon = (Lobby.cfg.dungeonIcons3 or {})[t]
+    if type(icon) == "table" and icon.image then
+        local img = Instance.new("ImageLabel")
+        img.BackgroundTransparency, img.Image = 1, icon.image
+        if icon.size then
+            pcall(function()
+                img.ImageRectOffset = Vector2.new(icon.offset[1] or 0, icon.offset[2] or 0)
+                img.ImageRectSize = Vector2.new(icon.size[1], icon.size[2])
+            end)
+        end
+        img.Position, img.Size = UDim2.new(0.5, -size / 2, 0, y), UDim2.new(0, size, 0, size)
+        img.Parent = parent
+        return img
+    end
+    local e = Instance.new("TextLabel")
+    e.BackgroundTransparency, e.Text, e.TextSize, e.TextColor3 = 1, DungeonRun.EMOJI[t] or "?", 28, DungeonRun.COLORS.text
+    e.Position, e.Size = UDim2.new(0, 0, 0, y), UDim2.new(1, 0, 0, size)
+    e.Parent = parent
+    return e
 end
 
 -- Setup window (our own ScreenGui): mode, room preferences, shrines, rare chests. Edits go to a
@@ -8620,24 +8757,13 @@ function DungeonRun.OpenSetup()
     -- until their game calls are recorded - a button that does nothing confuses)
     local tapHelp = label("Tap a room: WANT = go there, AVOID = skip it, ANY = let the script decide", 12, 140, 356, 30, 12)
     table.insert(paint, function() tapHelp.Visible = draft.mode == "Fixed" end)
-    local icons = Lobby.cfg.dungeonIcons2 or {}
     for i, t in ipairs(DungeonRun.ROOM_TYPES) do
         local tile = button("", 12 + (i - 1) * 72, 174, 66, 86, function()
             local p = draft.prefs[t]
             draft.prefs[t] = p == nil and "prefer" or (p == "prefer" and "avoid" or nil)
             repaint()
         end)
-        if icons[t] then
-            local img = Instance.new("ImageLabel")
-            img.BackgroundTransparency, img.Image = 1, icons[t]
-            img.Position, img.Size = UDim2.new(0.5, -20, 0, 6), UDim2.new(0, 40, 0, 40)
-            img.Parent = tile
-        else
-            local e = Instance.new("TextLabel")
-            e.BackgroundTransparency, e.Text, e.TextSize, e.TextColor3 = 1, DungeonRun.EMOJI[t] or "?", 28, C.text
-            e.Position, e.Size = UDim2.new(0, 0, 0, 6), UDim2.new(1, 0, 0, 40)
-            e.Parent = tile
-        end
+        DungeonRun.IconOn(tile, t, 0, 6, 40)
         local name = Instance.new("TextLabel")
         name.BackgroundTransparency, name.TextColor3, name.Font, name.TextSize = 1, C.text, Enum.Font.GothamBold, 11
         name.Position, name.Size = UDim2.new(0, 0, 0, 48), UDim2.new(1, 0, 0, 16)
@@ -9567,7 +9693,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-160757"
+Lobby.VERSION = "20261025-162356"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -10026,6 +10152,13 @@ Lobby.depthByWave = {}
 function Lobby.SampleDepth()
     local pts = AutoPlaceModule.PathPoints and AutoPlaceModule.PathPoints() or {}
     if #pts < 8 then return end
+    if Lobby.roadReversed == nil then
+        local goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
+        if goal then
+            local function d(q) return (q[1] - goal.X) ^ 2 + (q[3] - goal.Z) ^ 2 end
+            Lobby.roadReversed = d(pts[1]) < d(pts[#pts])
+        end
+    end
     local folder = unitsFolder()
     local deepest = 0
     for _, u in ipairs(folder and folder:GetChildren() or {}) do
@@ -10038,7 +10171,10 @@ function Lobby.SampleDepth()
                     local d = (q[1] - p.X) ^ 2 + (q[3] - p.Z) ^ 2
                     if d < bd then bi, bd = i, d end
                 end
-                deepest = math.max(deepest, bi / #pts)
+                -- (oriented by our base: the recorded road may start at either end)
+                local frac = bi / #pts
+                if Lobby.roadReversed then frac = 1 - frac end
+                deepest = math.max(deepest, frac)
             end
         end
     end
