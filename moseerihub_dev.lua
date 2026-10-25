@@ -115,7 +115,7 @@ local AutoPlace = {
 -- Dungeon Run state (settings saved in config.json "dungeon"; Auto dungeon is never restored on)
 local DungeonRun = {
     enabled = false,
-    roomPriority = "HOARD>CHEST>SHOP>BATTLE>SHRINE",
+    roomPriority = "HOARD>CHEST>SHOP>SHRINE",
     wishList = "",            -- shop items to buy, by name; empty = buy nothing
     acceptShrines = false,
     openRareAtEnd = true,
@@ -311,7 +311,7 @@ local function applyConfigData(data)
     local d = data.dungeon or {}
     -- (old dungeon bot keys remoteMap / autoBuyBuffs are ignored: that bot clicked any buy button)
     DungeonRun.roomPriority = pick(d.roomPriority, "string", DungeonRun.roomPriority)
-    if DungeonRun.roomPriority == "HOARD > CHEST > SHOP > BATTLE > SHRINE" then DungeonRun.roomPriority = "HOARD>CHEST>SHOP>BATTLE>SHRINE" end
+    if DungeonRun.roomPriority == "HOARD > CHEST > SHOP > BATTLE > SHRINE" then DungeonRun.roomPriority = "HOARD>CHEST>SHOP>SHRINE" end
     DungeonRun.wishList = pick(d.wishList, "string", DungeonRun.wishList)
     DungeonRun.acceptShrines = pick(d.shrineEnabled, "boolean", DungeonRun.acceptShrines)
     DungeonRun.openRareAtEnd = pick(d.openRareAtEnd, "boolean", DungeonRun.openRareAtEnd)
@@ -8808,7 +8808,8 @@ function DungeonRun.priority()
 end
 
 -- Room types the Setup window shows (the boss room is always last in the order).
-DungeonRun.ROOM_TYPES = { "HOARD", "CHEST", "SHOP", "BATTLE", "SHRINE" }
+-- (no BATTLE tile - it gives nothing and is always the last choice: owner 2026-10-25)
+DungeonRun.ROOM_TYPES = { "HOARD", "CHEST", "SHOP", "SHRINE" }
 function DungeonRun.wishes()
     local list = {}
     for w in tostring(DungeonRun.wishList or ""):gmatch("[^,;\n]+") do
@@ -9081,7 +9082,12 @@ end
 -- The room to enter: the first type in the priority list that is offered (shrines only
 -- when allowed; a boss room when it is the only way on). nil = nothing fits.
 function DungeonRun.PickRoom(rooms)
-    local order = DungeonRun.priority()
+    -- (BATTLE gives nothing: after every chosen type, then the boss room)
+    local order = {}
+    for _, t in ipairs(DungeonRun.priority()) do
+        if t ~= "BATTLE" and t ~= "BOSS" then table.insert(order, t) end
+    end
+    table.insert(order, "BATTLE")
     table.insert(order, "BOSS")
     for _, want in ipairs(order) do
         if want ~= "SHRINE" or DungeonRun.ShrineOK(DungeonRun.lives) then
@@ -9389,6 +9395,7 @@ function DungeonRun.ShrineStep(st, seq)
     local lives = st and st.hearts or DungeonRun.lives
     local live = type(DungeonRun.live) == "table" and DungeonRun.live.current_shops
     local data = type(live) == "table" and type(live[1]) == "table" and tostring(live[1]._t) == "7" and live[1].data or nil
+    pcall(DungeonRun.LearnRowIcons, "ShrineRoom", data)
     local rows, total, curses, gold = DungeonRun.ShrineOffer(page, lives, data)
     local accept = total > 0
     if lives ~= nil and lives <= 1 and curses > 0 and not gold then accept = false end
@@ -9907,8 +9914,10 @@ DungeonRun.ITEMS = {
     { id = "_curse_regen", kind = "shrine", name = "Curse of Regen", effect = "Enemies +1% regen" },
     { id = "_curse_health", kind = "shrine", name = "Curse of Health", effect = "Enemies +80% HP" },
     { id = "_curse_shop", kind = "shrine", name = "Curse of Shopping", effect = "+10% shop prices" },
-    { id = "speedy boots", kind = "shrine", name = "Speedy Boots", effect = "-20% Attack cooldown" },
-    { id = "treasure chest", kind = "shrine", name = "Treasure Chest", effect = "+1 Treasure chest" },
+    -- (the game ids of the shrine offer seen on the device, 21:31 2026-10-25)
+    { id = "boots", kind = "shrine", name = "Speedy Boots", effect = "-20% Attack cooldown" },
+    { id = "chest_mock_item", kind = "shrine", name = "Treasure Chest", effect = "+1 Treasure chest (instant)" },
+    { id = "_curse_super_armored", kind = "shrine", name = "Curse of Armor", effect = "+100% Armored enemies chance" },
 }
 -- Blessing (shop item) and curse effects from the AA wiki's Dungeon page (2026-10-25), by name: used
 -- for items learned in game whose id reads as one of these names. Text only - pictures come from the game.
@@ -9965,8 +9974,16 @@ function DungeonRun.LearnItems(p)
         local id = type(it) == "table" and tostring(it.id or "") or ""
         if id:find("^_curse") then add(id, "shrine") end
     end
+    -- (shrine offers name their items too: boots, chest_mock_item, _curse_super_armored ...)
+    for _, page in ipairs(type(p.current_shops) == "table" and p.current_shops or {}) do
+        if type(page) == "table" and tostring(page._t) == "7" and type(page.data) == "table" then
+            for _, it in ipairs(page.data) do add(type(it) == "table" and it.id or it, "shrine") end
+        end
+    end
     if #added > 0 then
         pcall(DungeonRun.Log, "new items " .. table.concat(added, ", "))
+        -- (their pictures may be in the game's data: scan it once more)
+        DungeonRun.dataScanned = nil
         saveConfig()
     end
 end
@@ -10051,6 +10068,7 @@ function DungeonRun.PageStep(st, page)
     local kind = type(page) == "table" and tostring(page._t) or "?"
     local seq = DungeonRun.liveSeq or 0
     local money = st.coins
+    if kind == "1" then pcall(DungeonRun.LearnRowIcons, "ShopSelection", page.data) end
     if kind == "1" and (DungeonRun.mode == "Auto" or DungeonRun.autoShop ~= false) and DungeonRun.buyStop ~= seq then
         local slot, id = DungeonRun.ShopPick(page.data, money)
         if slot then
@@ -10362,15 +10380,18 @@ end
 -- Lobby.cfg.dungeonIcons4[type] = { image, offset = {x, y}, size = {x, y} }; emoji until found.
 -- (the same image + rect for 2+ types is a card frame, not a room icon: dropped)
 DungeonRun.EMOJI = { HOARD = "💰", CHEST = "📦", SHOP = "🛒", BATTLE = "⚔️", SHRINE = "⛩️", BOSS = "👹" }
--- The game's own attribute pictures, read from its room tiles (dungeon_ui_dump 18:23 2026-10-25); SHOP
--- shows only a placeholder (120321831419148) until a shop tile is visible, BATTLE has none (swords).
+-- The game's own attribute pictures, read from its room tiles (dungeon_ui_dump 18:23 2026-10-25). SHOP is
+-- 120321831419148 (a purple-and-gold stall - a visible shop tile on the device, owner's crop); BATTLE has
+-- no picture (swords).
 DungeonRun.ICON_DEFAULTS = {
     HOARD = { image = "rbxassetid://95202532327953", offset = { 18, 0 }, size = { 18, 18 } },
+    SHOP = { image = "rbxassetid://120321831419148" },
     CHEST = { image = "rbxassetid://116030223007249" },
     SHRINE = { image = "rbxassetid://119641795033383" },
     BOSS = { image = "rbxassetid://130798371196238" },
 }
-DungeonRun.ICON_PLACEHOLDER = "rbxassetid://120321831419148"
+-- (the hidden attribute slots of every tile carry it too: only the "shop" slot's copy counts)
+DungeonRun.SHOP_ICON = "rbxassetid://120321831419148"
 function DungeonRun.FindIcons()
     Lobby.cfg.dungeonIcons4 = Lobby.cfg.dungeonIcons4 or {}
     local icons, found, cands = Lobby.cfg.dungeonIcons4, {}, {}
@@ -10398,7 +10419,8 @@ function DungeonRun.FindIcons()
         end
         table.insert(cands, { t = t, icon = icon, key = keyOf(icon), from = from })
     end
-    -- the room tiles' attribute pictures, by their names (visible ones, not the template, not the placeholder)
+    -- the room tiles' attribute pictures, by their names (visible ones, not the template; the shop picture
+    -- only from the shop slot)
     pcall(function()
         local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local ui = gui and gui:FindFirstChild("DungeonUI")
@@ -10406,7 +10428,7 @@ function DungeonRun.FindIcons()
             local t = (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Parent and d.Parent.Name == "LevelAttributes"
                 and DungeonRun.ATTR_TYPES[string.lower(d.Name)]
             if t and t ~= "CURSE" and isOnScreen(d) and not d:FindFirstAncestor("Configuration")
-                and tostring(d.Image) ~= "" and tostring(d.Image) ~= DungeonRun.ICON_PLACEHOLDER then
+                and tostring(d.Image) ~= "" and (t == "SHOP" or tostring(d.Image) ~= DungeonRun.SHOP_ICON) then
                 learn(t, d.Image, "DungeonUI." .. d.Name, d)
             end
         end
@@ -10590,6 +10612,71 @@ function DungeonRun.LearnIcons()
     pcall(DungeonRun.FindIcons)
 end
 -- An item's picture on a picker row: learned from the shop window, else an emoji.
+-- The game's shop / shrine page lists its rows in the order of the page data's ids: the picture in
+-- row i is item i's (sprite rect kept). Saved like the room icons, logged once per item.
+function DungeonRun.LearnRowIcons(pageName, data)
+    if type(data) ~= "table" or #data == 0 then return end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local ui = gui and gui:FindFirstChild("DungeonUI")
+    local page = ui and ui:FindFirstChild(pageName, true)
+    if not page or not isOnScreen(page) then return end
+    local list = page:FindFirstChildWhichIsA("ScrollingFrame", true) or page
+    local rows = {}
+    for _, c in ipairs(list:GetChildren()) do
+        if c:IsA("GuiObject") and c:FindFirstChildWhichIsA("ImageLabel", true) then table.insert(rows, c) end
+    end
+    if #rows ~= #data then return end
+    local function order(x) local ok, v = pcall(function() return x.LayoutOrder end) return ok and tonumber(v) or 0 end
+    table.sort(rows, function(a, b)
+        if order(a) ~= order(b) then return order(a) < order(b) end
+        return a.AbsolutePosition.Y < b.AbsolutePosition.Y
+    end)
+    Lobby.cfg.dungeonItemIcons = Lobby.cfg.dungeonItemIcons or {}
+    local icons, found = Lobby.cfg.dungeonItemIcons, {}
+    for i, row in ipairs(rows) do
+        local id = type(data[i]) == "table" and tostring(data[i].id or "") or tostring(data[i])
+        if id ~= "" and not icons[id] then
+            for _, x in ipairs(row:GetDescendants()) do
+                -- (the shop stall picture on a row is the page's, not the item's)
+                if (x:IsA("ImageLabel") or x:IsA("ImageButton")) and tostring(x.Image) ~= "" and tostring(x.Image) ~= DungeonRun.SHOP_ICON then
+                    local icon = { image = tostring(x.Image) }
+                    pcall(function()
+                        local o, z = x.ImageRectOffset, x.ImageRectSize
+                        if z and z.X > 0 and z.Y > 0 then icon.offset, icon.size = { o.X, o.Y }, { z.X, z.Y } end
+                    end)
+                    icons[id] = icon
+                    table.insert(found, id .. "=" .. icon.image)
+                    break
+                end
+            end
+        end
+    end
+    if #found > 0 then
+        pcall(DungeonRun.Log, "item icons from " .. pageName .. " " .. table.concat(found, ", "))
+        saveConfig()
+    end
+end
+-- One item for a row: name and effect from our list / the wiki, by the game's id.
+function DungeonRun.ItemInfo(id)
+    id = tostring(id or "")
+    local kind = id:find("^_curse") and "shrine" or "shop"
+    for _, k in ipairs({ "shop", "shrine" }) do
+        for _, it in ipairs(DungeonRun.ItemList(k)) do
+            if it.id == id and it.effect ~= "(seen in game)" then return it end
+        end
+    end
+    local text = DungeonRun.ItemText(id)
+    if text ~= id then
+        for name, effect in pairs(DungeonRun.WIKI_EFFECTS) do
+            if text == name .. " " .. effect then
+                local pretty = name:gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end)
+                return { id = id, kind = kind, name = pretty, effect = effect }
+            end
+        end
+    end
+    local pretty = id:gsub("^_", ""):gsub("_", " "):gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end)
+    return { id = id, kind = kind, name = pretty, effect = "(effect not known yet)" }
+end
 function DungeonRun.ItemIconOn(parent, it, x, y, size)
     local icon = (Lobby.cfg.dungeonItemIcons or {})[it.id]
     if type(icon) == "table" and icon.image then
@@ -10818,6 +10905,40 @@ function DungeonRun.OpenSetup()
         button("Back", 130, 312, 120, 34, closePage, page)
         repaint()
     end
+    -- the run's items now (blessings and curses), read-only, with their pictures
+    local function openRunItems()
+        pcall(function() if pageFrame then pageFrame:Destroy() end end)
+        pageFrame = Instance.new("Frame")
+        pageFrame.Name, pageFrame.Position, pageFrame.Size = "Page_RunItems", UDim2.new(0, 0, 0, 48), UDim2.new(1, 0, 1, -48)
+        pageFrame.BackgroundColor3, pageFrame.BorderSizePixel, pageFrame.Active = C.bg, 0, true
+        pageFrame.Parent = win
+        label("Items in this run", 12, 2, 356, 26, 16, pageFrame)
+        local live = type(DungeonRun.live) == "table" and DungeonRun.live or {}
+        local items = {}
+        for _, it in ipairs(type(live._items) == "table" and live._items or {}) do
+            local id = type(it) == "table" and it.id or it
+            if id then table.insert(items, DungeonRun.ItemInfo(id)) end
+        end
+        local list = Instance.new("ScrollingFrame")
+        list.Name, list.Position, list.Size = "List", UDim2.new(0, 8, 0, 34), UDim2.new(1, -16, 0, 266)
+        list.BackgroundColor3, list.BorderSizePixel = C.frame, 0
+        list.Parent = pageFrame
+        pcall(function() list.ScrollBarThickness, list.CanvasSize = 6, UDim2.new(0, 0, 0, #items * 62 + 8) end)
+        if #items == 0 then label("No blessings or curses yet in this run.", 12, 10, 330, 24, 13, list) end
+        for i, it in ipairs(items) do
+            local row = Instance.new("Frame")
+            row.Name, row.Position, row.Size = "Row_" .. it.id, UDim2.new(0, 4, 0, 4 + (i - 1) * 62), UDim2.new(1, -14, 0, 58)
+            row.BackgroundColor3, row.BorderSizePixel = it.kind == "shrine" and Color3.fromRGB(70, 36, 40) or C.panel, 0
+            row.Parent = list
+            DungeonRun.ItemIconOn(row, it, 6, 7, 44)
+            local name = label(it.name, 58, 6, 260, 20, 14, row)
+            name.TextColor3 = it.kind == "shrine" and C.avoidEdge or C.gold
+            local eff = label(it.effect, 58, 28, 260, 24, 11, row)
+            eff.TextColor3 = C.dim
+        end
+        button("Back", 130, 312, 120, 34, closePage, pageFrame)
+    end
+    button("Items", 138, 366, 74, 32, openRunItems)
     -- the five room tiles: icon, name and its choice; a tap opens the room's page
     local tapHelp = label("Tap a room to set it up", 12, 140, 356, 22, 12)
     -- Auto: nothing to choose, only what it will do (owner 2026-10-25)
@@ -11803,7 +11924,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-232251"
+Lobby.VERSION = "20261025-233745"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
