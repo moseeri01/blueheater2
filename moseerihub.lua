@@ -120,6 +120,7 @@ local DungeonRun = {
     acceptShrines = false,
     openRareAtEnd = true,
     autoContinueDeath = false,
+    mode = "Fixed",           -- room choice: "Fixed" (Room priority) | "Auto" (scored from dungeon_changed)
     status = "Off",
 }
 
@@ -230,7 +231,8 @@ local function buildConfigData()
             pingDisconnect = Webhook.pingDisconnect, pingLosses = Webhook.pingLosses },
         lobby = Lobby.cfg,
         dungeon = { roomPriority = DungeonRun.roomPriority, wishList = DungeonRun.wishList, shrineEnabled = DungeonRun.acceptShrines,
-            openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath },
+            openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath,
+            mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true },
         unitAI = {
             autoAbilities = UnitAI.autoAbilities,
             abilityCooldown = UnitAI.abilityCooldown,
@@ -309,6 +311,10 @@ local function applyConfigData(data)
     DungeonRun.acceptShrines = pick(d.shrineEnabled, "boolean", DungeonRun.acceptShrines)
     DungeonRun.openRareAtEnd = pick(d.openRareAtEnd, "boolean", DungeonRun.openRareAtEnd)
     DungeonRun.autoContinueDeath = pick(d.autoContinueDeath, "boolean", DungeonRun.autoContinueDeath)
+    DungeonRun.mode = d.mode == "Auto" and "Auto" or "Fixed"
+    DungeonRun.pendingStart = d.pendingStart == true
+    -- (every room is a teleport and the script reloads there: Auto dungeon has to come back on)
+    pendingToggles.dungeon = d.enabled == true
     local u = data.unitAI or {}
     UnitAI.abilityCooldown = pick(u.abilityCooldown, "number", UnitAI.abilityCooldown)
     UnitAI.buffGap = pick(u.buffGap, "number", UnitAI.buffGap)
@@ -2132,6 +2138,7 @@ local function inLobby()
     local lobby = cfg and cfg:FindFirstChild("IsLobby")
     return (lobby and lobby.Value == true) or not cfg
 end
+DungeonRun.InLobby = inLobby
 
 local function fireFirst(names, ...)
     local args = table.pack(...)
@@ -7509,6 +7516,9 @@ end
 
 -- The run as the game holds it: the getgc table with a depth and room choices (or a shop).
 function DungeonRun.Read()
+    local live = DungeonRun.live
+    if not live and DungeonRun.InLobby() then live = DungeonRun.FindLive() end
+    if live then return DungeonRun.FromLive(live) end
     local best, bestScore
     -- the table found last time is read again while it still looks like the run
     local last = DungeonRun.runTable
@@ -7591,7 +7601,8 @@ function DungeonRun.StatusText(st)
             st.maxHearts and ("/" .. st.maxHearts) or "", tostring(st.coins or "?"), tostring(st.silverKeys or "?"), tostring(st.goldKeys or "?")))
         local rooms = {}
         for _, r in ipairs(st.rooms or {}) do
-            table.insert(rooms, string.format("%s%s", tostring(r.type or r.label or "?"), r.id ~= nil and ("[" .. tostring(r.id) .. "]") or ("#" .. tostring(r.index))))
+            table.insert(rooms, string.format("%s%s%s", tostring(r.type or r.label or "?"), r.id ~= nil and ("[" .. tostring(r.id) .. "]") or ("#" .. tostring(r.index)),
+                r.score and string.format(" %.2f", r.score) or ""))
         end
         table.insert(lines, "Rooms offered: " .. (#rooms > 0 and table.concat(rooms, ", ") or "none"))
         if st.shop and #st.shop > 0 then
@@ -7605,7 +7616,14 @@ function DungeonRun.StatusText(st)
     end
     local screen = DungeonRun.ScreenText()
     if #screen > 0 then table.insert(lines, "On screen: " .. table.concat(screen, ", ")) end
-    table.insert(lines, "Rooms: " .. table.concat(DungeonRun.priority(), " > ") .. " | shrines " .. (DungeonRun.acceptShrines and "on" or "off")
+    if DungeonRun.mode == "Auto" then
+        local share = DungeonRun.TeamShare()
+        local parts = {}
+        for k, v in pairs(share) do table.insert(parts, string.format("%s %d%%", k, math.floor(v * 100 + 0.5))) end
+        table.sort(parts)
+        table.insert(lines, "Team damage: " .. (#parts > 0 and table.concat(parts, ", ") or "unknown"))
+    end
+    table.insert(lines, "Mode " .. tostring(DungeonRun.mode) .. " | Rooms: " .. table.concat(DungeonRun.priority(), " > ") .. " | shrines " .. (DungeonRun.acceptShrines and "on" or "off")
         .. " | wish-list: " .. (#DungeonRun.wishes() > 0 and table.concat(DungeonRun.wishes(), ", ") or "empty (buys nothing)"))
     return table.concat(lines, "\n")
 end
@@ -7669,6 +7687,7 @@ function DungeonRun.Call(name, arg, before)
     local remote = getAARemote(name)
     if not remote then DungeonRun.status = name .. " remote not found" return false end
     DungeonRun.calls = (DungeonRun.calls or 0) + 1
+    local sel = DungeonRun.selSeq or 0
     local ok, res = pcall(function()
         if remote:IsA("RemoteFunction") then return remote:InvokeServer(arg) end
         remote:FireServer(arg)
@@ -7678,6 +7697,8 @@ function DungeonRun.Call(name, arg, before)
     while os.clock() < deadline do
         local now = DungeonRun.Read()
         if now and before and DungeonRun.Changed(before, now) then return true, res end
+        -- (live run: the game answers a room with dungeon_selected_changed, then teleports)
+        if (DungeonRun.selSeq or 0) ~= sel then return true, res end
         task.wait(0.25)
     end
     return false, ok and res or "error"
@@ -7710,6 +7731,10 @@ end
 -- One step of the auto run. Returns seconds to wait.
 function DungeonRun.Step()
     local st = DungeonRun.Read()
+    if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and #st.rooms > 0 and not st.ended) then
+        return DungeonRun.TryStart()
+    end
+    if st and st.live then return DungeonRun.LiveStep(st) end
     if not st or ((not st.rooms or #st.rooms == 0) and not (st.shop and #st.shop > 0) and not st.dead) then
         DungeonRun.status = DungeonRun.WAITING
         DungeonRun.Refresh(st)
@@ -7782,6 +7807,323 @@ function DungeonRun.Step()
     return 1
 end
 
+-- The run as the game sends it: endpoints.server_to_client.dungeon_changed (Watch, real game
+-- 2026-10-25, work/dungeon_samples.txt): { _started, _items = { { id = "_curse_money" } },
+-- _resources = { money, treasure, treasure_gold }, current_shops, next = { ["1"] = room, ["2"] = room,
+-- next1 = { rooms after room 1 }, next2 = ... } }, room = { _d = depth, _t = tags (meaning unknown),
+-- _l = { _dungeon = { choice_str, depth }, _lobby_difficulty_scale, map, boss, _location_name,
+-- _weak_against = { { damage_type = "air_damage", amplification = 3.1 } }, _strong_against } }.
+-- dungeon_changed({}) = the run is over (after "You Died!" Continue).
+function DungeonRun.Norm(kind)
+    return (string.lower(tostring(kind or "")):gsub("_damage$", ""))
+end
+function DungeonRun.AsList(v)
+    local out = {}
+    if type(v) ~= "table" then return out end
+    for _, x in pairs(v) do table.insert(out, x) end
+    return out
+end
+-- tags as text ("2,7,_curse_fly"), for the log
+function DungeonRun.TagText(tags)
+    local parts = {}
+    for k, v in pairs(type(tags) == "table" and tags or {}) do
+        table.insert(parts, type(v) == "table" and tostring(v.id or k) or (v == true and tostring(k) or tostring(k) .. "=" .. tostring(v)))
+    end
+    table.sort(parts)
+    return table.concat(parts, ",")
+end
+-- a room type only when the data names one (the _t codes are not known yet)
+function DungeonRun.TagType(tags)
+    for _, v in pairs(type(tags) == "table" and tags or {}) do
+        local w = string.upper(tostring(type(v) == "table" and (v.type or v.id) or v))
+        for _, t in ipairs(DungeonRun.TYPES) do
+            if w == t then return t end
+        end
+    end
+end
+function DungeonRun.LiveRooms(nextT)
+    local rooms = {}
+    if type(nextT) ~= "table" then return rooms end
+    for k, r in pairs(nextT) do
+        if type(r) == "table" and type(r._l) == "table" then
+            local dn = type(r._l._dungeon) == "table" and r._l._dungeon or {}
+            local id = tostring(dn.choice_str or k)
+            table.insert(rooms, { id = id, index = tonumber(id), l = r._l, depth = tonumber(r._d or dn.depth), tags = r._t,
+                label = r._l._location_name or r._l.map, kids = nextT["next" .. id], type = DungeonRun.TagType(r._t) })
+        end
+    end
+    table.sort(rooms, function(a, b) return (tonumber(a.id) or 99) < (tonumber(b.id) or 99) end)
+    return rooms
+end
+-- the game's own copy of the run (lobby after a reload, before any dungeon_changed came)
+function DungeonRun.FindLive()
+    if os.clock() - (DungeonRun.findAt or -1e9) < 10 then return DungeonRun.liveGc end
+    DungeonRun.findAt = os.clock()
+    DungeonRun.liveGc = nil
+    if type(getgc) ~= "function" then return nil end
+    pcall(function()
+        for _, t in ipairs(getgc(true)) do
+            if type(t) == "table" and type(rawget(t, "next")) == "table" and (rawget(t, "_started") ~= nil or rawget(t, "_resources") ~= nil)
+                and #DungeonRun.LiveRooms(rawget(t, "next")) > 0 then
+                DungeonRun.liveGc = t
+                break
+            end
+        end
+    end)
+    return DungeonRun.liveGc
+end
+function DungeonRun.FromLive(live)
+    local st = { live = true, table = live }
+    st.rooms = DungeonRun.LiveRooms(live.next)
+    st.depth = st.rooms[1] and st.rooms[1].depth or DungeonRun.lastDepth
+    st.maxDepth = 20
+    st.hearts = DungeonRun.lives
+    local res = type(live._resources) == "table" and live._resources or {}
+    st.coins, st.silverKeys, st.goldKeys = tonumber(res.money), tonumber(res.treasure), tonumber(res.treasure_gold)
+    st.ended = next(live) == nil or (#st.rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
+    return st
+end
+
+-- Share of our damage by type (normalised: "air", "dark" ...), each unit by its base dps; a
+-- secondary type counts half. Placed units, else the team, else the event Always list.
+function DungeonRun.TeamShare()
+    local share, total = {}, 0
+    local function add(name)
+        local def = AutoPlaceModule.UnitDef(name)
+        if type(def) ~= "table" or def._NO_ATTACKS_UNIT then return end
+        local dps = (tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.DefCd(def))
+        if dps <= 0 then return end
+        local base = DungeonRun.Norm(def._base_damage_type or "physical")
+        share[base] = (share[base] or 0) + dps
+        for k, v in pairs(type(def._secondary_damage_types) == "table" and def._secondary_damage_types or {}) do
+            local kind = DungeonRun.Norm(type(k) == "number" and v or k)
+            if kind ~= base then share[kind] = (share[kind] or 0) + dps * 0.5 end
+        end
+        total = total + dps
+    end
+    local names = {}
+    pcall(function() for _, u in ipairs(ownedUnits()) do table.insert(names, unitType(u)) end end)
+    if #names == 0 then
+        -- (the team table is read once a minute at most: the room choice comes every few minutes)
+        if not AutoPlaceModule.team or (os.clock() - (DungeonRun.teamAt or -1e9) > 60 and next(AutoPlaceModule.team) == nil) then
+            DungeonRun.teamAt = os.clock()
+            pcall(AutoPlaceModule.RefreshTeam)
+        end
+        pcall(function() names = (AutoPlaceModule.TeamNames()) end)
+    end
+    if #names == 0 then names = Lobby.cfg.eventAlways or {} end
+    for _, n in ipairs(names) do pcall(add, n) end
+    if total <= 0 then return {} end
+    for k, v in pairs(share) do share[k] = v / total end
+    return share
+end
+
+DungeonRun.DIFF_W = 2        -- score lost per 1.0 of _lobby_difficulty_scale
+DungeonRun.LOW_LIVES = 1     -- lives at or below this: the easiest room wins (difficulty x5)
+DungeonRun.LOOKAHEAD = 0.3   -- part of the best room after it that counts
+-- One room's score: our damage its weaknesses amplify, minus what it resists, minus difficulty.
+function DungeonRun.ScoreRoom(r, share, lives)
+    local l = r.l or {}
+    local s = 0
+    for _, w in ipairs(DungeonRun.AsList(l._weak_against)) do
+        if type(w) == "table" then
+            s = s + (share[DungeonRun.Norm(w.damage_type)] or 0) * math.max(0, (tonumber(w.amplification) or 1) - 1)
+        end
+    end
+    -- (no _strong_against seen yet: a factor below 1 = damage taken, above 1 = divided, none = half)
+    for _, w in ipairs(DungeonRun.AsList(l._strong_against)) do
+        local kind = type(w) == "table" and w.damage_type or w
+        local a = type(w) == "table" and tonumber(w.amplification)
+        local m = (a and a < 1 and a) or (a and a > 1 and 1 / a) or 0.5
+        s = s - (share[DungeonRun.Norm(kind)] or 0) * (1 - m)
+    end
+    local low = lives ~= nil and lives <= DungeonRun.LOW_LIVES
+    return s - (low and DungeonRun.DIFF_W * 5 or DungeonRun.DIFF_W) * (tonumber(l._lobby_difficulty_scale) or 1)
+end
+-- Auto mode: the best scored room (plus a part of the best one after it); room types, when the
+-- data names them, break ties by Room priority; shrines only when allowed.
+function DungeonRun.AutoPick(rooms, lives)
+    local share = DungeonRun.TeamShare()
+    local order = DungeonRun.priority()
+    local best
+    for _, r in ipairs(rooms or {}) do
+        local sc = DungeonRun.ScoreRoom(r, share, lives)
+        local after
+        for _, k in ipairs(DungeonRun.LiveRooms(r.kids)) do
+            local x = DungeonRun.ScoreRoom(k, share, lives)
+            if not after or x > after then after = x end
+        end
+        if after then sc = sc + DungeonRun.LOOKAHEAD * after end
+        local rank = r.type and table.find(order, r.type)
+        if rank then sc = sc + 0.01 * (#order - rank + 1) end
+        if r.type == "SHRINE" and not DungeonRun.acceptShrines then sc = sc - 100 end
+        r.score = sc
+        if not best or sc > best.score then best = r end
+    end
+    return best
+end
+
+-- One step on the live run (from dungeon_changed or the game's copy of it).
+function DungeonRun.LiveStep(st)
+    if st.ended then
+        DungeonRun.status = DungeonRun.startNote or "run over" .. (DungeonRun.InLobby() and " - no next run to start" or " - back to the lobby next")
+        DungeonRun.Refresh(st)
+        return 3
+    end
+    if DungeonRun.blocked then
+        DungeonRun.status = DungeonRun.blocked
+        DungeonRun.Refresh(st)
+        return 2
+    end
+    if #st.rooms == 0 then
+        DungeonRun.status = "no rooms offered right now"
+        DungeonRun.Refresh(st)
+        return 2
+    end
+    if DungeonRun.enteredTable == st.table then
+        DungeonRun.status = "in room " .. tostring(DungeonRun.enteredId) .. " - waiting for its result"
+        DungeonRun.Refresh(st)
+        return 2
+    end
+    local room, why
+    if DungeonRun.mode == "Auto" then
+        room = DungeonRun.AutoPick(st.rooms, st.hearts)
+        why = room and string.format("score %.2f", room.score or 0)
+    else
+        room = DungeonRun.PickRoom(st.rooms)
+        why = room and tostring(room.type)
+        local typed = false
+        for _, r in ipairs(st.rooms) do if r.type then typed = true end end
+        -- (the run's data names no room types yet: Fixed takes the first room like a macro)
+        if not room and not typed then room, why = st.rooms[1], "first room (types not in the data)" end
+    end
+    if not room then
+        DungeonRun.status = "no room fits the settings (shrines off?) - pick one yourself"
+        DungeonRun.Refresh(st)
+        return 2
+    end
+    local arg = tostring(room.id)
+    DungeonRun.status = string.format("entering %s %s (%s)", arg, tostring(room.label or "?"), tostring(why))
+    DungeonRun.Refresh(st)
+    pcall(Lobby.ShareLog, string.format("dungeon: depth %s %s -> room %s %s (%s) lives %s", tostring(st.depth), DungeonRun.mode, arg,
+        tostring(room.label), tostring(why), tostring(st.hearts)))
+    local changed = DungeonRun.Call("dungeon_enter_room", arg, st)
+    if changed then
+        DungeonRun.enteredTable, DungeonRun.enteredId = st.table, arg
+        DungeonRun.picks = DungeonRun.picks or {}
+        table.insert(DungeonRun.picks, arg)
+        DungeonRun.status = "entered room " .. arg .. " " .. tostring(room.label or "")
+    else
+        DungeonRun.blocked = string.format("dungeon_enter_room(%s) changed nothing - %s", arg, DungeonRun.WAITING)
+    end
+    DungeonRun.Refresh()
+    return 1
+end
+
+function DungeonRun.OnChanged(p)
+    if type(p) ~= "table" then return end
+    DungeonRun.live = p
+    DungeonRun.liveSeq = (DungeonRun.liveSeq or 0) + 1
+    DungeonRun.blocked = nil
+    local rooms = DungeonRun.LiveRooms(p.next)
+    if rooms[1] and rooms[1].depth then DungeonRun.lastDepth = rooms[1].depth end
+    -- anything new in the data goes to the share log once (room tags, shops, keys)
+    DungeonRun.seen = DungeonRun.seen or {}
+    local function note(text)
+        if DungeonRun.seen[text] then return end
+        DungeonRun.seen[text] = true
+        pcall(Lobby.ShareLog, "dungeon: " .. text)
+    end
+    local keys = {}
+    for k in pairs(p) do table.insert(keys, tostring(k)) end
+    table.sort(keys)
+    note("state keys " .. table.concat(keys, ","))
+    for _, r in ipairs(rooms) do
+        local t = DungeonRun.TagText(r.tags)
+        if t ~= "" then note("room tags " .. t) end
+    end
+    if type(p.current_shops) == "table" and next(p.current_shops) ~= nil then
+        local ok, j = pcall(function() return HttpService:JSONEncode(p.current_shops) end)
+        note("shop " .. clip(ok and j or "?", 300))
+    end
+    local over = next(p) == nil or (#rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
+    if over then
+        note("run over at depth " .. tostring(DungeonRun.lastDepth))
+        if DungeonRun.enabled then DungeonRun.pendingStart = true saveConfig() end
+    elseif #rooms > 0 then DungeonRun.startNote = nil end
+    if not over and #rooms > 0 and DungeonRun.pendingStart then
+        DungeonRun.pendingStart = false
+        saveConfig()
+    end
+end
+function DungeonRun.OnSelected(p)
+    if type(p) ~= "table" then return end
+    DungeonRun.lives = tonumber(p.lives) or DungeonRun.lives
+    DungeonRun.selSeq = (DungeonRun.selSeq or 0) + 1
+end
+
+-- Dungeon Run Keys in the bag; nil = not known (no key item seen: the call's answer decides).
+function DungeonRun.KeyCount()
+    local ok, bag = pcall(Lobby.Bag)
+    if not ok or type(bag) ~= "table" then return nil end
+    for id, n in pairs(bag.counts or {}) do
+        local s = string.lower(tostring(id))
+        if s:find("dungeon", 1, true) and s:find("key", 1, true) then return n end
+    end
+    return nil
+end
+
+-- The next run after one ended: one dungeon_start() per ended run, never retried.
+function DungeonRun.TryStart()
+    DungeonRun.pendingStart = false
+    saveConfig()
+    local keys = DungeonRun.KeyCount()
+    if keys ~= nil and keys <= 0 then
+        DungeonRun.status = "run over - no Dungeon Run Key, not starting another"
+        DungeonRun.startNote = DungeonRun.status
+        DungeonRun.Refresh(false)
+        return 5
+    end
+    local remote = getAARemote("dungeon_start")
+    if not remote then
+        DungeonRun.status = "run over - dungeon_start remote not found"
+        DungeonRun.Refresh(false)
+        return 5
+    end
+    DungeonRun.status = "starting the next run (keys " .. tostring(keys or "?") .. ")"
+    DungeonRun.Refresh(false)
+    local seq = DungeonRun.liveSeq or 0
+    local ok, res = pcall(function()
+        if remote:IsA("RemoteFunction") then return remote:InvokeServer() end
+        remote:FireServer()
+        return true
+    end)
+    local deadline = os.clock() + 10
+    while os.clock() < deadline do
+        local live = DungeonRun.live
+        if (DungeonRun.liveSeq or 0) ~= seq and type(live) == "table" and live._started then
+            DungeonRun.status = "next run started"
+            pcall(Lobby.ShareLog, "dungeon: dungeon_start() -> new run (keys " .. tostring(keys or "?") .. ")")
+            DungeonRun.Refresh()
+            return 1
+        end
+        task.wait(0.25)
+    end
+    DungeonRun.status = "dungeon_start answered " .. clip(tostring(ok and res or "error"), 60) .. " - no new run (no key?), not trying again"
+    DungeonRun.startNote = DungeonRun.status
+    pcall(Lobby.ShareLog, "dungeon: " .. DungeonRun.status)
+    DungeonRun.Refresh(false)
+    return 5
+end
+
+for name, fn in pairs({ dungeon_changed = function(p) pcall(DungeonRun.OnChanged, p) end,
+    dungeon_selected_changed = function(p) pcall(DungeonRun.OnSelected, p) end }) do
+    task.spawn(pcall, function()
+        local conn = ReplicatedStorage:WaitForChild("endpoints"):WaitForChild("server_to_client"):WaitForChild(name).OnClientEvent:Connect(fn)
+        table.insert(State.connections, conn)
+    end)
+end
+
 function DungeonRun.Start()
     DungeonRun.gen = (DungeonRun.gen or 0) + 1
     local gen = DungeonRun.gen
@@ -7789,7 +8131,7 @@ function DungeonRun.Start()
     task.spawn(function()
         while DungeonRun.enabled and gen == DungeonRun.gen and not State.unloaded do
             local ok, wait = pcall(DungeonRun.Step)
-            if not ok then DungeonRun.status = "error: " .. clip(tostring(wait), 80) wait = 3 end
+            if not ok then DungeonRun.status = "error: " .. clip(tostring(wait), 80) wait = 3 pcall(DungeonRun.Refresh) end
             task.wait(wait or 2)
         end
     end)
@@ -8555,7 +8897,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-121106"
+Lobby.VERSION = "20261025-121323"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -9945,10 +10287,15 @@ Controls.dungeonAuto = dataSection:Toggle({
     Default = false,
     Callback = function(on)
         if on then DungeonRun.Start() else DungeonRun.Stop() end
+        saveConfig()
     end,
 }, "DungeonBot")
 
 setSection:Header({ Text = "Choices" })
+Controls.dungeonMode = setSection:Dropdown({ Name = "Room choice", Multi = false, Required = true, Options = { "Fixed", "Auto" },
+    Default = DungeonRun.mode,
+    Callback = function(v) DungeonRun.mode = v == "Auto" and "Auto" or "Fixed"; DungeonRun.blocked = nil; DungeonRun.Refresh(false); saveConfig() end,
+}, "DungeonMode")
 Controls.dungeonPriority = setSection:Input({
     Name = "Room priority",
     Placeholder = "HOARD > CHEST > SHOP > BATTLE > SHRINE",
@@ -10293,6 +10640,7 @@ applyRuntimeFeatures = function()
     setControl(Controls.dungeonContinueDeath, DungeonRun.autoContinueDeath)
     setControl(Controls.dungeonPriority, DungeonRun.roomPriority)
     setControl(Controls.dungeonWish, DungeonRun.wishList)
+    pcall(function() Controls.dungeonMode:UpdateSelection(DungeonRun.mode) end)
     setControl(Controls.profileName, Profile.name)
 
     UnitAI.autoAbilities = pendingToggles.autoAbilities == true
@@ -10321,6 +10669,10 @@ applyRuntimeFeatures = function()
     setControl(Controls.placeMyself, AutoPlace.manual == true)
     if AutoPlace.enabled then AutoPlaceModule.Start() else AutoPlaceModule.Stop() end
     setControl(Controls.homeAuto, AutoPlace.enabled)
+    if pendingToggles.dungeon and not DungeonRun.enabled then
+        setControl(Controls.dungeonAuto, true)
+        DungeonRun.Start()
+    end
     pcall(function() Controls.homeMode:UpdateSelection(AutoPlace.preset == "Safe" and "Safe" or "Fast farm") end)
 
     refreshUnitStatus()
