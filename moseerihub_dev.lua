@@ -10033,7 +10033,12 @@ function DungeonRun.ShopPick(items, money)
     local prefs = auto and {} or DungeonRun.itemPrefs or {}
     local list = type(items) == "table" and items or {}
     local function idOf(it) return string.lower(tostring(type(it) == "table" and it.id or it)) end
-    local function affordable(id) local price = DungeonRun.PRICES[id] return not price or not money or money >= price end
+    -- (the price on the page's row first: Bow 221 with 194 coins was tried and refused, 23:44 2026-10-25)
+    local function affordable(id)
+        if (DungeonRun.refused or {})[id] then return false end
+        local price = (DungeonRun.pagePrices or {})[id] or DungeonRun.PRICES[id]
+        return not price or not money or money >= price
+    end
     -- (owner 2026-10-25: Philosopher's Stone first - every chest after it is rare - while the run has
     -- chests to come; never when set to AVOID)
     if (DungeonRun.lastDepth or 0) < 18 then
@@ -10068,7 +10073,10 @@ function DungeonRun.PageStep(st, page)
     local kind = type(page) == "table" and tostring(page._t) or "?"
     local seq = DungeonRun.liveSeq or 0
     local money = st.coins
-    if kind == "1" then pcall(DungeonRun.LearnRowIcons, "ShopSelection", page.data) end
+    if kind == "1" then
+        pcall(DungeonRun.LearnRowIcons, "ShopSelection", page.data)
+        pcall(DungeonRun.ReadRowPrices, "ShopSelection", page.data)
+    end
     if kind == "1" and (DungeonRun.mode == "Auto" or DungeonRun.autoShop ~= false) and DungeonRun.buyStop ~= seq then
         local slot, id = DungeonRun.ShopPick(page.data, money)
         if slot then
@@ -10077,8 +10085,11 @@ function DungeonRun.PageStep(st, page)
             local ok, answer = DungeonRun.Call("dungeon_buy_shop", slot, st)
             pcall(DungeonRun.Log, string.format("dungeon_buy_shop(%d) %s -> %s, answered %s", slot, id, ok and "bought" or "nothing", clip(tostring(answer), 40)))
             pcall(Lobby.ShareLog, "dungeon: shop bought " .. id .. (ok and "" or " - refused"))
-            if not ok then DungeonRun.buyStop = DungeonRun.liveSeq or 0 end
-            return 1
+            if ok then return 1 end
+            -- (refused: never tried again this run, and the shop is left at once)
+            DungeonRun.refused = DungeonRun.refused or {}
+            DungeonRun.refused[id] = true
+            DungeonRun.buyStop = DungeonRun.liveSeq or 0
         end
     elseif kind == "6" then
         local gold = tonumber(st.goldKeys) or 0
@@ -10110,8 +10121,50 @@ function DungeonRun.PageStep(st, page)
     DungeonRun.status = kind == "1" and "leaving the shop" or "leaving the chest page"
     DungeonRun.Refresh(st)
     local ok = DungeonRun.Call("dungeon_continue_shop", nil, st)
-    if not ok then DungeonRun.blocked = "dungeon_continue_shop changed nothing - continue by hand" end
+    if not ok then
+        -- (no answer: the page's own Continue button by GUI, else left to the player)
+        local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local ui = gui and gui:FindFirstChild("DungeonUI")
+        local pageGui = ui and ui:FindFirstChild(kind == "1" and "ShopSelection" or "OpenTreasure", true)
+        local b = pageGui and DungeonRun.FindButton(pageGui, "continue")
+        if b then
+            Lobby.TapGui(b)
+            pcall(Lobby.ShareLog, "dungeon: continue_shop gave no answer - tapped " .. b.Name)
+        else
+            DungeonRun.blocked = "dungeon_continue_shop changed nothing - continue by hand"
+        end
+    end
     return 1
+end
+-- Prices from the game's shop page: each row (in the order of the page data's ids) shows its price as a
+-- plain number (Bow 221, Dagger 221 - 23:44 2026-10-25). Kept for this page: prices change with depth.
+function DungeonRun.ReadRowPrices(pageName, data)
+    DungeonRun.pagePrices = {}
+    if type(data) ~= "table" or #data == 0 then return end
+    local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local ui = gui and gui:FindFirstChild("DungeonUI")
+    local page = ui and ui:FindFirstChild(pageName, true)
+    if not page or not isOnScreen(page) then return end
+    local list = page:FindFirstChildWhichIsA("ScrollingFrame", true) or page
+    local rows = {}
+    for _, c in ipairs(list:GetChildren()) do
+        if c:IsA("GuiObject") then table.insert(rows, c) end
+    end
+    if #rows ~= #data then return end
+    local function order(x) local ok, v = pcall(function() return x.LayoutOrder end) return ok and tonumber(v) or 0 end
+    table.sort(rows, function(a, b)
+        if order(a) ~= order(b) then return order(a) < order(b) end
+        return a.AbsolutePosition.Y < b.AbsolutePosition.Y
+    end)
+    for i, row in ipairs(rows) do
+        local id = type(data[i]) == "table" and tostring(data[i].id or "") or tostring(data[i])
+        for _, d in ipairs(row:GetDescendants()) do
+            if d:IsA("TextLabel") or d:IsA("TextButton") then
+                local n = tostring(d.Text):gsub("<[^>]->", ""):gsub("[,%s]", "")
+                if n:match("^%d+$") then DungeonRun.pagePrices[id] = tonumber(n) break end
+            end
+        end
+    end
 end
 
 function DungeonRun.LiveStep(st)
@@ -10238,7 +10291,7 @@ function DungeonRun.OnChanged(p)
     local over = next(p) == nil or (not running and #rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
     if over then
         note("run over at depth " .. tostring(DungeonRun.lastDepth))
-        DungeonRun.lostRooms = {}
+        DungeonRun.lostRooms, DungeonRun.refused = {}, nil
         if DungeonRun.enabled then DungeonRun.pendingStart = true saveConfig() end
     elseif #rooms > 0 then DungeonRun.startNote = nil end
     if not over and (running or #rooms > 0) and DungeonRun.pendingStart then
@@ -11924,7 +11977,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-233745"
+Lobby.VERSION = "20261025-235313"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
