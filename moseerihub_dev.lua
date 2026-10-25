@@ -5060,6 +5060,106 @@ function PV.AirStage()
         or (AutoPlaceModule.seenFly or 0) / math.max(1, AutoPlaceModule.seenN or 0) >= 0.5
 end
 
+-- Timing (owner 2026-10-25, work/placement_method.md "Timing"): act on the money change, farm upgrades
+-- before the wave's payout, air upgrades at once while flyers are on the map, and a per-wave log.
+PV.END_SECONDS = 2.5   -- a wave timer counting down to this or less: the wave is ending
+PV.END_ENEMIES = 1     -- or this many enemies left, once the wave has had 3+ on the map and is 5+ s old
+-- the wave timer: workspace._wave_time or LP._stats.wave_timer; counting down when it went down lately
+function PV.WaveTimer()
+    local v = workspace:FindFirstChild("_wave_time")
+    local t = v and tonumber(v.Value)
+    if not t then
+        local st = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("_stats")
+        local w = st and st:FindFirstChild("wave_timer")
+        t = w and tonumber(w.Value)
+    end
+    if not t then return nil end
+    local now = os.clock()
+    if PV.wtLast and t < PV.wtLast.v then PV.wtDown = now end
+    if not PV.wtLast or t ~= PV.wtLast.v then PV.wtLast = { v = t, at = now } end
+    return t, PV.wtDown ~= nil and now - PV.wtDown < 3
+end
+function PV.WaveEnding()
+    local t, down = PV.WaveTimer()
+    if t and down and t > 0 and t <= PV.END_SECONDS then return true end
+    local w = AutoPlaceModule.WaveNumber()
+    if PV.endWave ~= w then PV.endWave, PV.endSeen, PV.endAt = w, 0, os.clock() end
+    local n = 0
+    local folder = unitsFolder()
+    for _, e in ipairs(folder and folder:GetChildren() or {}) do if isEnemy(e) then n = n + 1 end end
+    PV.endSeen = math.max(PV.endSeen, n)
+    return PV.endSeen >= 3 and os.clock() - PV.endAt >= 5 and n <= PV.END_ENEMIES
+end
+
+-- The money value as an instance (for its Changed signal): the learned path, else LP._stats.resource.
+function PV.MoneyValue()
+    local path = AutoPlace.moneyPath or "LP._stats.resource"
+    local instPath, attr = path:match("^(.-)@(.+)$")
+    instPath = instPath or path
+    local current, rest = game, instPath
+    if instPath:sub(1, 2) == "LP" then current, rest = Players.LocalPlayer, instPath:sub(3) end
+    for segment in rest:gmatch("[^%.]+") do
+        if not (current == game and segment == "game") then
+            current = current and current:FindFirstChild(segment)
+        end
+    end
+    return current, attr
+end
+-- money crossing what the last tick waits for (AutoPlaceModule.nextCost) wakes the Auto Place loop at once;
+-- the moment it became affordable is kept for the lag log
+function PV.WatchMoney()
+    local ok, inst, attr = pcall(PV.MoneyValue)
+    if not ok then inst = nil end
+    if inst == PV.moneyInst then return end
+    if PV.moneyConn then pcall(function() PV.moneyConn:Disconnect() end) end
+    PV.moneyInst, PV.moneyConn = inst, nil
+    if not inst then return end
+    pcall(function()
+        local sig = attr and inst:GetAttributeChangedSignal(attr) or inst.Changed
+        PV.moneyConn = sig:Connect(function()
+            local v = tonumber(attr and inst:GetAttribute(attr) or inst.Value)
+            local need = AutoPlaceModule.nextCost
+            -- (flyers on the map: any money gain may pay an air upgrade - the loop looks at once)
+            local gain = v and PV.seenMoney and v > PV.seenMoney
+            PV.seenMoney = v
+            if gain and AutoPlaceModule.flying then AutoPlaceModule.wake = true end
+            if v and need and v >= need then
+                AutoPlaceModule.wake = true
+                PV.affordAt = PV.affordAt or os.clock()
+            end
+        end)
+    end)
+end
+-- what a tick waits for (a price): wakes the loop when the money reaches it; also starts the lag clock
+-- when it is affordable already
+function PV.WaitFor(cost, money)
+    cost = tonumber(cost)
+    if not cost then return end
+    AutoPlaceModule.nextCost = math.min(AutoPlaceModule.nextCost or math.huge, cost)
+    if money and money >= cost then PV.affordAt = PV.affordAt or os.clock() end
+end
+-- a placement / upgrade done: the lag since it became affordable goes into this wave's log
+PV.waveLog = {}
+function PV.Acted()
+    if PV.affordAt then
+        local lag = os.clock() - PV.affordAt
+        PV.waveLag = math.max(PV.waveLag or 0, lag)
+    end
+    PV.affordAt = nil
+end
+-- once a tick: a new wave closes the last one's row (money left unspent at its end, the worst lag)
+function PV.WaveStep(money)
+    local w = AutoPlaceModule.WaveNumber()
+    if w < (PV.logWave or 0) then PV.waveLog = {} end
+    if PV.logWave and w > PV.logWave then
+        table.insert(PV.waveLog, { wave = PV.logWave, unspent = PV.lastMoney and math.floor(PV.lastMoney) or -1,
+            lag = math.floor((PV.waveLag or 0) * 100 + 0.5) / 100 })
+        while #PV.waveLog > 40 do table.remove(PV.waveLog, 1) end
+        PV.waveLag = 0
+    end
+    PV.logWave, PV.lastMoney = w, money
+end
+
 -- Air focus is a quota, not a lock: while flyers are about, the air-capable share of the
 -- placed damage (damage / s) should reach max(40%, share of flyers among enemies seen).
 -- Below it, the next damage unit placed / upgraded is an air-capable one; above it the
@@ -5766,6 +5866,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
     if noWait and pickCost and money and money < pickCost then return nil end
     if pickCost and money and money < pickCost then
         AutoPlaceModule.status = string.format("Upgrade %s to %d: waiting for money %d / %d", unitType(pick), pickLevel + 1, math.floor(money), math.floor(pickCost))
+        PV.WaitFor(pickCost, money)
         return 0.2
     end
     AutoPlaceModule.status = string.format("Upgrading %s (level %d)", unitType(pick), pickLevel)
@@ -5781,6 +5882,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
         task.wait(0.1)
     end
     if lvl and (tonumber(lvl.Value) or 0) > pickLevel then
+        PV.Acted()
         AutoPlaceModule.Note(string.format("upgraded %s to %d (%s%s)", unitType(pick), pickLevel + 1, pickRole,
             pickAir and ", hits flying enemies" or fuse[pick] and ", for the fusion" or BuffRot.isControlSkill(pick) and ", skill copy first" or (pickRank == 2 and ", most damage per ¥" or "")))
     elseif not pickCost and State.eventMode and money then
@@ -5793,7 +5895,7 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
         upgradeFails[pick] = now + 30
         AutoPlaceModule.Note(string.format("could not upgrade %s - skipped for 30 s", unitType(pick)))
     end
-    return pickCost and 0.3 or 1.5
+    return pickCost and 0.1 or 1.5
 end
 
 -- The game shows each team slot's price on the hotbar ("800 ¥") and the cash just above it
@@ -6368,6 +6470,29 @@ end
 --   damageUps: damage upgrades | rest: the normal choice below (chooseNext, value per ¥)
 -- Returns a wait, or a team entry to place (t, role, slot), or nothing (go on with the rest).
 local function v2Plan(money, danger)
+    -- (timing, owner 2026-10-25) flyers on the map: an air-capable unit's upgrade (not a trap's) the moment it is affordable
+    -- (airNeed held on for the call: upgradeStep counts a unit as air only while the air quota is short)
+    if AutoPlace.upgrade and AutoPlaceModule.flying then
+        local need = AutoPlaceModule.airNeed
+        AutoPlaceModule.airNeed = true
+        -- (not the traps: they hit flyers weakly - the build must not lock onto them, flying_mixed_team)
+        local ok, wait = pcall(function()
+            for _, u in ipairs(ownedUnits()) do
+                if unitRole(u) == "dps" and not AutoPlaceModule.IsTrap(unitType(u) or "") then
+                    local w = upgradeStep(money, "dps", true, true, nil, u)
+                    if w then return w end
+                end
+            end
+        end)
+        AutoPlaceModule.airNeed = need
+        if ok and wait then return wait end
+    end
+    -- the wave is ending: an affordable farm upgrade now, before the payout (bought after it, it misses
+    -- that wave's money) - whatever bigger thing the money was saved for
+    if AutoPlace.upgrade and not danger and PV.WaveEnding() then
+        local wait = upgradeStep(money, "farm", nil, true)
+        if wait then return wait end
+    end
     -- (flying enemies on the map, or most enemies seen here fly: the air rules below choose - owner rule, not in the spec)
     if PV.AirStage() then AutoPlaceModule.v2Why = "air" return nil end
     local steps, why = PV.Steps(danger)
@@ -6424,7 +6549,7 @@ local function v2Plan(money, danger)
 end
 
 local function tick()
-    AutoPlaceModule.idleMoney = nil
+    AutoPlaceModule.idleMoney, AutoPlaceModule.nextCost = nil, nil
     -- (where the last tick got to, for the live status: a step that never returns shows here)
     AutoPlaceModule.tickAt, AutoPlaceModule.tickStep = os.clock(), "start"
     if State.replaying then AutoPlaceModule.status = "Paused while the macro plays" return 1 end
@@ -6467,6 +6592,7 @@ local function tick()
     -- money: the learned value, else AA's in-game yen (_stats.resource), else the screen
     local money = (AutoPlace.moneyPath and readCostValue(AutoPlace.moneyPath))
         or readCostValue("LP._stats.resource") or hudMoney
+    if not State.eventMode then pcall(PV.WaveStep, money) end
     AutoPlaceModule.tickStep = "spells"
     pcall(Lobby.SpellStep, money)
     pcall(Lobby.RerollStep)
@@ -6681,6 +6807,7 @@ local function tick()
     end
     if cost and money and money < cost then
         AutoPlaceModule.status = string.format("Slot %d %s: waiting for money %d / %d", slot, t.name, math.floor(money), math.floor(cost))
+        PV.WaitFor(cost, money)
         return 0.1
     end
     end
@@ -6716,6 +6843,7 @@ local function tick()
     -- tryPlace returns, and that copy must not count as the used one)
     local placeStart = os.clock()
     if tryPlace(t, spot) then
+        PV.Acted()
         -- (event: the copy is used up - the placed unit may carry another uuid, so it is not
         -- counted from the map; the bar is read again on the next tick)
         if t.temp then
@@ -7021,12 +7149,17 @@ function AutoPlaceModule.Start()
                 AutoPlaceModule.RefreshTeam()
             end
             lastGame = gameNow
+            -- (timing: the money's Changed signal wakes the wait below once the money reaches what the tick
+            -- waits for - PV.WatchMoney; the tick's own wait stays the fallback)
+            pcall(PV.WatchMoney)
+            AutoPlaceModule.wake = false
             local ok, waitFor = pcall(tick)
             if not ok then
                 AutoPlaceModule.problem = "error: " .. clip(tostring(waitFor), 60)
                 waitFor = 2
             end
-            task.wait(waitFor or 1)
+            local untilT = os.clock() + (waitFor or 1)
+            while os.clock() < untilT and not AutoPlaceModule.wake and AutoPlace.enabled and gen == apGen do task.wait(0.05) end
         end
     end)
 end
@@ -7125,7 +7258,7 @@ function AutoPlaceModule.DumpStep()
         short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
         road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath(), hills = PV.HillSpots(),
         v2 = { rl = PV.Road().len, kind = PV.Kind(PV.Road().len), from = PV.Road().from, lanes = PV.Road().lanes, order = AutoPlaceModule.v2Why,
-            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName() } }
+            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog } }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
@@ -12078,7 +12211,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-000519"
+Lobby.VERSION = "20261026-001743"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
