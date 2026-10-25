@@ -236,7 +236,7 @@ local function buildConfigData()
             mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true,
             prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule, autoShop = DungeonRun.autoShop ~= false,
             goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, picksV2 = DungeonRun.picksV2, lostRooms = DungeonRun.lostRooms, flyMaps = DungeonRun.flyMaps,
-            stuckTotal = DungeonRun.stuckTotal, lastStuck = DungeonRun.lastStuck,
+            stuckTotal = DungeonRun.stuckTotal, lastStuck = DungeonRun.lastStuck, lastStartAt = DungeonRun.lastStartAt,
             lives = DungeonRun.lives },
         unitAI = {
             autoAbilities = UnitAI.autoAbilities,
@@ -325,6 +325,7 @@ local function applyConfigData(data)
     DungeonRun.mode = d.mode == "Auto" and "Auto" or "Fixed"
     DungeonRun.pendingStart = d.pendingStart == true
     DungeonRun.lives = tonumber(d.lives)
+    DungeonRun.lastStartAt = tonumber(d.lastStartAt)
     -- (Setup window: room prefs and the shrine rule; an old config keeps its typed priority)
     DungeonRun.prefs = type(d.prefs) == "table" and d.prefs or nil
     if DungeonRun.prefs and DungeonRun.ApplyPrefs then DungeonRun.ApplyPrefs() end
@@ -9933,8 +9934,11 @@ function DungeonRun.Call(name, arg, before)
     DungeonRun.calls = (DungeonRun.calls or 0) + 1
     local sel, seq = DungeonRun.selSeq or 0, DungeonRun.liveSeq or 0
     local ok, res = pcall(function()
-        if remote:IsA("RemoteFunction") then return remote:InvokeServer(arg) end
-        remote:FireServer(arg)
+        if remote:IsA("RemoteFunction") then
+            if arg == nil then return remote:InvokeServer() end
+            return remote:InvokeServer(arg)
+        end
+        if arg == nil then remote:FireServer() else remote:FireServer(arg) end
         return true
     end)
     local deadline = os.clock() + 5
@@ -10329,6 +10333,13 @@ function DungeonRun.Step()
     -- (only a fresh dungeon_changed shows a run still going: an old copy in memory still has rooms)
     if DungeonRun.pendingStart and DungeonRun.InLobby() and not (st and st.live and st.table == DungeonRun.live and #st.rooms > 0 and not st.ended) then
         return DungeonRun.TryStart()
+    end
+    -- (run over but still in the boss room: the game showed its "Enter Dungeon" page there and its
+    -- dungeon_start() did nothing - owner stuck, 02:38 2026-10-26. Back to the lobby first; the start
+    -- is only ever sent there)
+    if DungeonRun.pendingStart and DungeonRun.InRoom() and not Lobby.ButtonFor("You Died!")
+        and not (st and st.live and st.table == DungeonRun.live and #st.rooms > 0 and not st.ended) then
+        return DungeonRun.LeaveRoom()
     end
     if DungeonRun.InLobby() then
         local wait = DungeonRun.OpenWindowStep(st)
@@ -11166,15 +11177,15 @@ function DungeonRun.ReadRowPrices(pageName, data)
     end
 end
 
--- One chest from the chest page: dungeon_open_chest(true) = gold (seen in Watch), (false) = a normal chest
--- (owner: it opens the same way). A call that errors or changes nothing: the page's Open button by GUI;
+-- One chest from the chest page: dungeon_open_chest(true) = gold, dungeon_open_chest() with no argument =
+-- a normal chest (both seen in Watch, the owner opening chests 02:38 2026-10-26). A call that errors or changes nothing: the page's Open button by GUI;
 -- the reward popups after it are tapped away by Lobby.ClickAnywhere. Which way worked is logged.
 function DungeonRun.OpenChest(st, gold)
     local what = gold and "gold chest" or "chest"
     DungeonRun.status = "opening a " .. what
     DungeonRun.Refresh(st)
-    local ok, answer = DungeonRun.Call("dungeon_open_chest", gold, st)
-    local how = string.format("open_chest(%s)", tostring(gold))
+    local ok, answer = DungeonRun.Call("dungeon_open_chest", gold and true or nil, st)
+    local how = gold and "open_chest(true)" or "open_chest()"
     if not ok then
         local gui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local ui = gui and gui:FindFirstChild("DungeonUI")
@@ -11346,6 +11357,27 @@ function DungeonRun.KeyCount()
     return nil
 end
 
+-- Run over inside a room: back to the lobby (Return to lobby, else teleport_back_to_lobby()), at most
+-- every 30 s; the next run starts in the lobby.
+function DungeonRun.LeaveRoom()
+    DungeonRun.status = "run over - back to the lobby (the next run starts there)"
+    DungeonRun.Refresh(false)
+    if os.clock() - (DungeonRun.leaveAt or -1e9) < 30 then return 3 end
+    DungeonRun.leaveAt = os.clock()
+    local back, remote = Lobby.ButtonFor("Return to lobby"), getAARemote("teleport_back_to_lobby")
+    local how
+    if back then
+        Lobby.TapGui(back) how = "tapped Return to lobby"
+    elseif remote then
+        pcall(function() if remote:IsA("RemoteFunction") then remote:InvokeServer() else remote:FireServer() end end)
+        how = "teleport_back_to_lobby()"
+    else
+        pcall(function() game:GetService("TeleportService"):Teleport(8304191830, Players.LocalPlayer) end)
+        how = "teleport to the lobby"
+    end
+    pcall(Lobby.ShareLog, "dungeon: run over in the room - " .. how)
+    return 3
+end
 -- The next run after one ended: one dungeon_start() per ended run, never retried.
 function DungeonRun.TryStart()
     -- (You Died! still up: it closes the old run first - dungeon_start answered "error" under it, 22:56)
@@ -11355,6 +11387,14 @@ function DungeonRun.TryStart()
         return 3
     end
     DungeonRun.pendingStart = false
+    -- (one dungeon_start() per ended run: a second "run over" or You Died! still up set pendingStart again
+    -- and three starts went out in 2 s - Watch 02:38 2026-10-26. Kept in the config: a reload too)
+    if os.time() - (DungeonRun.lastStartAt or 0) < 120 then
+        saveConfig()
+        DungeonRun.status = "next run: dungeon_start() already sent " .. (os.time() - DungeonRun.lastStartAt) .. " s ago - not again"
+        DungeonRun.Refresh(false)
+        return 5
+    end
     saveConfig()
     -- (the game may already have started the next run itself, after You Died! Continue)
     local live = DungeonRun.live
@@ -11378,6 +11418,8 @@ function DungeonRun.TryStart()
     end
     DungeonRun.status = "starting the next run (keys " .. tostring(keys or "?") .. ")"
     DungeonRun.Refresh(false)
+    DungeonRun.lastStartAt = os.time()
+    saveConfig()
     local seq = DungeonRun.liveSeq or 0
     local ok, res = pcall(function()
         if remote:IsA("RemoteFunction") then return remote:InvokeServer() end
@@ -13308,7 +13350,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-022708"
+Lobby.VERSION = "20261026-025137"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -13643,7 +13685,7 @@ function Lobby.DiedStep(inLobbyNow)
     elseif d.step == 2 then
         call("dungeon_open_chest", true, tonumber(res.treasure_gold))
     elseif d.step == 3 then
-        call("dungeon_open_chest", false, tonumber(res.treasure))
+        call("dungeon_open_chest", nil, tonumber(res.treasure))
     elseif d.step == 4 then
         call("dungeon_continue_death", nil)
     else
