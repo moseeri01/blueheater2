@@ -11215,6 +11215,7 @@ function DungeonRun.LiveStep(st)
     end
     -- (no lives left: the run is over, a room call only answers "error" - 18:05 2026-10-25)
     if st.hearts ~= nil and st.hearts <= 0 then
+        if DungeonRun.enabled and not DungeonRun.pendingStart then DungeonRun.pendingStart = true saveConfig() end
         DungeonRun.status = "no lives left - the run is over"
         DungeonRun.Refresh(st)
         return 3
@@ -11242,17 +11243,25 @@ function DungeonRun.LiveStep(st)
         DungeonRun.Refresh(st)
         return 2
     end
+    -- (rooms the game refused for this choice are not sent again: the other one next, then recovery)
+    local offered = st.rooms
+    local ref = DungeonRun.refusedRooms
+    if ref and ref.table == st.table then
+        offered = {}
+        for _, r in ipairs(st.rooms) do if not ref[tostring(r.id)] then table.insert(offered, r) end end
+        if #offered == 0 then return DungeonRun.AllRefused(st) end
+    end
     local room, why
     if DungeonRun.mode == "Auto" then
-        room = DungeonRun.AutoPick(st.rooms, st.hearts)
+        room = DungeonRun.AutoPick(offered, st.hearts)
         why = room and string.format("score %.2f", room.score or 0)
     else
-        room = DungeonRun.PickRoom(st.rooms)
+        room = DungeonRun.PickRoom(offered)
         why = room and tostring(room.type)
         local typed = false
-        for _, r in ipairs(st.rooms) do if r.type then typed = true end end
+        for _, r in ipairs(offered) do if r.type then typed = true end end
         -- (the run's data names no room types yet: Fixed takes the first room like a macro)
-        if not room and not typed then room, why = st.rooms[1], "first room (types not in the data)" end
+        if not room and not typed then room, why = offered[1], "first room (types not in the data)" end
     end
     if not room then
         DungeonRun.status = "no room fits - pick one yourself"
@@ -11286,7 +11295,16 @@ function DungeonRun.LiveStep(st)
         table.insert(DungeonRun.picks, arg)
         DungeonRun.status = "entered room " .. arg .. " " .. tostring(room.label or "")
     else
-        DungeonRun.blocked = string.format("room %s: the game did not take it (answered %s) - pick by hand", arg, clip(tostring(answer), 30))
+        -- (refused: never "pick by hand" with Auto on - stuck 72 x 10 s after two lost rooms, 04:50
+        -- 2026-10-26. The state is read again; the other room next; none left: DungeonRun.AllRefused)
+        if not (ref and ref.table == st.table) then
+            ref = { table = st.table, rounds = 0 }
+            DungeonRun.refusedRooms = ref
+        end
+        ref[arg] = true
+        DungeonRun.findAt, DungeonRun.lastRead = nil, nil
+        DungeonRun.status = string.format("room %s: not taken (answered %s) - trying another way", arg, clip(tostring(answer), 30))
+        pcall(DungeonRun.Log, DungeonRun.status)
     end
     DungeonRun.Refresh()
     return 1
@@ -11357,6 +11375,28 @@ function DungeonRun.KeyCount()
     return nil
 end
 
+-- Every offered room refused: in a room -> back to the lobby; in the lobby -> the Dungeon window is
+-- opened again by GUI and the rooms tried once more (30 s apart, 3 rounds), then only a new
+-- dungeon_changed is waited for.
+function DungeonRun.AllRefused(st)
+    local ref = DungeonRun.refusedRooms
+    -- (the refused rooms stay refused until the game sends a new choice)
+    if DungeonRun.InRoom() then return DungeonRun.LeaveRoom() end
+    ref.at = ref.at or os.clock()
+    if ref.rounds < 3 and os.clock() - ref.at >= 30 then
+        local menu = not DungeonRun.ChoiceOpen() and Lobby.ButtonFor("Dungeon")
+        if menu then Lobby.TapGui(menu) end
+        DungeonRun.refusedRooms = { table = ref.table, rounds = ref.rounds + 1 }
+        DungeonRun.findAt, DungeonRun.lastRead = nil, nil
+        pcall(DungeonRun.Log, "all rooms refused - trying again (round " .. (ref.rounds + 1) .. ")")
+        DungeonRun.status = "the game took none of the rooms - trying again"
+    else
+        DungeonRun.status = ref.rounds < 3 and "the game took none of the rooms - trying again in a moment"
+            or "the game took none of the rooms - waiting for the game's next update"
+    end
+    DungeonRun.Refresh(st)
+    return 3
+end
 -- Run over inside a room: back to the lobby (Return to lobby, else teleport_back_to_lobby()), at most
 -- every 30 s; the next run starts in the lobby.
 function DungeonRun.LeaveRoom()
@@ -11827,7 +11867,17 @@ DungeonRun.FRAME_IMAGES = { ["rbxassetid://126788194153452"] = true, ["rbxasseti
 DungeonRun.NAME_ICONS = { ["speedy boots"] = "rbxassetid://110168360769036", ["treasure chest"] = "rbxassetid://103690538373746",
     ["curse of armor"] = "rbxassetid://131564693808604", bow = "rbxassetid://83257385637914", dagger = "rbxassetid://99767692490865",
     ["ninja belt"] = "rbxassetid://129383649740464", stormbringer = "rbxassetid://82443821880546", axe = "rbxassetid://126820581831157",
-    ["nimble cloak"] = "rbxassetid://112490194054135" }
+    ["nimble cloak"] = "rbxassetid://112490194054135", ["rare chest"] = "rbxassetid://131900384494075" }
+-- By item id, learned on the owner's device overnight (AAMacro/dungeon_icons.txt 04:48 2026-10-26).
+DungeonRun.ID_ICONS = { _curse_explode = "rbxassetid://138071506989773", _curse_fly = "rbxassetid://105695290005748",
+    _curse_health = "rbxassetid://140526116127521", _curse_money = "rbxassetid://120532049768180",
+    _curse_regen = "rbxassetid://84904860048599", _curse_shield = "rbxassetid://111724563305832",
+    _curse_shop = "rbxassetid://79397081975008", _curse_speed = "rbxassetid://90923902571652",
+    _curse_super_armored = "rbxassetid://131564693808604", _curse_super_explode = "rbxassetid://73460673195104",
+    axe_legendary = "rbxassetid://139862734702895", belt = "rbxassetid://129383649740464", boots = "rbxassetid://110168360769036",
+    bow1 = "rbxassetid://83257385637914", bow2 = "rbxassetid://77865184778652", chest_mock_item = "rbxassetid://116030223007249",
+    cloak = "rbxassetid://131326127048906", gold_branch = "rbxassetid://115471999925377", gold_shroom = "rbxassetid://88524980019321",
+    hook = "rbxassetid://102236070614986", scythe = "rbxassetid://139108386903206", sword2 = "rbxassetid://132738126365453" }
 function DungeonRun.NameKey(name)
     return (string.lower(tostring(name or "")):gsub("^%[[^%]]*%]%s*", ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -11838,7 +11888,8 @@ function DungeonRun.ItemIcon(it)
     if type(icon) == "table" and icon.image then return icon end
     icon = (Lobby.cfg.dungeonItemIcons or {})[it.id]
     if type(icon) == "table" and icon.image and not DungeonRun.FRAME_IMAGES[icon.image] and icon.image ~= DungeonRun.SHOP_ICON then return icon end
-    return DungeonRun.NAME_ICONS[key] and { image = DungeonRun.NAME_ICONS[key] } or nil
+    local baked = DungeonRun.ID_ICONS[it.id] or DungeonRun.NAME_ICONS[key]
+    return baked and { image = baked } or nil
 end
 -- Every item seen: shop, shrine (blessings / curses) and the run's other items (chest relics).
 function DungeonRun.AllItems()
@@ -11859,6 +11910,7 @@ function DungeonRun.WriteIconFile()
     for k, v in pairs(DungeonRun.NAME_ICONS) do
         if not (Lobby.cfg.dungeonNameIcons or {})[k] then table.insert(names, string.format("%q = %q, -- built in", k, v)) end
     end
+    -- (only the items with no built-in picture yet are worth copying back)
     table.sort(names)
     for _, l in ipairs(names) do table.insert(lines, l) end
     table.insert(lines, "## by id")
@@ -13350,7 +13402,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-025137"
+Lobby.VERSION = "20261026-065136"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
