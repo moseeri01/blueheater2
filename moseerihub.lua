@@ -8464,7 +8464,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-102751"
+Lobby.VERSION = "20261025-103025"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8510,7 +8510,8 @@ function Lobby.ShareLog(text)
 end
 function Lobby.ShareGame(win, wave)
     Lobby.ShareLog(string.format("game end: share %s, event %s, wave %s", tostring(Lobby.cfg.shareData), tostring(State.eventMode), tostring(wave)))
-    if not (Lobby.cfg.shareData and State.eventMode) then return end
+    -- (every mode since 2026-10-25, owner: story, raids, dungeon too - "mode" tells them apart)
+    if not Lobby.cfg.shareData then return end
     if not Lobby.shareUrl then
         local ok, url = pcall(function() return game:HttpGet(Lobby.SHARE_URL_FILE) end)
         -- (kept only when found: a failed fetch is tried again next game)
@@ -8529,7 +8530,7 @@ function Lobby.ShareGame(win, wave)
             AutoPlaceModule.IsShiny(u) and 1 or 0, (Lobby.placedAt or {})[u] or -1 })
     end
     -- (pl = players in the room: a duo game is much easier than solo, so stats compare like with like)
-    local data = { v = 1, ver = Lobby.VERSION, pl = #game:GetService("Players"):GetPlayers(), id = Lobby.ShareId(), t = os.time(), map = tostring(State.stage), w = wave, win = win and 1 or 0,
+    local data = { v = 1, mode = State.eventMode and "event" or "other", ver = Lobby.VERSION, pl = #game:GetService("Players"):GetPlayers(), id = Lobby.ShareId(), t = os.time(), map = tostring(State.stage), w = wave, win = win and 1 or 0,
         candy = Lobby.candy or 0, cards = Lobby.cardsTaken or {}, u = units }
     local body = HttpService:JSONEncode(data)
     -- (a Discord message holds 2000 characters: the last-placed units go first when it is long)
@@ -9805,7 +9806,7 @@ event:Toggle({ Name = "Use spells", Default = Lobby.cfg.eventSpells, Callback = 
 event:Toggle({ Name = "Event Auto Place", Default = Lobby.cfg.eventBrain ~= false, Callback = set("eventBrain") }, "EventBrain")
 event:Toggle({ Name = "Share game data", Default = Lobby.cfg.shareData ~= false, Callback = set("shareData") }, "EventShare")
 event:Toggle({ Name = "Auto update", Default = Lobby.cfg.autoUpdate ~= false, Callback = set("autoUpdate") }, "EventAutoUpdate")
-event:Paragraph({ Header = "Shared", Body = "Fool's Hunt results only: map, wave, win, cards, units (level, trait, golden). No name or account info." })
+event:Paragraph({ Header = "Shared", Body = "Every game's result: map, wave, win, cards, units (level, trait, golden). No name or account info." })
 task.delay(5, pcall, Lobby.ShareNotice)
 event:Dropdown({ Name = "Always place", Multi = true, Required = false, Options = AutoPlaceModule.ROSTER,
     Default = picked(Lobby.cfg.eventAlways or {}), Callback = setList("eventAlways") }, "EventAlways")
