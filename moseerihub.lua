@@ -8459,7 +8459,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-092714"
+Lobby.VERSION = "20261025-092913"
 Lobby.SCRIPT_URL = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/moseerihub.lua"
 function Lobby.AutoUpdate()
     if not Lobby.cfg.autoUpdate or Lobby.VERSION == "dev" or Lobby.updating then return end
@@ -8709,6 +8709,18 @@ function Lobby.DamageShare()
     end
     if total <= 0 then return { physical = 0.5, magic = 0.5 } end
     for k, v in pairs(share) do share[k] = v / total end
+    -- (event: the main carry's damage type counts as ours whatever its share - judar is magic, but
+    -- magic was ~22%% of the Always list, so Spellproof +75 was taken as cheap - 2026-10-25)
+    if State.eventMode then
+        local main
+        for _, n in ipairs(AutoPlaceModule.RANK) do
+            for _, u in ipairs(ownedUnits()) do if unitType(u) == n then main = n break end end
+            if main then break end
+        end
+        local def = AutoPlaceModule.UnitDef(main or AutoPlaceModule.RANK[1] or "")
+        local kind = def and tostring(def._base_damage_type or "physical")
+        if kind then share[kind] = math.max(share[kind] or 0, 0.3) end
+    end
     return share
 end
 
