@@ -3029,6 +3029,8 @@ end
 
 -- Called once per finished game.
 function AutoPlaceModule.OnResult(win)
+    -- (a played stage is not new any more: no new-stage hold in the next game on it)
+    AutoPlaceModule.freshStage = {}
     AutoPlace.stageLosses = AutoPlace.stageLosses or {}
     local key, n = AutoPlaceModule.StageName(), AutoPlaceModule.Losses()
     if win then
@@ -3099,49 +3101,85 @@ function AutoPlaceModule.SameMapPath(key)
 end
 AutoPlaceModule.sameMapAt = {}
 AutoPlaceModule.sameMapDone = {}
+AutoPlaceModule.freshStage = {}
+AutoPlaceModule.laneClean = {}
 
--- The game's own road data: _BASES.player.LANES.<lane>.<bend> (MapFingerprint reads it on maps with no
--- _BASES.pve). Bend names' order is not known, so each lane is chained from the bend farthest from our
--- base, nearest bend next; points every 2.5 studs along it, spawn side first. Raw bends go into the
--- placement dump (lanes) to check this on real maps.
+-- The game's own road data: _BASES.pve.LANES / _BASES.player.LANES .<lane>.<bend> (MapFingerprint reads
+-- player LANES on maps with no _BASES.pve). Real dump (Planet Greenie, 2026-10-25): bends "1".."10" plus
+-- "final" by the enemy entrance and "spawn" by our base - "10" next to the entrance, "1" next to our base
+-- (player LANES run base -> entrance: summons walk the road backwards). Raw bends go into the dump.
 function AutoPlaceModule.Lanes()
     local bases = workspace:FindFirstChild("_BASES")
-    local pb = bases and bases:FindFirstChild("player")
-    local lanes = pb and pb:FindFirstChild("LANES")
     local out = {}
-    for _, lane in ipairs(lanes and lanes:GetChildren() or {}) do
-        local bends = {}
-        for _, b in ipairs(lane:GetChildren()) do
-            local ok, p = pcall(function() return b:IsA("BasePart") and b.Position or b:GetPivot().Position end)
-            if ok and p then bends[#bends + 1] = { name = b.Name, x = p.X, y = p.Y, z = p.Z } end
+    for _, side in ipairs({ "pve", "player" }) do
+        local sb = bases and bases:FindFirstChild(side)
+        local lanes = sb and sb:FindFirstChild("LANES")
+        for _, lane in ipairs(lanes and lanes:GetChildren() or {}) do
+            local bends = {}
+            for _, b in ipairs(lane:GetChildren()) do
+                local ok, p = pcall(function() return b:IsA("BasePart") and b.Position or b:GetPivot().Position end)
+                if ok and p then bends[#bends + 1] = { name = b.Name, x = p.X, y = p.Y, z = p.Z } end
+            end
+            if #bends > 0 then out[#out + 1] = { name = lane.Name, side = side, bends = bends } end
         end
-        if #bends > 0 then out[#out + 1] = { name = lane.Name, bends = bends } end
     end
     return out
+end
+-- One lane's bends in walking order, entrance first: numbered bends by number, the named ones
+-- ("final", "spawn") at the end they stand nearer; turned round so it starts away from our base. Only
+-- when no bend name is a number: chained from the bend farthest from our base, nearest bend next.
+function AutoPlaceModule.LaneOrder(bends, g)
+    local function d2(a, b) return (a.x - b.x) ^ 2 + (a.z - b.z) ^ 2 end
+    local nums, named = {}, {}
+    for _, b in ipairs(bends) do
+        if tonumber(b.name) then nums[#nums + 1] = b else named[#named + 1] = b end
+    end
+    local chain = {}
+    if #nums >= 2 then
+        table.sort(nums, function(a, b) return tonumber(a.name) > tonumber(b.name) end)
+        for _, b in ipairs(nums) do chain[#chain + 1] = b end
+        local head, tail = {}, {}
+        for _, b in ipairs(named) do
+            if d2(b, nums[1]) <= d2(b, nums[#nums]) then head[#head + 1] = b else tail[#tail + 1] = b end
+        end
+        for _, b in ipairs(head) do table.insert(chain, 1, b) end
+        for _, b in ipairs(tail) do chain[#chain + 1] = b end
+    else
+        local start, sd = 1, -1
+        for i, p in ipairs(bends) do if d2(p, g) > sd then start, sd = i, d2(p, g) end end
+        local used = { [start] = true }
+        chain[1] = bends[start]
+        while #chain < #bends do
+            local last, bi, bd = chain[#chain], nil, nil
+            for i, p in ipairs(bends) do
+                if not used[i] and (not bd or d2(last, p) < bd) then bi, bd = i, d2(last, p) end
+            end
+            used[bi] = true
+            chain[#chain + 1] = bends[bi]
+        end
+    end
+    if #chain >= 2 and d2(chain[1], g) < d2(chain[#chain], g) then
+        local rev = {}
+        for i = #chain, 1, -1 do rev[#rev + 1] = chain[i] end
+        chain = rev
+    end
+    return chain
 end
 function AutoPlaceModule.LanePath()
     local goal = AutoPlaceModule.BasePos and AutoPlaceModule.BasePos("player")
     if not goal then return nil end
-    local function d2(a, b) return (a.x - b.x) ^ 2 + (a.z - b.z) ^ 2 end
     local g = { x = goal.X, z = goal.Z }
+    local lanes = AutoPlaceModule.Lanes()
+    -- (the enemies' own lanes first when the map has them)
+    local useSide = "player"
+    for _, lane in ipairs(lanes) do if lane.side == "pve" and #lane.bends >= 2 then useSide = "pve" end end
     local out = {}
-    for _, lane in ipairs(AutoPlaceModule.Lanes()) do
-        local bends = lane.bends
-        if #bends >= 2 then
-            local start, sd = 1, -1
-            for i, p in ipairs(bends) do if d2(p, g) > sd then start, sd = i, d2(p, g) end end
-            local chain, used = { bends[start] }, { [start] = true }
-            while #chain < #bends do
-                local last, bi, bd = chain[#chain], nil, nil
-                for i, p in ipairs(bends) do
-                    if not used[i] and (not bd or d2(last, p) < bd) then bi, bd = i, d2(last, p) end
-                end
-                used[bi] = true
-                chain[#chain + 1] = bends[bi]
-            end
+    for _, lane in ipairs(lanes) do
+        if lane.side == useSide and #lane.bends >= 2 then
+            local chain = AutoPlaceModule.LaneOrder(lane.bends, g)
             for i = 1, #chain - 1 do
                 local a, b = chain[i], chain[i + 1]
-                local len = math.sqrt(d2(a, b))
+                local len = math.sqrt((a.x - b.x) ^ 2 + (a.z - b.z) ^ 2)
                 for s = 0, len - 0.01, 2.5 do
                     local t = s / math.max(0.01, len)
                     out[#out + 1] = { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t }
@@ -3172,12 +3210,29 @@ local function pathPoints()
     local key = stageKey()
     if not AutoPlace.paths[key] then
         AutoPlace.paths[key] = AutoPlaceModule.AdoptOldPath(key) or {}
+        -- (nothing saved for this stage: a new one - the only kind the new-stage hold waits on)
+        if #AutoPlace.paths[key] == 0 then AutoPlaceModule.freshStage[key] = true end
     end
     -- (empty, or a stub that does not reach our base: the same map's road from another stage - each
     -- Dungeon Room depth is its own stage - tried once a second, the bases may load late; a stub
     -- keeps its points and gets the other road's points that are not already there)
     local cur = AutoPlace.paths[key]
-    if not AutoPlaceModule.sameMapDone[key] and os.clock() - (AutoPlaceModule.sameMapAt[key] or -1e9) >= 1 then
+    -- (normal stages, once per stage: lane points merged by the old bend chaining - out of order on
+    -- Planet Greenie, its road cut across off-road ground - are dropped; learned samples are always on
+    -- the half-stud grid, lane points are not; the lanes are merged again in the right order below)
+    if not State.eventMode and not AutoPlaceModule.laneClean[key] then
+        AutoPlaceModule.laneClean[key] = true
+        local kept = {}
+        for _, q in ipairs(cur) do
+            if q[1] * 2 == math.floor(q[1] * 2) and q[3] * 2 == math.floor(q[3] * 2) then kept[#kept + 1] = q end
+        end
+        if #kept < #cur then
+            AutoPlace.paths[key], cur = kept, kept
+            AutoPlaceModule.sameMapDone[key] = nil
+            AutoPlaceModule.Note(string.format("old lane points dropped from the saved road (%d left)", #kept))
+        end
+    end
+    if not State.eventMode and not AutoPlaceModule.sameMapDone[key] and os.clock() - (AutoPlaceModule.sameMapAt[key] or -1e9) >= 1 then
         AutoPlaceModule.sameMapAt[key] = os.clock()
         if #cur == 0 or not AutoPlaceModule.Reaches(cur) then
             local same, done = AutoPlaceModule.SameMapPath(key)
@@ -3640,7 +3695,15 @@ local function bestSpot(skip, role, range, kind, aoe, back)
     end
     local free, nearRefused = {}, {}
     for _, c in ipairs(candidates) do
-        if not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) and not (attacks and cover(c) == 0) then
+        -- (normal stages: candidates are built once and kept until the road grows 10%; a spot made
+        -- beside the end of a short road is ON the road once it grows past it - refused, auto_place)
+        local onRoad = false
+        if not State.eventMode and not c.onPath then
+            for _, q in ipairs(pts) do
+                if (q[1] - c.x) ^ 2 + (q[3] - c.z) ^ 2 < 12.25 then onRoad = true break end
+            end
+        end
+        if not onRoad and not badSpots[spotKey(c, kind)] and (kind == "any" or c.kind == kind) and not (attacks and cover(c) == 0) then
             local ok = true
             for _, p in ipairs(mine) do
                 local dx, dz = p.X - c.x, p.Z - c.z
@@ -5747,8 +5810,10 @@ local function tick()
     -- is known when the first unit goes down, so every unit stood forward) the 2nd+ damage unit
     -- waits until the learned path reaches our base - HOLD_PATH s at most, never in danger, not in
     -- Fast clear (units forward on purpose there)
+    -- (a new stage only: where the enemies never reach our base the road stays "short" for good, and
+    -- the script reloads every game - the hold came back each game there, auto_place next game)
     if t and role == "dps" and (dpsPlaced or 0) > 0 and not danger and not State.eventMode and not AutoPlaceModule.flying
-        and AutoPlaceModule.Mode() ~= "Fast clear" and AutoPlaceModule.PathShort() then
+        and AutoPlaceModule.freshStage[stageKey()] and AutoPlaceModule.Mode() ~= "Fast clear" and AutoPlaceModule.PathShort() then
         -- (no early end when the path stops growing: Future City 2026-10-25, homura froze the enemies
         -- by the spawn and the units went down on a 25-point stub 150 studs from our base)
         local key = stageKey()
@@ -5761,7 +5826,9 @@ local function tick()
             -- (the money waits for the next unit: upgrading during the hold put upgrades before placing -
             -- auto_place_upgrade; flyers on the map end the hold, see above)
             AutoPlaceModule.status = string.format("Learning the road to our base (%d points) before more damage units", #pathPoints())
-            return 0.5
+            -- (0.1: the path is sampled once a tick - at 0.5 the enemies moved past PATH_CELL between
+            -- samples and the saved road had gaps; spots in them were on the road, refused next game)
+            return 0.1
         end
     end
     -- Fool's Hunt: its own brain decides (EventChoose); the normal-stage rules below are skipped
@@ -6247,6 +6314,18 @@ AutoPlaceModule.scoredLog = {}
 AutoPlaceModule.DUMP_WAVES = { 1, 5, 10, 20 } -- wave 1: the map scan (lanes) without playing on
 -- For the dump: workspace's top folders, and anything named like a path / waypoint / node / lane /
 -- route (the game has "Show Paths Info" for multi-path modes, so its own path data may be readable).
+-- workspace._road (a Model seen on Planet Greenie): its children, for the dump.
+function AutoPlaceModule.RoadModel()
+    local out = {}
+    local road = workspace:FindFirstChild("_road")
+    for _, c in ipairs(road and road:GetChildren() or {}) do
+        local okp, p = pcall(function() return c:IsA("BasePart") and c.Position or c:GetPivot().Position end)
+        local ok, n = pcall(function() return #c:GetChildren() end)
+        out[#out + 1] = { name = c.Name, class = c.ClassName, children = ok and n or -1,
+            x = okp and p and math.floor(p.X * 10) / 10 or nil, z = okp and p and math.floor(p.Z * 10) / 10 or nil }
+    end
+    return out
+end
 function AutoPlaceModule.MapScan()
     local out = { top = {}, named = {} }
     for _, c in ipairs(workspace:GetChildren()) do
@@ -6310,7 +6389,8 @@ function AutoPlaceModule.DumpStep()
     local data = { stage = State.stage, key = stageKey(), wave = w, mode = AutoPlaceModule.Mode(), hard = AutoPlaceModule.Hard(),
         version = Lobby and Lobby.VERSION, time = os.date("%Y-%m-%d %H:%M:%S"), spawn = xz(s), base = xz(g), swapped = swapped,
         pve = base("pve"), player = base("player"), path = pts, units = units, placements = AutoPlaceModule.scoredLog,
-        short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog }
+        short = AutoPlaceModule.PathShort(), map = AutoPlaceModule.MapScan(), lanes = AutoPlaceModule.Lanes(), bad = AutoPlaceModule.badLog,
+        road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath() }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
@@ -10561,7 +10641,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261025-195831"
+Lobby.VERSION = "20261025-202649"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
