@@ -4863,7 +4863,8 @@ function PV.Rank(free, t, role, r, back)
     if want then
         -- (decided above)
     elseif sub == "carry" then
-        want = function(e) return e.p >= 0.5 end
+        local line = back and 0.75 or 0.5
+        want = function(e) return e.p >= line end
     elseif sub == "damage" and PV.FinishFast() then
         -- (finish fast: the best spot in the front half of the road - PV.FinishFast)
         want = function(e) return e.p < 0.5 end
@@ -5115,14 +5116,6 @@ PV.HARD_LEVEL = 2
 function PV.HardRoom()
     local ok, d = pcall(Stage.levelData)
     return ok and type(d) == "table" and (tonumber(d._lobby_difficulty_scale) or 0) >= PV.HARD_ROOM
-end
--- (b) a hard room: no carry upgrade past HARD_LEVEL while fewer than HARD_DPS damage units are down and one
--- can still be placed
-function PV.CarryHold(u, level)
-    if State.eventMode or level < PV.HARD_LEVEL or not PV.HardRoom() or unitType(u) ~= (PV.Carry() or {}).name then return false end
-    if PV.DpsDown() >= PV.HARD_DPS then return false end
-    for _, x in ipairs(AutoPlaceModule.placeable or {}) do if x.role == "dps" then return true end end
-    return false
 end
 -- our damage units on the map (all, and the ones that are not summoners)
 function PV.DpsDown()
@@ -6234,7 +6227,7 @@ end
 local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
     local remote = getAARemote("upgrade_unit_ingame")
     -- (normal stages: flyers on the map - upgrades only on units that hit them, when one is down; farms by their own call)
-    if not State.eventMode and PV.AirStage() and (onlyRole == "dps" or onlyRole == nil) and PV.AirDown() then airOnly = true end
+    if not State.eventMode and not onlyUnit and PV.AirStage() and (onlyRole == "dps" or onlyRole == nil) and PV.AirDown() then airOnly = true end
     if not remote then return nil end
     -- (owner 2026-10-24: the always-on aura unit (hoshino) is placed early and upgraded to the top
     -- once the damage units are; rotation buffers never)
@@ -6320,8 +6313,6 @@ local function upgradeStep(money, onlyRole, airOnly, noWait, waitCap, onlyUnit)
             -- a farm upgrade must pay back in time (friend's Infinity Mansion loss: ~60k in farms
             -- by wave 9, Bulma at 6, the damage units barely upgraded)
             if can and role == "farm" and not AutoPlaceModule.FarmPays(u, level, cost) then can = false end
-            -- (hard room: the carry waits at HARD_LEVEL for the first damage units - PV.CarryHold)
-            if can and PV.CarryHold(u, level) then can = false end
             -- (spare money only: an upgrade it cannot pay must not block one it can - a farm's
             -- 6500 upgrade held 30k unused in a real game)
             if can and noWait and cost and money and cost > money then can = false end
@@ -7134,140 +7125,187 @@ function AutoPlaceModule.EventChoose(money)
     return 0.5
 end
 
--- v2 order (normal stages): the steps of PV.Steps in turn - the first one not done yet acts.
---   carry: place the carry | carryUp: its upgrades to CARRY_LEVEL | carryMax: its upgrades to the top
---   slow: place a slow unit | farms: place the money units | farmUps: farm upgrades that pay back
---   damageUps: damage upgrades | rest: the normal choice below (chooseNext, value per ¥)
--- Returns a wait, or a team entry to place (t, role, slot), or nothing (go on with the rest).
+-- The single decision (owner 2026-10-26, normal stages): every spend lists every option - place a team unit
+-- (at its best spot, chosen later by bestSpot) or upgrade a unit on the map, farms and buffs included - and
+-- takes the best score = value / cost x need. No step order; the filters are only what the game or the owner
+-- rules out (caps, a full slot, Never lists, out of reach, a farm upgrade that cannot pay back, a rotating buff).
+--   damage unit  : damage / s gained (traits, rolls, area x AOE_VALUE, damage type vs the map); a slow / time-stop
+--                  unit adds SLOW_GAIN-1 of the team's damage / s (the first one fully, later ones a third)
+--   farm         : extra income x waves left, as damage / s at the best damage per yen now, x FARM_DISCOUNT
+--   rotating buff: ROT_GAIN of the team's damage / s for the full set (a copy its share); upgrades 0
+--   aura         : AURA_GAIN of the team's damage / s + its price cut on the money still to come; upgrades half
+--   summon buff  : SUMMON_GAIN of the summoners' damage / s (one copy: the second is filtered by its target)
+--   need         : the margin (low: damage x2, farms x0.3; high: farms x1.5), the room's difficulty before the
+--                  margin is known (a hard room counts as low), flyers on the map (air-capable damage x3), the
+--                  team still small (a new damage unit x SPREAD while fewer than SPREAD_UNTIL are down; farms 0
+--                  with no damage unit down), the
+--                  wave ending (farm upgrades x1.5, before the payout), the base hit (low)
+-- The best option is bought when affordable; else one that is affordable and within SAVE_RATIO of it; else the
+-- money is saved for the best. Each decision goes into AutoPlaceModule.decisions (the dump: chosen + top 3).
+PV.FARM_DISCOUNT_SET, PV.ROT_GAIN, PV.AURA_GAIN, PV.AURA_CUT, PV.SUMMON_GAIN = 1, 0.3, 0.15, 0.05, 0.2
+PV.FARM_DISCOUNT = PV.FARM_DISCOUNT_SET
+PV.SAVE_RATIO = 0.6
+PV.SPREAD, PV.SPREAD_UNTIL, PV.SPREAD_HARD = 1.5, 4, 8 -- a new damage unit counts this much more while fewer damage units are down (more road covered; a hard room: SPREAD_HARD)
+PV.FIRST_COPY = 3                   -- the first copy of a team unit counts this much more (the whole team gets down)
+PV.UP_FLOOR = 0.05                  -- an upgrade with no numbers in the data: this share of the unit's damage / s
+AutoPlaceModule.decisions = {}
 local function v2Plan(money, danger)
-    -- (a) starvation guard: never two carry upgrades in a row while a team unit - damage / slow, or a farm on a
-    -- long road - is unplaced and affordable now (owner's rooms 2026-10-26: one carry upgraded 1->4, lost)
-    if (PV.carryRow or 0) >= 1 then
-        local long = PV.Kind(PV.Road().len) == "long"
-        local best, bv
-        for _, x in ipairs(AutoPlaceModule.placeable or {}) do
-            if x.cost <= (money or 0) and (x.role == "dps" or (x.role == "farm" and long)) then
-                local v = (x.role == "dps" and 1e6 or 0) + AutoPlaceModule.Value(x.t, x.cost ~= math.huge and x.cost or nil)
-                if not bv or v > bv then best, bv = x, v end
-            end
-        end
-        if best then AutoPlaceModule.v2Why = "guard: a unit before another carry upgrade" return nil, best.t, best.role, best.slot end
-    end
-    -- (timing, owner 2026-10-25) flyers on the map: an air-capable unit's upgrade (not a trap's) the moment it is affordable
-    -- (airNeed held on for the call: upgradeStep counts a unit as air only while the air quota is short)
-    if AutoPlace.upgrade and AutoPlaceModule.flying then
-        local need = AutoPlaceModule.airNeed
-        AutoPlaceModule.airNeed = true
-        -- (not the traps: they hit flyers weakly - the build must not lock onto them, flying_mixed_team)
-        local ok, wait = pcall(function()
-            for _, u in ipairs(ownedUnits()) do
-                if unitRole(u) == "dps" and not AutoPlaceModule.IsTrap(unitType(u) or "") then
-                    local w = upgradeStep(money, "dps", true, true, nil, u)
-                    if w then return w end
-                end
-            end
-        end)
-        AutoPlaceModule.airNeed = need
-        if ok and wait then return wait end
-    end
-    -- the wave is ending: an affordable farm upgrade now, before the payout (bought after it, it misses
-    -- that wave's money) - whatever bigger thing the money was saved for
-    if AutoPlace.upgrade and not danger and PV.WaveEnding() then
-        local wait = upgradeStep(money, "farm", nil, true)
-        if wait then return wait end
-    end
-    -- (flying enemies on the map, or most enemies seen here fly: the air rules below choose - owner rule, not in the spec)
-    if PV.AirStage() then AutoPlaceModule.v2Why = "air" return nil end
-    local steps, why = PV.Steps(danger)
-    AutoPlaceModule.v2Why = why
-    local list = AutoPlaceModule.placeable or {}
-    local function entry(test)
-        local best
-        for _, e in ipairs(list) do
-            if test(e) and (not best or e.cost < best.cost or (e.cost == best.cost and e.slot < best.slot)) then best = e end
-        end
-        return best
-    end
-    local carry = PV.Carry()
+    money = money or 0
     local wave = AutoPlaceModule.WaveNumber()
-    -- (a damage unit that is not a summoner goes down by DPS_BY_WAVE whatever the order says)
-    local _, realDown = PV.DpsDown()
-    if realDown == 0 and wave >= PV.DPS_BY_WAVE - 1 then
-        local e, ev
-        for _, x in ipairs(list) do
-            if x.role == "dps" and not PV.IsSummoner(x.t.name) then
-                local v = PV.Power(x.t)
-                if not e or v > ev then e, ev = x, v end
-            end
-        end
-        if e then AutoPlaceModule.v2Why = "damage by wave " .. PV.DPS_BY_WAVE return nil, e.t, e.role, e.slot end
-    end
-    for _, step in ipairs(steps) do
-        if step == "rest" then return nil end
-        -- (from FARM_PHASE_WAVE the carry's upgrades come before more farms: never a farm phase without end)
-        if (step == "farms" or step == "farmUps") and wave >= PV.FARM_PHASE_WAVE then
-            local cu, lv = PV.CarryUnit()
-            if cu and lv < PV.CARRY_LEVEL and nextUpgrade(cu, lv) then step = "skip" end
-        end
-        if step == "rotating" then
-            -- (the rotating buff's full set once 2+ damage units are down: its target is 0 before - BuffCopies)
-            local e = entry(function(x) return x.role == "buff" and PV.BuffKind(x.t.name) == "rotating" end)
-            if e then return nil, e.t, e.role, e.slot end
-        end
-        if step == "aura" then
-            -- (the aura buff: one copy right after the first damage unit, upgraded to the top early - each
-            -- level cuts every price and raises team damage, owner 2026-10-26)
-            local e = PV.DpsDown() >= 1 and entry(function(x) return (x.role == "buff" or x.role == "support") and x.placed == 0 and PV.BuffKind(x.t.name) == "aura" end)
-            if e then return nil, e.t, e.role, e.slot end
-            if AutoPlace.upgrade then
-                for _, u in ipairs(ownedUnits()) do
-                    local r = unitRole(u)
-                    if (r == "buff" or r == "support") and PV.BuffKind(unitType(u) or "") == "aura" then
-                        local wait = upgradeStep(money, nil, nil, why == "low", nil, u)
-                        if wait then return wait end
-                    end
-                end
-            end
-        end
-        if step == "carry" and carry and #placedOf(carry.uuid) == 0 then
-            local e = entry(function(x) return x.t.uuid == carry.uuid end)
-            if e then return nil, e.t, e.role, e.slot end
-        elseif (step == "carryUp" or step == "carryMax") and AutoPlace.upgrade then
-            local cu, lv = PV.CarryUnit()
-            if cu and (step == "carryMax" or lv < PV.CARRY_LEVEL) then
-                local wait = upgradeStep(money, "dps", nil, nil, nil, cu)
-                if wait then return wait end
-            end
-        elseif step == "slow" then
-            local e = entry(function(x) return x.role == "dps" and x.placed == 0 and PV.IsSlow(x.t.name) end)
-            if e then return nil, e.t, e.role, e.slot end
-        elseif step == "farms" then
-            -- (a Golden copy first: it earns more)
-            local e = entry(function(x) return x.role == "farm" and AutoPlaceModule.TraitMods(x.t.traits).money > 1 end)
-                or entry(function(x) return x.role == "farm" end)
-            if e then return nil, e.t, e.role, e.slot end
-        elseif step == "farmUps" and AutoPlace.upgrade then
-            local wait = upgradeStep(money, "farm")
-            if wait then return wait end
-        elseif step == "damageUps" then
-            -- (a new damage copy when it adds more damage per ¥ than the best upgrade, else the upgrade)
-            local e, ev
-            for _, x in ipairs(list) do
-                if x.role == "dps" then
-                    local v = AutoPlaceModule.Value(x.t, x.cost ~= math.huge and x.cost or nil)
-                    if not e or v > ev then e, ev = x, v end
-                end
-            end
-            if e and (not AutoPlace.upgrade or ev >= AutoPlaceModule.BestUpgradeScore()) then return nil, e.t, e.role, e.slot end
-            if AutoPlace.upgrade then
-                local wait = upgradeStep(money, "dps")
-                if wait then return wait end
-            end
-            if e then return nil, e.t, e.role, e.slot end
+    local spend = PV.Spend(danger)
+    if spend == "normal" and PV.lastMargin == nil and PV.HardRoom() then spend = "low" end
+    local needD = (spend == "low" and 2) or (spend == "high" and 0.7) or 1
+    local needF = (spend == "low" and 0.3) or (spend == "high" and 1.5) or 1
+    local needB = 1
+    local flying = AutoPlaceModule.flying ~= nil
+    local ending = PV.WaveEnding()
+    local waves = PV.WaveCount()
+    local left = math.max(1, ((waves and waves < math.huge) and waves or 15) - wave)
+    -- the team now: damage / s of our damage units, of the summoners, and whether a slow unit is down
+    local teamDps, summonDps, slowDown, dpsDown = 0, 0, false, 0
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "dps" then
+            local def = AutoPlaceModule.UnitDef(unitType(u) or "") or {}
+            local v = (AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(def))
+            teamDps, dpsDown = teamDps + v, dpsDown + 1
+            if PV.IsSummoner(unitType(u) or "") then summonDps = summonDps + v end
+            if PV.IsSlow(unitType(u) or "") then slowDown = true end
         end
     end
-    return nil
+    local function dmgValue(name, dps)
+        local v = dps * (AutoPlaceModule.IsAoe(name) and AutoPlaceModule.AOE_VALUE or 1) * PV.TypeFactor(name)
+        if PV.IsSlow(name) then v = v + (PV.SLOW_GAIN - 1) * teamDps * (slowDown and 0.33 or 1) end
+        if flying and AutoPlaceModule.airNeed and AutoPlaceModule.AirCapable(name, math.huge) then v = v * (AutoPlaceModule.IsTrap(name) and (AutoPlaceModule.airRealInTeam and 1 or 1.5) or 3) end
+        return v * needD
+    end
+    local opts = {}
+    local function add(o) if o.cost and o.cost > 0 and o.cost < math.huge and o.value and o.value > 0 then o.score = o.value / o.cost opts[#opts + 1] = o end end
+    -- 1. damage options first (the best damage per yen prices the farms and buffs)
+    for _, e in ipairs(AutoPlaceModule.placeable or {}) do
+        if e.role == "dps" then
+            local s = AutoPlaceModule.Stats(e.t)
+            local def = AutoPlaceModule.UnitDef(e.t.name) or {}
+            add({ kind = "place", e = e, what = "place " .. e.t.name, cost = e.cost ~= math.huge and e.cost or tonumber(def.cost),
+                value = dmgValue(e.t.name, s.damage / math.max(0.1, s.cooldown)) * (dpsDown < (PV.HardRoom() and PV.SPREAD_HARD or PV.SPREAD_UNTIL) and (PV.HardRoom() and 2 or PV.SPREAD) or 1) * (e.placed == 0 and PV.FIRST_COPY or 1) })
+        end
+    end
+    local now = os.clock()
+    -- (filter, owner 2026-10-26: no second carry upgrade in a row while a damage unit is unplaced and affordable)
+    local carryName = (PV.Carry() or {}).name
+    local waiting = false
+    -- (a unit that costs no more than the carry's next upgrade could be bought instead of it)
+    local carryUp = math.huge
+    for _, u in ipairs(ownedUnits()) do
+        if unitType(u) == carryName then
+            local okU, c = nextUpgrade(u, AutoPlaceModule.StatNum(u, "upgrade") or 0)
+            if okU and c then carryUp = math.min(carryUp, c) end
+        end
+    end
+    for _, e in ipairs(AutoPlaceModule.placeable or {}) do if e.role == "dps" and e.placed == 0 and (e.cost <= money or e.cost <= carryUp) then waiting = true end end
+    local noCarryUp = (PV.carryRow or 0) >= 1 and waiting
+    for _, u in ipairs(ownedUnits()) do
+        local role, name = unitRole(u), unitType(u) or ""
+        local lv = AutoPlaceModule.StatNum(u, "upgrade") or 0
+        local can, cost = nextUpgrade(u, lv)
+        if can and cost and (upgradeFails[u] or 0) < now and not (PV.skipUp[u] and PV.skipUp[u] > now)
+            and not (AutoPlaceModule.UP_CAP[name] and lv >= AutoPlaceModule.UP_CAP[name]) and not (noCarryUp and name == carryName) then
+            if role == "dps" and not AutoPlaceModule.OutOfReach(u) then
+                local def = AutoPlaceModule.UnitDef(name) or {}
+                local own = (AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(def))
+                local gain = math.max(upgradeGain(u, lv), PV.UP_FLOOR * own)
+                -- (owner 2026-10-24: the Unique-trait unit is upgraded first, to the top)
+                local uniq = AutoPlaceModule.HasTrait(u, "unique") and 100 or 1
+                add({ kind = "upgrade", u = u, what = "upgrade " .. name .. " to " .. (lv + 1), cost = cost, value = dmgValue(name, gain) * uniq })
+            end
+        end
+    end
+    local bestDpy = 0
+    for _, o in ipairs(opts) do bestDpy = math.max(bestDpy, o.score / needD) end
+    if bestDpy <= 0 then bestDpy = 0.01 end
+    -- 2. farms, buffs: priced in damage / s at the best damage per yen now
+    for _, e in ipairs(AutoPlaceModule.placeable or {}) do
+        local name = e.t.name
+        local def = AutoPlaceModule.UnitDef(name) or {}
+        local cost = e.cost ~= math.huge and e.cost or tonumber(def.cost)
+        if e.role == "farm" and teamDps > 0 then
+            local inc = (tonumber(def.farm_amount) or 0) * (AutoPlaceModule.TraitMods(e.t.traits).money or 1)
+            add({ kind = "place", e = e, what = "place " .. name, cost = cost, value = inc * left * bestDpy * PV.FARM_DISCOUNT * needF * (e.placed == 0 and PV.FIRST_COPY or 1) })
+        elseif e.role == "buff" or e.role == "support" then
+            local kind = PV.BuffKind(name)
+            local v = 0
+            if kind == "rotating" then v = PV.ROT_GAIN * teamDps / math.max(1, AutoPlaceModule.BuffNeed(e.t))
+            elseif kind == "aura" then v = (PV.AURA_GAIN * teamDps + PV.AURA_CUT * (money + 1000 * left) * bestDpy) * (e.placed == 0 and (dpsDown >= 1 and 100 or 10) or 1) -- (owner: the aura right after the first damage unit)
+            elseif kind == "summon" then v = PV.SUMMON_GAIN * summonDps
+            elseif kind == "farm" then v = 0.1 * 100 * left * bestDpy
+            else v = 0.1 * teamDps end
+            add({ kind = "place", e = e, what = "place " .. name .. " (" .. kind .. ")", cost = cost, value = v * needD * needB * (e.placed == 0 and kind ~= "aura" and PV.FIRST_COPY or 1) })
+        end
+    end
+    for _, u in ipairs(ownedUnits()) do
+        local role, name = unitRole(u), unitType(u) or ""
+        local lv = AutoPlaceModule.StatNum(u, "upgrade") or 0
+        local can, cost = nextUpgrade(u, lv)
+        if can and cost and (upgradeFails[u] or 0) < now and not (PV.skipUp[u] and PV.skipUp[u] > now) then
+            local carryT = PV.Carry()
+            if role == "farm" and teamDps > 0 and (not carryT or #placedOf(carryT.uuid) > 0) and AutoPlaceModule.FarmPays(u, lv, cost) then
+                local def = AutoPlaceModule.UnitDef(name) or {}
+                local up = def.upgrade or def.upgrades or {}
+                local cur = lv == 0 and tonumber(def.farm_amount) or (type(up[lv]) == "table" and tonumber(up[lv].farm_amount)) or 0
+                local nxt = type(up[lv + 1]) == "table" and tonumber(up[lv + 1].farm_amount) or cur
+                local gain = math.max(0, nxt - (cur or 0)) * (AutoPlaceModule.HasTrait(u, "golden") and AutoPlaceModule.GOLDEN_MONEY or 1)
+                add({ kind = "upgrade", u = u, what = "upgrade " .. name .. " to " .. (lv + 1), cost = cost,
+                    value = gain * left * bestDpy * PV.FARM_DISCOUNT * needF * (ending and 3 or 1) })
+            elseif role == "buff" or role == "support" then
+                local kind = PV.BuffKind(name)
+                local v = 0
+                if kind == "aura" then v = 0.5 * (PV.AURA_GAIN * teamDps + PV.AURA_CUT * (money + 1000 * left) * bestDpy)
+                elseif kind ~= "rotating" and kind ~= "farm" then v = PV.BuffUpScore(u, lv, cost) * cost end
+                add({ kind = "upgrade", u = u, what = "upgrade " .. name .. " to " .. (lv + 1), cost = cost, value = v * needD })
+            end
+        end
+    end
+    table.sort(opts, function(a, b) return a.score > b.score end)
+    AutoPlaceModule.v2Why = spend
+    local best = opts[1]
+    if not best then
+        AutoPlaceModule.status = "All units placed and fully upgraded"
+        return 1
+    end
+    local pick = best
+    if best.cost > money then
+        for _, o in ipairs(opts) do
+            if o.cost <= money and o.score >= PV.SAVE_RATIO * best.score then pick = o break end
+            -- (the wave ending: an affordable farm upgrade before the payout - owner 2026-10-25)
+            if ending and o.cost <= money and o.kind == "upgrade" and unitRole(o.u) == "farm" then pick = o break end
+            -- (flyers on the map: an air-capable damage option the moment it is affordable - owner 2026-10-25)
+            local nm = o.e and o.e.t.name or (o.u and unitType(o.u)) or ""
+            if flying and o.cost <= money and AutoPlaceModule.AirCapable(nm, math.huge) and not (AutoPlaceModule.airRealInTeam and AutoPlaceModule.IsTrap(nm)) and ((o.e and o.e.role == "dps") or (o.u and unitRole(o.u) == "dps")) then pick = o break end
+        end
+    end
+    -- the log: chosen + the next three
+    local row = { wave = wave, money = math.floor(money), spend = spend, chosen = pick.what, score = math.floor(pick.score * 1e4) / 1e4, alts = {} }
+    for i = 1, math.min(4, #opts) do
+        if opts[i] ~= pick and #row.alts < 3 then row.alts[#row.alts + 1] = { what = opts[i].what, score = math.floor(opts[i].score * 1e4) / 1e4, cost = opts[i].cost } end
+    end
+    local log = AutoPlaceModule.decisions
+    local last = log[#log]
+    if not (last and last.chosen == row.chosen and last.wave == row.wave) then
+        log[#log + 1] = row
+        while #log > 40 do table.remove(log, 1) end
+    end
+    if pick.kind == "place" then return nil, pick.e.t, pick.e.role, pick.e.slot end
+    if not AutoPlace.upgrade then
+        AutoPlaceModule.idleMoney = money >= 2000 and money or nil
+        AutoPlaceModule.status = "Upgrades are off"
+        return 1
+    end
+    local wait = upgradeStep(money, nil, nil, nil, nil, pick.u)
+    if wait then return wait end
+    -- (refused by upgradeStep's own filters: another option next tick)
+    PV.skipUp[pick.u] = now + 5
+    return 0.1
 end
+PV.skipUp = setmetatable({}, { __mode = "k" })
 
 local function tick()
     AutoPlaceModule.idleMoney, AutoPlaceModule.nextCost, AutoPlaceModule.v2Picked = nil, nil, nil
@@ -7423,10 +7461,11 @@ local function tick()
     if not ev and not State.eventMode and not AutoPlace.manual then
         local wait, vt, vrole, vslot = v2Plan(money, danger)
         if wait then return wait end
-        if vt then t, role, slot = vt, vrole, vslot end
-        AutoPlaceModule.v2Picked = vt ~= nil
+        if not vt then return 0.5 end
+        t, role, slot = vt, vrole, vslot
+        AutoPlaceModule.v2Picked = true
     end
-    if not ev then
+    if not ev and not AutoPlaceModule.v2Picked then
     -- Fool's Hunt: 20 units at most on the map (seen in the real game); then the money goes into
     -- upgrades instead of refused placements
     if t and AutoPlaceModule.hotbarAt and #ownedUnits() >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99) then t = nil end
@@ -8009,7 +8048,8 @@ function AutoPlaceModule.DumpStep()
         road = AutoPlaceModule.RoadModel(), lanePath = AutoPlaceModule.LanePath(), hills = PV.HillSpots(),
         control = AutoPlaceModule.ControlReport(),
         v2 = { rl = PV.Road().len, kind = PV.Kind(PV.Road().len), from = PV.Road().from, lanes = PV.Road().lanes, order = AutoPlaceModule.v2Why,
-            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog, fast = PV.FinishFast(), highStreak = PV.highStreak } }
+            margin = PV.lastMargin, depth = PV.lastDepth, speed = PV.speed, buff = PV.BuffShare(), carry = AutoPlaceModule.CarryName(), waves = PV.waveLog, fast = PV.FinishFast(), highStreak = PV.highStreak,
+            decisions = AutoPlaceModule.decisions } }
     local ok, text = pcall(function() return HttpService:JSONEncode(data) end)
     if ok and type(writefile) == "function" then
         pcall(function() writefile(Config.Folder .. "/placement_dump.json", text) end)
@@ -13418,7 +13458,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-080919"
+Lobby.VERSION = "20261026-081539"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
