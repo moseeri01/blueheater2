@@ -235,7 +235,7 @@ local function buildConfigData()
             openRareAtEnd = DungeonRun.openRareAtEnd, autoContinueDeath = DungeonRun.autoContinueDeath,
             mode = DungeonRun.mode, enabled = DungeonRun.enabled == true, pendingStart = DungeonRun.pendingStart == true,
             prefs = DungeonRun.prefs, shrineRule = DungeonRun.shrineRule, autoShop = DungeonRun.autoShop ~= false,
-            goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, picksV2 = DungeonRun.picksV2, lostRooms = DungeonRun.lostRooms, flyMaps = DungeonRun.flyMaps,
+            goldChests = DungeonRun.goldChests or "end", itemPrefs = DungeonRun.itemPrefs, picksV2 = DungeonRun.picksV2, lostRooms = DungeonRun.lostRooms, lastLoss = DungeonRun.lastLoss, flyMaps = DungeonRun.flyMaps,
             stuckTotal = DungeonRun.stuckTotal, lastStuck = DungeonRun.lastStuck, lastStartAt = DungeonRun.lastStartAt,
             lives = DungeonRun.lives },
         unitAI = {
@@ -336,6 +336,7 @@ local function applyConfigData(data)
     DungeonRun.picksV2 = d.picksV2 == true or nil
     DungeonRun.legacyPicks = not DungeonRun.picksV2 and next(DungeonRun.itemPrefs) ~= nil or nil
     DungeonRun.lostRooms = type(d.lostRooms) == "table" and d.lostRooms or {}
+    DungeonRun.lastLoss = type(d.lastLoss) == "table" and d.lastLoss or nil
     DungeonRun.flyMaps = type(d.flyMaps) == "table" and d.flyMaps or {}
     DungeonRun.stuckTotal, DungeonRun.lastStuck = tonumber(d.stuckTotal), type(d.lastStuck) == "string" and d.lastStuck or nil
     -- (every room is a teleport and the script reloads there: Auto dungeon has to come back on)
@@ -10685,6 +10686,9 @@ function DungeonRun.NoteLoss()
     local key = DungeonRun.RoomKey(depth, d)
     DungeonRun.lostRooms = DungeonRun.lostRooms or {}
     DungeonRun.lostRooms[key] = (tonumber(DungeonRun.lostRooms[key]) or 0) + 1
+    -- (the next choice at this depth: the game only takes a retry of THIS room - Watch: the retry after a
+    -- loss is dungeon_enter_room on the same room; room 2 answered error, 04:50 2026-10-26)
+    DungeonRun.lastLoss = { depth = depth, key = key, choice = type(d._dungeon) == "table" and d._dungeon.choice_str and tostring(d._dungeon.choice_str) or nil }
     pcall(DungeonRun.Log, "lost room " .. key .. " x" .. DungeonRun.lostRooms[key])
     saveConfig()
 end
@@ -11245,14 +11249,26 @@ function DungeonRun.LiveStep(st)
     end
     -- (rooms the game refused for this choice are not sent again: the other one next, then recovery)
     local offered = st.rooms
+    -- (just lost a room at this depth: its retry is the only choice the game takes; the lost-room
+    -- penalty is for choices elsewhere)
+    local loss, retry = DungeonRun.lastLoss, nil
+    if type(loss) == "table" then
+        for _, r in ipairs(st.rooms) do
+            if tonumber(r.depth) == tonumber(loss.depth) and (loss.choice and tostring(r.id) == loss.choice or not loss.choice and DungeonRun.RoomKey(r.depth, r.l) == loss.key) then retry = r end
+        end
+        if retry then offered = { retry } end
+    end
     local ref = DungeonRun.refusedRooms
     if ref and ref.table == st.table then
-        offered = {}
-        for _, r in ipairs(st.rooms) do if not ref[tostring(r.id)] then table.insert(offered, r) end end
-        if #offered == 0 then return DungeonRun.AllRefused(st) end
+        local left = {}
+        for _, r in ipairs(offered) do if not ref[tostring(r.id)] then table.insert(left, r) end end
+        if #left == 0 then return DungeonRun.AllRefused(st) end
+        offered = left
     end
     local room, why
-    if DungeonRun.mode == "Auto" then
+    if retry then
+        room, why = retry, "retry of the room lost here"
+    elseif DungeonRun.mode == "Auto" then
         room = DungeonRun.AutoPick(offered, st.hearts)
         why = room and string.format("score %.2f", room.score or 0)
     else
@@ -11344,7 +11360,7 @@ function DungeonRun.OnChanged(p)
     local over = next(p) == nil or (not running and #rooms == 0 and (DungeonRun.lastDepth or 0) >= 20)
     if over then
         note("run over at depth " .. tostring(DungeonRun.lastDepth))
-        DungeonRun.lostRooms, DungeonRun.refused, DungeonRun.pagePrices = {}, nil, nil
+        DungeonRun.lostRooms, DungeonRun.refused, DungeonRun.pagePrices, DungeonRun.lastLoss = {}, nil, nil, nil
         if DungeonRun.enabled then DungeonRun.pendingStart = true saveConfig() end
     elseif #rooms > 0 then DungeonRun.startNote = nil end
     if not over and (running or #rooms > 0) and DungeonRun.pendingStart then
@@ -13402,7 +13418,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-065136"
+Lobby.VERSION = "20261026-080919"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
