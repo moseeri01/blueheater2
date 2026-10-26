@@ -4698,6 +4698,107 @@ function PV.Shape(name)
 end
 -- slow / freeze / stun in its main attack or its active skill
 PV.SLOW_UNITS = {}
+-- Time-stop spots by value, not a fixed spacing (owner 2026-10-26, placement_method.md "Homura /
+-- time-stop spacing"): PV.TimeStopValue scores a spot by the road it stops inside the carry's reach x
+-- the stop length, minus road another copy already stops x the gap - so copies chain along the road
+-- and stay where the carry hits. The reach planned is the one the copy will really have in this
+-- stage (PV.TimeStopLevel: top on long stages, what the money forecast pays on 15-wave ones).
+function PV.IsTimeStop(name)
+    local def = AutoPlaceModule.UnitDef(name) or {}
+    local a = string.lower(tostring(def.active_attack or ""))
+    return a:find("stop", 1, true) ~= nil or a:find("freeze", 1, true) ~= nil or a:find("stun", 1, true) ~= nil
+end
+-- Upgrade level a time-stop copy will realistically reach (owner 2026-10-26): long stages (event,
+-- 20+ waves, endless - PV.LongStage) the top; 15-wave stages what a share (STOP_SHARE) of the money
+-- forecast pays: money in hand + the farms' income per wave x waves left, against the upgrade costs.
+PV.STOP_SHARE = 0.25
+function PV.TimeStopLevel(name)
+    local def = AutoPlaceModule.UnitDef(name) or {}
+    local up = type(def.upgrade) == "table" and def.upgrade or {}
+    if PV.LongStage() then return #up end
+    local left = math.max(0, (PV.WaveCount() or 15) - AutoPlaceModule.WaveNumber())
+    local farm = 0
+    for _, u in ipairs(ownedUnits()) do
+        if unitRole(u) == "farm" then farm = farm + (AutoPlaceModule.StatNum(u, "farm_amount") or 0) end
+    end
+    local share = ((tonumber(PV.seenMoney) or 0) + farm * left) * PV.STOP_SHARE
+    local lvl, sum = 0, 0
+    for i, s in ipairs(up) do
+        sum = sum + (tonumber(type(s) == "table" and s.cost) or math.huge)
+        if sum > share then break end
+        lvl = i
+    end
+    return lvl
+end
+-- Reach the copy plans for: its reach now (r: rolls, traits, run buffs) grown as the data range grows
+-- from level 0 to TimeStopLevel.
+function PV.TimeStopReach(t, r)
+    local now = AutoPlaceModule.DefRangeAt(t.name, 0)
+    if now <= 0 then return r end
+    return r * AutoPlaceModule.DefRangeAt(t.name, PV.TimeStopLevel(t.name)) / now
+end
+-- Time-stop value of a spot (score hook for the chooser): road it stops that the carry hits (the rest
+-- counts STOP_OFF_CARRY) x the stop length; road another time-stop copy already stops counts minus the
+-- immunity gap instead (a second stop there lands on stopped or immune enemies). Stop length and gap as
+-- measured (AutoPlace.stopTimes), else 5 s / 3 s.
+PV.STOP_OFF_CARRY = 0.3
+PV.STOP_BASE_SIDE = 0.6 -- carry's road past its middle (toward our base) counts this much
+function PV.TimeStopValue(c, t, r, road)
+    local reach = PV.TimeStopReach(t, r)
+    local def = AutoPlaceModule.UnitDef(t.name) or {}
+    local times = (AutoPlace.stopTimes or {})[tostring(def.active_attack or "")] or {}
+    local dur, gap = times.dur or 5, times.gap or 3
+    local cu = PV.CarryUnit()
+    local cp = cu and rootPos(cu)
+    local cr = cu and (AutoPlaceModule.StatNum(cu, "range") or unitReach(cu))
+    -- (the carry's stretch: its mean road position - stops on the enemy side of it hold enemies before
+    -- they walk through, v2 rule "slow on the carry's bend, on the enemy side")
+    local cMean
+    if cp then
+        local s, n = 0, 0
+        for _, q in ipairs(road.pts) do
+            if (q[1] - cp.X) ^ 2 + (q[3] - cp.Z) ^ 2 <= cr * cr then s, n = s + q.p * (q.w or 1), n + (q.w or 1) end
+        end
+        cMean = n > 0 and s / n or nil
+    end
+    local others = {}
+    for _, u in ipairs(ownedUnits()) do
+        if BuffRot.isControlSkill(u) then
+            local p = rootPos(u)
+            if p then others[#others + 1] = { p, AutoPlaceModule.ControlReach(u) } end
+        end
+    end
+    local v = 0
+    for _, q in ipairs(road.pts) do
+        if (q[1] - c.x) ^ 2 + (q[3] - c.z) ^ 2 <= reach * reach then
+            local w = q.w or 1
+            local inCarry = not cp or (q[1] - cp.X) ^ 2 + (q[3] - cp.Z) ^ 2 <= cr * cr
+            local covered = false
+            for _, o in ipairs(others) do
+                if (q[1] - o[1].X) ^ 2 + (q[3] - o[1].Z) ^ 2 <= o[2] * o[2] then covered = true break end
+            end
+            -- (road another copy stops already: a second stop there adds nothing and costs the gap)
+            local f = inCarry and ((cMean and q.p > cMean) and PV.STOP_BASE_SIDE or 1) or PV.STOP_OFF_CARRY
+            if covered then v = v - w * gap else v = v + w * dur * f end
+        end
+    end
+    return v
+end
+-- The hook PV.Rank consults for a time-stop unit: the spots within 90% of the best time-stop value
+-- (up to 250 spots - the top ones by cover all sit where the first copies already stop; when every
+-- spot overlaps, the least bad one). nil = no opinion.
+function PV.TimeStopWant(t, r, road, list, top)
+    if not (t and PV.IsTimeStop(t.name)) or not road or not list or #list == 0 then return nil end
+    local best
+    for i = 1, math.min(250, #list) do
+        local e = list[i]
+        e.stopValue = PV.TimeStopValue(e.c, t, r, road)
+        if not best or e.stopValue > best then best = e.stopValue end
+    end
+    PV.lastTimeStop = { unit = t.name, level = PV.TimeStopLevel(t.name), reach = PV.TimeStopReach(t, r), value = best }
+    local line = best > 0 and 0.9 * best or best
+    return function(e) return e.stopValue ~= nil and e.stopValue >= line end, "timestop+value"
+end
 function PV.IsSlow(name)
     if PV.SLOW_UNITS[name] then return true end
     for _, f in ipairs({ false, "active_attack" }) do
@@ -4849,6 +4950,12 @@ function PV.Rank(free, t, role, r, back)
     -- (a lane of LANE_MIN+ studs that no damage unit reaches - a second road, "A new path has opened!" -
     -- gets the next damage unit: the spots reaching it, best cover first)
     local gap = (sub == "damage" or sub == "slow") and PV.UncoveredLane(road)
+    -- (a time-stop copy with another one down: the next stretch toward our base - PV.TimeStopWant, the
+    -- control-skill job's hook; nil leaves the choice to the rules below)
+    if not gap and (sub == "slow" or sub == "damage") and PV.TimeStopWant then
+        local tw, tl = PV.TimeStopWant(t, r, road, list, top)
+        if tw then want, sub = tw, tl end
+    end
     if gap then
         local lanePts = {}
         for _, q in ipairs(road.pts) do if q.lane == gap then lanePts[#lanePts + 1] = q end end
@@ -5705,10 +5812,20 @@ function ControlUp.dataNum(u, words)
     for _, v in pairs(entry) do if type(v) == "table" then n = look(v) if n then return n end end end
     return nil
 end
+-- The immunity gap from what was seen: longer than every cast that did nothing (lo), at most the
+-- shortest wait after which one worked (hi). Both seen: the middle + 0.3 s (a stop end is seen up to one
+-- 0.3 s look late); only lo: lo + 1; only hi: hi.
+function ControlUp.SetGap(times)
+    local lo, hi = times.lo, times.hi
+    if lo and hi and hi > lo then times.gap = math.floor(((lo + hi) / 2 + 0.3) * 10 + 0.5) / 10
+    elseif lo then times.gap = math.floor((lo + 1) * 10 + 0.5) / 10
+    elseif hi then times.gap = math.floor(math.min(hi, ControlUp.STOP_GAP) * 10 + 0.5) / 10 end
+end
 function ControlUp.gap(u)
     local t = (AutoPlace.stopTimes or {})[ControlUp.skillId(u)] or {}
     return ControlUp.dataNum(u, { "immun" }) or t.gap or ControlUp.STOP_GAP
 end
+AutoPlaceModule.ControlReach = function(u) return ControlUp.reach(u) end
 function ControlUp.reach(u)
     local def = AutoPlaceModule.UnitDef(unitType(u)) or {}
     return (AutoPlaceModule.StatNum(u, "range") or tonumber(def.range) or DEFAULT_RANGE) * (AutoPlaceModule.StatNum(u, "range_multiplier") or 1)
@@ -5776,10 +5893,18 @@ function ControlUp.Watch(now)
             if s then s.wasted = s.wasted + 1 end
             local prev = ControlUp.prevEnd
             if prev and st.at - prev < 15 then
-                times.gap = math.max(times.gap or ControlUp.STOP_GAP, st.at - prev + 1)
+                -- (cast this long after a stop ended and it did nothing: the gap is longer)
+                times.lo = math.max(times.lo or 0, st.at - prev)
+                ControlUp.SetGap(times)
                 AutoPlace.stopTimes[st.id] = times
             end
-            AutoPlaceModule.Note(string.format("%s's stop did nothing (enemies kept moving)", unitType(st.unit) or "?"))
+            AutoPlaceModule.Note(string.format("%s's stop did nothing (enemies kept moving, %.1f s after the last stop ended)",
+                unitType(st.unit) or "?", prev and (st.at - prev) or -1))
+        elseif ControlUp.prevEnd and st.at - ControlUp.prevEnd < 15 then
+            -- (it worked this long after the last stop ended: the gap is at most that)
+            times.hi = math.min(times.hi or math.huge, st.at - ControlUp.prevEnd)
+            ControlUp.SetGap(times)
+            AutoPlace.stopTimes[st.id] = times
         end
         return
     end
@@ -13458,7 +13583,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-081539"
+Lobby.VERSION = "20261026-085441"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
