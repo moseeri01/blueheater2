@@ -2989,10 +2989,12 @@ PV.MIN_NORMAL = 0.85                   -- a spot's ground must be flatter than t
 PV.REFUSED_GONE = 3                    -- a refused spot and this far around it: never tried again this game
 PV.PLACE_REACH = 30                    -- hill-placement spots at most this far from the road
 PV.SUMMON_COVER = 0.5                  -- a summoner's summons work along this share of the road (margin)
--- Fool's Hunt on the v2 spot rules (AutoPlace.v2Event = true; off by default - owner 2026-10-26, on hold): the road, cov / best, the carry /
--- damage / slow / summoner / buff spots; Merge keeps its rule (a copy next to its own kind first). What to buy
--- stays the event brain's (EventChoose).
-function PV.EventOn() return AutoPlace.v2Event == true end
+-- Fool's Hunt on v2 (on by default - owner 2026-10-26; AutoPlace.v2Event = false turns it off): the road, cov / best,
+-- the carry / damage / slow / summoner / buff spots; Merge keeps its rule (a copy next to its own kind first). What to
+-- buy is the single decision (v2Plan); the event brain (EventChoose) only filters the bar: copies it clears, the
+-- Never / Always lists, caps and the swap at the map limit (AutoPlaceModule.eventOk). 30 waves, the depth margin.
+function PV.EventOn() return AutoPlace.v2Event ~= false end
+PV.EVENT_WAVES = 30
 -- The map's hill-placement parts (Hill4_Placement ...): parts under _terrain / _map with "placement" in
 -- their own or a parent's name (4 levels); read again every 10 s.
 function PV.PlacementParts()
@@ -4847,8 +4849,11 @@ function PV.Carry()
     local best, bv, bs
     for s = 1, 6 do
         local t = AutoPlaceModule.team[s]
+        -- (none down and it found no spot on this map: not the carry while it rests - a hill carry on a map with no
+        -- hill places held every upgrade back, matrix 2026-10-26)
         if t and (AutoPlaceModule.RoleOf(t) or "dps") == "dps" and AutoPlaceModule.SlotTarget(s, t) > 0
-            and (not AutoPlaceModule.full[t.uuid] or #placedOf(t.uuid) > 0) then
+            and (not AutoPlaceModule.full[t.uuid] or #placedOf(t.uuid) > 0)
+            and not ((AutoPlaceModule.noSpot[t.uuid] or 0) > os.clock() and #placedOf(t.uuid) == 0) then
             -- (owner 2026-10-24: the Unique-trait copy is upgraded first, to the top - it is the carry)
             local v = PV.Power(t) * (AutoPlaceModule.TraitMods(t.traits).cap == 1 and 1e6 or 1)
             -- (a summoner only when no other damage unit is in the team: its summons do the damage, not it)
@@ -5322,6 +5327,7 @@ end
 -- Waves in this stage from the level data (math.huge = infinite; nil = unknown): its own count field,
 -- else the waves table of src.Data.Waves[level.waves].
 function PV.WaveCount()
+    if State.eventMode then return PV.EVENT_WAVES end
     local key = stageKey()
     if PV.wavesFor == key then return PV.waves end
     PV.wavesFor, PV.waves = key, nil
@@ -7092,8 +7098,10 @@ function AutoPlaceModule.DamageCount(units)
     return n
 end
 AutoPlaceModule.EV = { placeBonus = 2, reserve = 0, airMin = 3, airBy = 8, buffUnits = 2, stuck = 12 }
-function AutoPlaceModule.EventChoose(money)
+function AutoPlaceModule.EventChoose(money, onlyFilter)
     local EV, now = AutoPlaceModule.EV, os.clock()
+    -- (v2: the copies the bar rules let through, uuid -> { mult = the Always weight, now = placed once paid })
+    AutoPlaceModule.eventOk = {}
     local wave = AutoPlaceModule.WaveNumber()
     local units = ownedUnits()
     local atCap = #units >= math.min(AutoPlaceModule.EVENT_CAP, AutoPlaceModule.capSeen or 99)
@@ -7172,10 +7180,12 @@ function AutoPlaceModule.EventChoose(money)
             if not atCap and (AutoPlaceModule.noSpot[t.uuid] or 0) <= now then
                 -- (an Always unit counts 3x, and more the stronger it ranks - AutoPlaceModule.RANK)
                 local v = AutoPlaceModule.Value(t, t.cost or 1000) * EV.placeBonus
+                local mult = 1
                 if always then
                     local list, at = AutoPlaceModule.RANK, #AutoPlaceModule.RANK + 1
                     for i, n in ipairs(list) do if n == t.name then at = i end end
-                    v = v * (3 + 2 * math.max(0, #list - at + 1) / #list)
+                    mult = 3 + 2 * math.max(0, #list - at + 1) / math.max(1, #list)
+                    v = v * mult
                 end
                 -- (an Always unit goes down as soon as it can be paid: nagumo was X'd as stuck while the
                 -- money waited for an upgrade - Snowy Town loss 2026-10-24)
@@ -7189,6 +7199,7 @@ function AutoPlaceModule.EventChoose(money)
                 if (always and (payNow or not AutoPlaceModule.danger))
                     or (payNow and (role == "farm" or role == "buff" or role == "support" or (airShort and AutoPlaceModule.AirCapable(t.name, 0))
                     )) then v = math.huge end
+                AutoPlaceModule.eventOk[t.uuid] = { mult = mult, now = v == math.huge }
                 -- (2026-10-25 night: "below 8 damage units a payable damage copy goes before upgrades" was
                 -- taken back - shared data showed 6-8 units placed at level 0 and losses at waves 7-15)
                 if v > bestV then best, bestV = { t = t, role = role }, v end
@@ -7226,6 +7237,7 @@ function AutoPlaceModule.EventChoose(money)
             end
         end
     end
+    if onlyFilter then return nil end
     -- 2. the best upgrade on the map, then the better of the two
     local upV = AutoPlace.upgrade and AutoPlaceModule.BestUpgradeScore() or 0
     local function canPay(b) return not b.t.cost or (money and money >= b.t.cost) end
@@ -7272,6 +7284,7 @@ PV.FARM_DISCOUNT = PV.FARM_DISCOUNT_SET
 PV.SAVE_RATIO = 0.6
 PV.SPREAD, PV.SPREAD_UNTIL, PV.SPREAD_HARD = 1.5, 4, 8 -- a new damage unit counts this much more while fewer damage units are down (more road covered; a hard room: SPREAD_HARD)
 PV.FIRST_COPY = 3                   -- the first copy of a team unit counts this much more (the whole team gets down)
+PV.EVENT_NOW = 100                  -- Fool's Hunt: a copy the owner's rules place as soon as it is paid (Always, payable farm / buff / air)
 PV.UP_FLOOR = 0.05                  -- an upgrade with no numbers in the data: this share of the unit's damage / s
 AutoPlaceModule.decisions = {}
 local function v2Plan(money, danger)
@@ -7304,7 +7317,17 @@ local function v2Plan(money, danger)
         return v * needD
     end
     local opts = {}
-    local function add(o) if o.cost and o.cost > 0 and o.cost < math.huge and o.value and o.value > 0 then o.score = o.value / o.cost opts[#opts + 1] = o end end
+    -- (Fool's Hunt: a copy the bar rules let through - an Always unit by its weight, one the owner places as soon as
+    -- it is paid x EVENT_NOW; the rest of the bar is not an option)
+    local evOk = State.eventMode and (AutoPlaceModule.eventOk or {}) or nil
+    local function add(o)
+        if evOk and o.kind == "place" then
+            local ok = evOk[o.e.t.uuid]
+            if not ok then return end
+            o.value = (o.value or 0) * ok.mult * (ok.now and PV.EVENT_NOW or 1)
+        end
+        if o.cost and o.cost > 0 and o.cost < math.huge and o.value and o.value > 0 then o.score = o.value / o.cost opts[#opts + 1] = o end
+    end
     -- 1. damage options first (the best damage per yen prices the farms and buffs)
     for _, e in ipairs(AutoPlaceModule.placeable or {}) do
         if e.role == "dps" then
@@ -7352,7 +7375,7 @@ local function v2Plan(money, danger)
         local name = e.t.name
         local def = AutoPlaceModule.UnitDef(name) or {}
         local cost = e.cost ~= math.huge and e.cost or tonumber(def.cost)
-        if e.role == "farm" and teamDps > 0 then
+        if e.role == "farm" and (teamDps > 0 or evOk) then
             local inc = (tonumber(def.farm_amount) or 0) * (AutoPlaceModule.TraitMods(e.t.traits).money or 1)
             add({ kind = "place", e = e, what = "place " .. name, cost = cost, value = inc * left * bestDpy * PV.FARM_DISCOUNT * needF * (e.placed == 0 and PV.FIRST_COPY or 1) })
         elseif e.role == "buff" or e.role == "support" then
@@ -7578,7 +7601,16 @@ local function tick()
     end
     -- Fool's Hunt: its own brain decides (EventChoose); the normal-stage rules below are skipped
     local ev = State.eventMode and not AutoPlace.manual and Lobby.cfg.eventBrain ~= false
-    if ev then
+    if ev and PV.EventOn() then
+        -- (v2: the bar rules first - a copy cleared or a swap at the limit takes this tick - then the single decision)
+        local wait = AutoPlaceModule.EventChoose(money, true)
+        if wait then return wait end
+        local vwait, vt, vrole, vslot = v2Plan(money, danger)
+        if vwait then return vwait end
+        if not vt then return 0.5 end
+        t, role, slot = vt, vrole, vslot
+        AutoPlaceModule.v2Picked = true
+    elseif ev then
         local wait, et, er = AutoPlaceModule.EventChoose(money)
         if wait then return wait end
         t, role, slot = et, er, et.slot
@@ -13583,7 +13615,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-085441"
+Lobby.VERSION = "20261026-090349"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
@@ -14106,8 +14138,18 @@ function Lobby.DamageShare()
     end
     -- (placed units by their damage as upgraded now: three judar at level 8 counted as three level-0
     -- ones, and Spellproof II was taken - 2026-10-25)
+    -- (v2: effective damage per second - area x AOE_VALUE, the live damage_multiplier, the carry counted twice -
+    -- the same team model as the placement margin; AutoPlace.v2Event)
+    local v2 = AutoPlaceModule.V2 and AutoPlaceModule.V2.EventOn()
+    local carry = v2 and AutoPlaceModule.V2.CarryUnit() or nil
     for _, u in ipairs(ownedUnits()) do
-        add(unitType(u), AutoPlaceModule.StatNum(u, "damage"), AutoPlaceModule.StatNum(u, "attack_cooldown"))
+        local dmg = AutoPlaceModule.StatNum(u, "damage")
+        if v2 then
+            local def = AutoPlaceModule.UnitDef(unitType(u) or "") or {}
+            dmg = (dmg or tonumber(def.damage) or 0) * (AutoPlaceModule.IsAoe(unitType(u) or "") and AutoPlaceModule.AOE_VALUE or 1)
+                * (AutoPlaceModule.StatNum(u, "damage_multiplier") or 1) * (u == carry and 2 or 1)
+        end
+        add(unitType(u), dmg, AutoPlaceModule.StatNum(u, "attack_cooldown"))
     end
     if State.eventMode then
         for _, n in ipairs(Lobby.cfg.eventAlways or {}) do add(n) end
@@ -14173,6 +14215,25 @@ end
 
 -- How much a Good card helps: damage first, then range, then attack speed (owner 2026-10-24);
 -- Yen (resource_gain) never: the owner cut it - damage and range help more. nil = not taken.
+-- (v2) the share of our damage / s standing where its range is the limit (cov / best under 80%%): range cards
+-- count that much; 1 with nothing on the map or v2 off
+function Lobby.RangeNeed()
+    if not (AutoPlaceModule.V2 and AutoPlaceModule.V2.EventOn()) then return 1 end
+    local all, limited = 0, 0
+    for _, u in ipairs(ownedUnits()) do
+        if AutoPlaceModule.RoleOf({ name = unitType(u) or "" }) ~= "farm" then
+            local def = AutoPlaceModule.UnitDef(unitType(u) or "") or {}
+            local v = (AutoPlaceModule.StatNum(u, "damage") or tonumber(def.damage) or 0) / math.max(0.5, AutoPlaceModule.StatNum(u, "attack_cooldown") or AutoPlaceModule.DefCd(def))
+            if v > 0 then
+                all = all + v
+                local ok, cb = pcall(AutoPlaceModule.V2.CovBest, u)
+                if ok and cb and cb >= 0 and cb < 80 then limited = limited + v end
+            end
+        end
+    end
+    if all <= 0 then return 1 end
+    return math.max(0.3, limited / all)
+end
 function Lobby.CardGain(opt)
     local gain = 0
     for _, e in ipairs(Lobby.AsList(type(opt.effects) == "table" and opt.effects or {})) do
@@ -14181,7 +14242,11 @@ function Lobby.CardGain(opt)
         -- (1.3: Attack I +12%% must beat Range I +15%% - owner order damage first; shared games took
         -- Range I over and over in mid-game losses, 2026-10-25)
         elseif t == "stat_mul" and stat == "damage" then gain = gain + 1.3 * a
-        elseif t == "stat_mul" and stat == "range" then gain = gain + 0.9 * a
+        elseif t == "stat_mul" and stat == "range" then gain = gain + 0.9 * a * Lobby.RangeNeed()
+        elseif string.lower(stat):find("summon", 1, true) and AutoPlaceModule.V2 and AutoPlaceModule.V2.EventOn()
+            and not AutoPlaceModule.SummonerDown(ownedUnits()) then gain = gain + 0
+        elseif string.lower(stat):find("cost", 1, true) and AutoPlaceModule.V2 and AutoPlaceModule.V2.EventOn() then
+            gain = gain + 0.3 * a * math.max(0.2, 1 - AutoPlaceModule.WaveNumber() / 30)
         elseif t == "stat_mul" and stat == "attack_cooldown" then gain = gain + 0.8 * a
         else gain = gain + 0.3 * a
         end
