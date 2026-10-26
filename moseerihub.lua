@@ -304,6 +304,7 @@ local function applyConfigData(data)
         -- every reload - each room is a teleport - showed the generic picture again; 2026-10-26)
         if (k == "dungeonItems" or k == "dungeonItemIcons" or k == "dungeonIcons4" or k == "dungeonNameIcons") and type(v) == "table" then Lobby.cfg[k] = v end
         if k == "dungeonModuleScan" and type(v) == "number" then Lobby.cfg[k] = v end
+        if k == "itemsShared" and type(v) == "table" then Lobby.cfg[k] = v end
     end
     local w = data.webhook or {}
     Webhook.url = pick(w.url, "string", Webhook.url)
@@ -11546,6 +11547,14 @@ function DungeonRun.OnChanged(p)
     for _, r in ipairs(rooms) do
         local t = DungeonRun.TagText(r.tags)
         if t ~= "" then note("room tags " .. t) end
+        for k, v in pairs(type(r.tags) == "table" and r.tags or {}) do
+            local code = type(k) == "number" and (type(v) == "table" and v.id or v) or k
+            code = tostring(code or "")
+            if code ~= "" and code ~= "0" and not DungeonRun.TAG_TYPES[code] and not code:find("^_curse") then
+                DungeonRun.newRoomTags = DungeonRun.newRoomTags or {}
+                DungeonRun.newRoomTags[code] = DungeonRun.newRoomTags[code] or (type(r.l) == "table" and r.l._location_name) or true
+            end
+        end
     end
     if type(p.current_shops) == "table" and next(p.current_shops) ~= nil then
         local ok, j = pcall(function() return HttpService:JSONEncode(p.current_shops) end)
@@ -13615,7 +13624,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-090354"
+Lobby.VERSION = "20261026-101316"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "stable"
@@ -13696,6 +13705,47 @@ function Lobby.UnitRows()
     return rows
 end
 
+-- Dungeon data the friends' devices find (owner 2026-10-26): one line per item the script learned that
+-- is not in its built-in tables (a new id, its name / effect, a picture other than the built-in one,
+-- a shop price) or a room tag with no name yet. Game data only; once per item per device
+-- (Lobby.cfg.itemsShared), 10 per game at most, sent with the game's AASTAT (same opt-out).
+DungeonRun.ITEM_LINES_MAX = 10
+function DungeonRun.ItemLines()
+    local catalog, shared, lines, keys = {}, Lobby.cfg.itemsShared or {}, {}, {}
+    for _, it in ipairs(DungeonRun.ITEMS) do catalog[it.id] = it end
+    for _, it in ipairs(DungeonRun.AllItems()) do
+        local icon = DungeonRun.ItemIcon(it)
+        local img = icon and icon.image
+        local baked = DungeonRun.ID_ICONS[it.id] or DungeonRun.NAME_ICONS[DungeonRun.NameKey(it.name)]
+        local learned = (Lobby.cfg.dungeonItems or {})[it.id]
+        local newItem = not catalog[it.id] and type(learned) == "table" and learned.name ~= nil
+        local newIcon = img ~= nil and img ~= baked
+        if (newItem or newIcon) and not shared[it.id] and #lines < DungeonRun.ITEM_LINES_MAX then
+            local kind = it.kind == "shrine" and (it.id:find("^_curse") and "curse" or "shrine") or it.kind
+            table.insert(lines, "AAITEM " .. HttpService:JSONEncode({ id = it.id, name = it.name, icon = img, effect = it.effect,
+                price = (DungeonRun.pagePrices or {})[it.id] or DungeonRun.PRICES[it.id], kind = kind }))
+            table.insert(keys, it.id)
+        end
+    end
+    for code, where in pairs(DungeonRun.newRoomTags or {}) do
+        if not shared["room:" .. code] and #lines < DungeonRun.ITEM_LINES_MAX then
+            table.insert(lines, "AAITEM " .. HttpService:JSONEncode({ id = "room:" .. code, name = type(where) == "string" and where or nil, kind = "room" }))
+            table.insert(keys, "room:" .. code)
+        end
+    end
+    return lines, keys
+end
+function Lobby.ShareItems()
+    local ok, lines, keys = pcall(DungeonRun.ItemLines)
+    if not ok or #lines == 0 then return end
+    local sent, why = Webhook.post(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = table.concat(lines, "\n") }))
+    if sent then
+        Lobby.cfg.itemsShared = Lobby.cfg.itemsShared or {}
+        for _, k in ipairs(keys) do Lobby.cfg.itemsShared[k] = true end
+        saveConfig()
+    end
+    Lobby.ShareLog("items " .. #lines .. " sent " .. tostring(sent) .. " " .. tostring(why))
+end
 function Lobby.ShareGame(win, wave)
     Lobby.ShareLog(string.format("game end: share %s, event %s, wave %s", tostring(Lobby.cfg.shareData), tostring(State.eventMode), tostring(wave)))
     -- (every mode since 2026-10-25, owner: story, raids, dungeon too - "mode" tells them apart)
@@ -13743,6 +13793,7 @@ function Lobby.ShareGame(win, wave)
     end
     local sent, why = Webhook.post(Lobby.shareUrl, HttpService:JSONEncode({ username = "moseeri data", content = "AASTAT " .. body }))
     if sent and data.stuck then DungeonRun.stuckTotal, DungeonRun.lastStuck = 0, nil saveConfig() end
+    pcall(Lobby.ShareItems)
     AutoPlaceModule.Note("game data " .. (sent and "shared" or ("NOT shared - " .. tostring(why))))
     Lobby.ShareLog("sent " .. tostring(sent) .. " " .. tostring(why) .. " (" .. #body .. " chars)")
 end
