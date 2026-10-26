@@ -2,6 +2,101 @@
 -- Core: __namecall hook recorder, money-filtered replay, unit linking.
 -- Tabs: Home | Lobby | Dungeon | Event | Macro | Advanced | Settings
 
+-- Access gate (2026-10-26): personal key + whitelist + kill switch, else the player is kicked.
+-- The key bot (key_bot/bot.js) keeps access.txt in the GitHub repo: "on"/"off", then one line per
+-- bound key "u <UserId> <device> <admin|->". A key not bound yet is sent once as "AAKEY {...}"
+-- through the share webhook and the bot binds it. Off in the unstamped source (tests, local runs):
+-- work/push.sh switches it on.
+do
+    local ACCESS_GATE = true
+    local G = (getgenv and getgenv()) or _G
+    if ACCESS_GATE then
+        local me = game:GetService("Players").LocalPlayer
+        local API = "https://api.github.com/repos/moseeri01/blueheater2/contents/access.txt"
+        local RAW = "https://raw.githubusercontent.com/moseeri01/blueheater2/main/access.txt"
+        local req = (syn and syn.request) or (http and http.request) or request or http_request
+        local function kick(why)
+            G.__moseeri_kicked = true
+            pcall(function() me:Kick("moseeri hub: " .. why) end)
+        end
+        -- (fresh = the GitHub API, seconds behind; the raw CDN lags up to 5 min but has no rate limit)
+        local function fetch(fresh)
+            if fresh and type(req) == "function" then
+                local ok, res = pcall(req, { Url = API, Method = "GET", Headers = { Accept = "application/vnd.github.raw", ["User-Agent"] = "moseeri-hub" } })
+                if ok and type(res) == "table" and tonumber(res.StatusCode) == 200 and type(res.Body) == "string" and res.Body:sub(1, 1) == "#" then return res.Body end
+            end
+            local ok, body = pcall(function() return game:HttpGet(RAW .. "?t=" .. tostring(os.time())) end)
+            if ok and type(body) == "string" and body:sub(1, 1) == "#" then return body end
+        end
+        local hw = ""
+        pcall(function() hw = game:GetService("RbxAnalyticsService"):GetClientId() end)
+        if (type(hw) ~= "string" or hw == "") and type(gethwid) == "function" then pcall(function() hw = gethwid() end) end
+        hw = (tostring(hw or ""):gsub("[^%w%-_]", "")):sub(1, 40)
+        if hw == "" then hw = "any" end
+        local uid = tostring(me.UserId)
+        -- "ok" | "none" (not listed) | "device" (listed on another device) | "off" (kill switch)
+        local function verdict(text)
+            local on, mine = true, nil
+            for line in text:gmatch("[^\r\n]+") do
+                if line == "off" then on = false end
+                local u, h, tag = line:match("^u (%d+) (%S+) (%S+)")
+                if u == uid then mine = { hw = h, admin = tag == "admin" } end
+            end
+            if not mine then return "none" end
+            if mine.hw ~= "any" and mine.hw ~= hw then return "device" end
+            if not on and not mine.admin then return "off" end
+            return "ok"
+        end
+        local WHY = {
+            none = "your key is not active. Press Get Script in the moseeri Discord and use that script.",
+            device = "your key is locked to another device. Press Reset HWID in the moseeri Discord.",
+            off = "the hub is turned off by the owner for now.",
+        }
+        local text
+        for try = 1, 3 do
+            text = fetch(true)
+            if text then break end
+            if try < 3 then task.wait(3) end
+        end
+        if not text then kick("could not check your key (GitHub did not answer). Rejoin and try again.") return end
+        local v = verdict(text)
+        local key = G.moseeri_key
+        if v == "none" and type(key) == "string" and key ~= "" and type(req) == "function" then
+            local ok, url = pcall(function() return game:HttpGet("https://raw.githubusercontent.com/moseeri01/blueheater2/main/share_url.txt") end)
+            url = ok and type(url) == "string" and url:match("https://[%w%./_%-]+") or nil
+            if url then
+                local Http = game:GetService("HttpService")
+                local body = Http:JSONEncode({ content = "AAKEY " .. Http:JSONEncode({ key = key, uid = uid, name = me.Name, hw = hw }) })
+                pcall(req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+                pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", { Title = "moseeri hub", Text = "Checking your key (up to 90 s)...", Duration = 10 }) end)
+                for _ = 1, 9 do
+                    task.wait(10)
+                    local t = fetch(true)
+                    if t then v = verdict(t) end
+                    if v ~= "none" then break end
+                end
+            end
+        end
+        if v ~= "ok" then kick(WHY[v]) return end
+        G.__moseeri_kicked = nil
+        -- re-check every 5 min (removed key / kill switch); kicks only after two "no" in a row, since the
+        -- raw CDN can still show the file from before this key was bound. One loop per run: an
+        -- auto-updated copy takes over.
+        local token = {}
+        G.__moseeri_gate = token
+        task.spawn(function()
+            local strikes = 0
+            while G.__moseeri_gate == token do
+                task.wait(300)
+                local t = G.__moseeri_gate == token and fetch(false)
+                local now = t and verdict(t)
+                if now and now ~= "ok" then strikes = strikes + 1 elseif now then strikes = 0 end
+                if strikes >= 2 then kick(WHY[now]) return end
+            end
+        end)
+    end
+end
+
 local ok_maclib, MacLib = pcall(function()
     return loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 end)
@@ -13624,7 +13719,7 @@ Lobby.SHARE_URL_FILE = "https://raw.githubusercontent.com/moseeri01/blueheater2/
 -- Auto-update (owner 2026-10-25): Replay keeps the same server, so a fix only reached players who
 -- went back to the lobby. At each result screen the hosted script is fetched; when its VERSION
 -- differs it is run, and running it closes this copy (__MacroLabShutdown). VERSION is stamped at push.
-Lobby.VERSION = "20261026-101312"
+Lobby.VERSION = "20261026-104944"
 -- (two channels since 2026-10-25: "test" = moseerihub_dev.lua, the owner's device tries changes first;
 -- "stable" = moseerihub.lua for friends, promoted once the test games look fine. Stamped at push.)
 Lobby.CHANNEL = "test"
