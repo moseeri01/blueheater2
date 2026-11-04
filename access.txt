@@ -1,4 +1,5 @@
 # moseeri hub access - written by key_bot, do not edit by hand
 on
+u 5b42de9973d7f58b 25a99cb408701e97 admin
 u 53442bb87d124035 04ffd2d232749325 -
 u 724d0ed20b371089 7ac334c61f48e40e -
